@@ -285,6 +285,9 @@ pub struct RunCheckpointLayer {
     pub exclude_globs:  Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip_git_hooks: Option<bool>,
+    /// Optional timeout for the per-node run-branch checkpoint commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_timeout: Option<Duration>,
 }
 
 /// `[run.clone]` — source workspace clone policy.

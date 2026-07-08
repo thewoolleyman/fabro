@@ -280,9 +280,8 @@ impl RunLifecycle<WorkflowGraph> for GitLifecycle {
             &result.outcome.status.to_string(),
             completed_count,
             shadow_sha,
-            &self.run_options.checkpoint_exclude_globs(),
+            self.run_options.checkpoint(),
             &git_author,
-            self.run_options.checkpoint_skip_git_hooks(),
         )
         .await;
 
