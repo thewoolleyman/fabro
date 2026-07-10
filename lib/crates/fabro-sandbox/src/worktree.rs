@@ -361,7 +361,7 @@ impl Sandbox for WorktreeSandbox {
         self.inner.sandbox_info()
     }
 
-    async fn refresh_push_credentials(&self) -> crate::Result<()> {
+    async fn refresh_push_credentials(&self) -> crate::Result<crate::RefreshOutcome> {
         self.inner.refresh_push_credentials().await
     }
 

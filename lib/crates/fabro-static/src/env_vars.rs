@@ -22,6 +22,9 @@ impl EnvVars {
     pub const FABRO_LOG: &'static str = "FABRO_LOG";
     pub const FABRO_LOG_DESTINATION: &'static str = "FABRO_LOG_DESTINATION";
     pub const FABRO_NO_UPGRADE_CHECK: &'static str = "FABRO_NO_UPGRADE_CHECK";
+    pub const FABRO_PUSH_CRED_REFRESH_AHEAD: &'static str = "FABRO_PUSH_CRED_REFRESH_AHEAD";
+    pub const FABRO_PUSH_CRED_REFRESH_INTERVAL_SECONDS: &'static str =
+        "FABRO_PUSH_CRED_REFRESH_INTERVAL_SECONDS";
     pub const FABRO_QUIET: &'static str = "FABRO_QUIET";
     pub const FABRO_SERVER: &'static str = "FABRO_SERVER";
     pub const FABRO_SERVER_MAX_CONCURRENT_RUNS: &'static str = "FABRO_SERVER_MAX_CONCURRENT_RUNS";
@@ -161,6 +164,8 @@ mod tests {
             EnvVars::FABRO_LOG,
             EnvVars::FABRO_LOG_DESTINATION,
             EnvVars::FABRO_NO_UPGRADE_CHECK,
+            EnvVars::FABRO_PUSH_CRED_REFRESH_AHEAD,
+            EnvVars::FABRO_PUSH_CRED_REFRESH_INTERVAL_SECONDS,
             EnvVars::FABRO_QUIET,
             EnvVars::FABRO_SERVER,
             EnvVars::FABRO_SERVER_MAX_CONCURRENT_RUNS,

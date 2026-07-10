@@ -54,8 +54,8 @@ pub use read_guard::ReadBeforeWriteSandbox;
 pub use reconnect::{reconnect, reconnect_for_run, reconnect_for_run_with_callback};
 pub use sandbox::{
     CommandOutputCallback, DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult,
-    ExecStreamingResult, GitRunInfo, GitSetupIntent, GrepOptions, Sandbox, SandboxEvent,
-    SandboxEventCallback, StderrCollector, StdioProcess, StdioProcessHandle,
+    ExecStreamingResult, GitRunInfo, GitSetupIntent, GrepOptions, RefreshOutcome, Sandbox,
+    SandboxEvent, SandboxEventCallback, StderrCollector, StdioProcess, StdioProcessHandle,
     StdioProcessTermination, format_lines_numbered, git_push_via_exec, redacted_output_tail,
     setup_git_via_exec, shell_quote,
 };

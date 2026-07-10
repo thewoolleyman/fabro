@@ -28,7 +28,7 @@ use tokio_util::sync::CancellationToken;
 use crate::clone_source::{self, CloneDecision, EmptyWorkspaceReason};
 use crate::managed_labels::{self, MANAGED_LABEL, RUN_ID_LABEL};
 use crate::redact::redact_auth_url;
-use crate::sandbox::{StdioProcessControl, optional_timeout, resolve_path};
+use crate::sandbox::{RefreshOutcome, StdioProcessControl, optional_timeout, resolve_path};
 use crate::{
     CommandOutputCallback, DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, ExecResult,
     ExecStreamingResult, GrepOptions, Sandbox, SandboxEvent, SandboxEventCallback, StderrCollector,
@@ -1950,16 +1950,22 @@ impl Sandbox for DockerSandbox {
         self.origin_url.get().map(String::as_str)
     }
 
-    async fn refresh_push_credentials(&self) -> crate::Result<()> {
+    async fn refresh_push_credentials(&self) -> crate::Result<RefreshOutcome> {
         if !self.repo_cloned() {
-            return Ok(());
+            return Ok(RefreshOutcome::Skipped);
         }
         let Some(origin_url) = self.origin_url.get() else {
-            return Ok(());
+            return Ok(RefreshOutcome::Skipped);
         };
         let Some(creds) = &self.github_app else {
-            return Ok(());
+            return Ok(RefreshOutcome::Skipped);
         };
+        // Only a GitHub App installation token can be re-minted; a static PAT or
+        // a pre-minted Installation token is fixed, so re-embedding it changes
+        // nothing. Short-circuit to Skipped before the resolve + set-url exec.
+        if !matches!(creds, GitHubCredentials::App(_)) {
+            return Ok(RefreshOutcome::Skipped);
+        }
 
         let auth_url = fabro_github::resolve_authenticated_url(
             &fabro_github::GitHubContext::new(creds, &fabro_github::github_api_base_url()),
@@ -1984,7 +1990,9 @@ impl Sandbox for DockerSandbox {
             ));
         }
 
-        Ok(())
+        // Static creds were short-circuited to Skipped above; reaching here means
+        // a GitHub App installation token was freshly minted.
+        Ok(RefreshOutcome::Refreshed)
     }
 }
 

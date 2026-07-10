@@ -1,19 +1,26 @@
 //! Workflow adapter for ACP-backed LLM stages.
 
 use std::collections::HashMap;
+use std::env;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use fabro_acp::{
     AcpCommandError, AcpControlHandle, AcpError, AcpLiveControl, AcpProcessSpec, AcpRunRequest,
     render_stop_reason,
 };
-use fabro_agent::{AgentEvent, Sandbox, StaticEnvProvider, SteeringItem, ToolEnvProvider};
+use fabro_agent::{
+    AgentEvent, RefreshOutcome, Sandbox, StaticEnvProvider, SteeringItem, ToolEnvProvider,
+};
 use fabro_graphviz::graph::Node;
+use fabro_static::EnvVars;
 use fabro_types::{
     AgentBackend, Principal, SessionCapability, StageId, StageTiming, SteeringMessage,
 };
 use fabro_util::time::elapsed_ms;
+use tokio::task::JoinHandle;
+use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 use super::super::agent::{CodergenBackend, CodergenResult, CodergenRunRequest, OneShotRequest};
@@ -23,6 +30,129 @@ use crate::error::Error;
 use crate::event::{Emitter, Event, RunNoticeCode, RunNoticeLevel, StageScope};
 use crate::handler::NodeTimeoutPolicy;
 use crate::steering_hub::{ActiveControlHandle, SteeringHub};
+
+/// Default refresh-ahead interval — comfortably under the ~60-min GitHub App
+/// installation-token TTL.
+const REFRESH_INTERVAL_DEFAULT: Duration = Duration::from_mins(45);
+/// Upper bound on a single push-credential refresh (token mint + `git remote
+/// set-url` exec). The turn-entry refresh runs before the ACP process spawns
+/// and the ACP node uses `NodeTimeoutPolicy::HandlerManaged`, so without this
+/// bound a stalled GitHub API call would hang node entry indefinitely.
+const REFRESH_MINT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Aborts the wrapped task when dropped, bounding the refresh-ahead loop to the
+/// lifetime of a single ACP turn.
+struct AbortOnDrop(JoinHandle<()>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Process-env lookup facade for the `FABRO_PUSH_CRED_REFRESH_*` tunables,
+/// isolated so the single disallowed-methods exception is documented in one
+/// place. Variable names come from [`EnvVars`].
+#[expect(
+    clippy::disallowed_methods,
+    reason = "Documented process-env facade for the FABRO_PUSH_CRED_REFRESH_* tunables; names come from fabro_static::EnvVars."
+)]
+fn refresh_env(name: &str) -> Option<String> {
+    env::var(name).ok()
+}
+
+/// Whether the push-credential refresh feature is enabled. Default ON; disabled
+/// by a falsy value (empty / `0` / `false` / `off` / `no`, case-insensitive),
+/// matching the repo's env-flag convention.
+fn parse_refresh_enabled(raw: Option<&str>) -> bool {
+    !matches!(
+        raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("" | "0" | "false" | "off" | "no")
+    )
+}
+
+/// Parse the refresh-ahead loop interval. `None` disables the loop (explicit
+/// `0`, mirroring the codebase's `set_autostop_interval` "0 to disable"
+/// convention). Unset/empty or an unparsable value falls back to the default.
+fn parse_refresh_interval(raw: Option<&str>) -> Option<Duration> {
+    match raw.map(str::trim) {
+        None | Some("") => Some(REFRESH_INTERVAL_DEFAULT),
+        Some(s) => match s.parse::<u64>() {
+            Ok(0) => None,
+            Ok(secs) => Some(Duration::from_secs(secs)),
+            Err(_) => {
+                tracing::warn!(
+                    value = %s,
+                    "invalid FABRO_PUSH_CRED_REFRESH_INTERVAL_SECONDS; using default"
+                );
+                Some(REFRESH_INTERVAL_DEFAULT)
+            }
+        },
+    }
+}
+
+fn push_cred_refresh_enabled() -> bool {
+    parse_refresh_enabled(refresh_env(EnvVars::FABRO_PUSH_CRED_REFRESH_AHEAD).as_deref())
+}
+
+fn push_cred_refresh_interval() -> Option<Duration> {
+    parse_refresh_interval(
+        refresh_env(EnvVars::FABRO_PUSH_CRED_REFRESH_INTERVAL_SECONDS).as_deref(),
+    )
+}
+
+/// Background loop that re-mints the sandbox's push credentials every
+/// `interval` for the duration of one ACP turn, so a single turn that outlives
+/// the installation-token TTL still pushes with a fresh token. Bounded by
+/// `cancel` (the drop-guard cancels it at turn end). A failed or timed-out tick
+/// retries after a shorter delay so a transient error does not leave a
+/// longer-than-interval window with an expired token.
+async fn refresh_ahead_loop(
+    sandbox: Arc<dyn Sandbox>,
+    cancel: CancellationToken,
+    interval: Duration,
+) {
+    let retry_delay = interval.min(Duration::from_mins(1));
+    let mut delay = interval;
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => break,
+            () = sleep(delay) => {
+                match timeout(REFRESH_MINT_TIMEOUT, sandbox.refresh_push_credentials())
+                    .await
+                {
+                    Ok(Ok(RefreshOutcome::Refreshed)) => {
+                        tracing::info!(
+                            interval_secs = interval.as_secs(),
+                            "refresh-ahead re-minted push credentials mid-turn"
+                        );
+                        delay = interval;
+                    }
+                    Ok(Ok(RefreshOutcome::Skipped)) => {
+                        tracing::debug!(
+                            interval_secs = interval.as_secs(),
+                            "refresh-ahead tick: no managed push credentials to refresh"
+                        );
+                        delay = interval;
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            error = %fabro_sandbox::display_for_log(&e),
+                            "refresh-ahead mid-turn refresh failed; retrying sooner"
+                        );
+                        delay = retry_delay;
+                    }
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            timeout_secs = REFRESH_MINT_TIMEOUT.as_secs(),
+                            "refresh-ahead mid-turn refresh timed out; retrying sooner"
+                        );
+                        delay = retry_delay;
+                    }
+                }
+            }
+        }
+    }
+}
 
 pub struct AgentAcpBackend {
     tool_env:                     Option<Arc<dyn ToolEnvProvider>>,
@@ -136,6 +266,67 @@ impl AgentAcpBackend {
                 );
             }) as Arc<dyn Fn(String, Option<Principal>) + Send + Sync>
         });
+
+        // Keep the sandbox's push credentials fresh for the duration of this ACP
+        // turn so the agent's own `git push` uses a live token instead of the one
+        // baked into the clone at run start.
+        //
+        // Part 2 (turn-entry): re-mint + rewrite the origin URL before the ACP
+        // process spawns, covering a push early in the turn. Non-fatal and
+        // timeout-bounded — a stalled mint must neither fail nor hang node entry.
+        // Part 3 (loop): a background task re-mints every ~45 min so a single turn
+        // that itself outlives the ~60-min installation-token TTL still pushes
+        // with a fresh token; a normal sub-interval turn never ticks (the
+        // drop-guard aborts the task at turn end before the first tick).
+        //
+        // FABRO_PUSH_CRED_REFRESH_AHEAD=0 (or false/off/no/empty, case-
+        // insensitive) disables the WHOLE feature — turn-entry re-mint AND loop —
+        // so an operator who manages `origin` themselves can opt out of all
+        // fabro-side origin rewriting. FABRO_PUSH_CRED_REFRESH_INTERVAL_SECONDS
+        // overrides the loop interval; 0 disables just the loop.
+        //
+        // Known limitations tracked as follow-ups (not addressed here): (a)
+        // resumed/parked runs reconnect the sandbox with no GitHub App creds, so
+        // refresh no-ops until those creds are threaded through the reconnect
+        // path; (b) the turn-entry re-mint has no freshness check, so it mints
+        // once per node entry even when the current token is still fresh; (c) the
+        // background `git remote set-url` can contend with the agent's own git on
+        // `.git/config.lock`; (d) parallel ACP branches each run their own loop;
+        // (e) this refresh lives in the ACP handler only, though the stale-origin
+        // problem is stage-type-agnostic (native/command stages that push are not
+        // covered); (f) refresh failures are logged via tracing but not surfaced
+        // as a RunNotice event on the run stream.
+        let refresh_enabled = push_cred_refresh_enabled();
+        if refresh_enabled {
+            match timeout(REFRESH_MINT_TIMEOUT, sandbox.refresh_push_credentials()).await {
+                Ok(Ok(RefreshOutcome::Refreshed)) => {
+                    tracing::debug!("refreshed sandbox push credentials at ACP turn entry");
+                }
+                Ok(Ok(RefreshOutcome::Skipped)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        error = %fabro_sandbox::display_for_log(&e),
+                        "node-entry push-credential refresh failed (non-fatal)"
+                    );
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        timeout_secs = REFRESH_MINT_TIMEOUT.as_secs(),
+                        "node-entry push-credential refresh timed out (non-fatal)"
+                    );
+                }
+            }
+        }
+        let _refresh_ahead_guard: Option<AbortOnDrop> = refresh_enabled
+            .then(push_cred_refresh_interval)
+            .flatten()
+            .map(|interval| {
+                AbortOnDrop(tokio::spawn(refresh_ahead_loop(
+                    Arc::clone(sandbox),
+                    cancel_token.child_token(),
+                    interval,
+                )))
+            });
 
         let files_before = changed_files::detect_changed_files(sandbox).await;
         let launch_start = std::time::Instant::now();
@@ -416,20 +607,80 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use fabro_acp::test_support::fake_acp_agent_script;
     use fabro_acp::{AcpError, AcpProcessExit};
-    use fabro_agent::{LocalSandbox, Sandbox, shell_quote};
+    use fabro_agent::{LocalSandbox, RefreshOutcome, Sandbox, shell_quote};
     use fabro_graphviz::graph::{AttrValue, Node};
     use fabro_sandbox::test_support::MockSandbox;
     use fabro_types::{CommandTermination, EventBody, ExecOutputTail};
     use tokio_util::sync::CancellationToken;
 
-    use super::{AgentAcpBackend, acp_error_to_workflow};
+    use super::{
+        AgentAcpBackend, acp_error_to_workflow, parse_refresh_enabled, parse_refresh_interval,
+    };
     use crate::context::Context;
     use crate::event::Emitter;
     use crate::handler::agent::{CodergenBackend, CodergenResult, CodergenRunRequest};
     use crate::steering_hub::SteeringHub;
+
+    #[test]
+    fn refresh_enabled_defaults_on_and_honors_falsy_values() {
+        // Default ON when unset.
+        assert!(parse_refresh_enabled(None));
+        // Truthy / non-falsy values stay enabled.
+        for v in ["1", "true", "on", "yes", "anything"] {
+            assert!(parse_refresh_enabled(Some(v)), "{v} should be enabled");
+        }
+        // Falsy values disable — case-insensitive, and empty/whitespace counts.
+        for v in [
+            "0", "false", "off", "no", "FALSE", "Off", "No", "OFF", "", "  ",
+        ] {
+            assert!(!parse_refresh_enabled(Some(v)), "{v} should be disabled");
+        }
+    }
+
+    #[test]
+    fn refresh_interval_parses_default_disable_and_override() {
+        // Unset or empty → default.
+        assert_eq!(parse_refresh_interval(None), Some(Duration::from_mins(45)));
+        assert_eq!(
+            parse_refresh_interval(Some("  ")),
+            Some(Duration::from_mins(45))
+        );
+        // Explicit 0 disables the loop.
+        assert_eq!(parse_refresh_interval(Some("0")), None);
+        // A positive value overrides.
+        assert_eq!(
+            parse_refresh_interval(Some("1800")),
+            Some(Duration::from_mins(30))
+        );
+        assert_eq!(
+            parse_refresh_interval(Some(" 900 ")),
+            Some(Duration::from_mins(15))
+        );
+        // Unparsable → default (never panics).
+        for v in ["15m", "-1", "abc", "9999999999999999999999"] {
+            assert_eq!(
+                parse_refresh_interval(Some(v)),
+                Some(Duration::from_mins(45)),
+                "{v} should fall back to default"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_reports_skipped_without_managed_credentials() {
+        // MockSandbox uses the trait default (no GitHub App creds), so refresh is
+        // a no-op that must report Skipped — the signal the refresh-ahead loop
+        // relies on to log at debug rather than falsely claim a re-mint.
+        let sandbox = MockSandbox::linux();
+        assert_eq!(
+            sandbox.refresh_push_credentials().await.unwrap(),
+            RefreshOutcome::Skipped
+        );
+    }
 
     #[tokio::test]
     async fn acp_backend_run_sends_prompt_and_returns_text() {

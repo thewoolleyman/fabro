@@ -196,7 +196,7 @@ macro_rules! delegate_sandbox {
                 self.$field.snapshot_info()
             }
 
-            async fn refresh_push_credentials(&self) -> $crate::Result<()> {
+            async fn refresh_push_credentials(&self) -> $crate::Result<$crate::RefreshOutcome> {
                 self.$field.refresh_push_credentials().await
             }
 
@@ -811,6 +811,18 @@ pub struct GrepOptions {
     pub max_results:      Option<usize>,
 }
 
+/// Outcome of [`Sandbox::refresh_push_credentials`]: whether a fresh token was
+/// actually minted and applied to the origin remote, or the call was a no-op
+/// (no clone, no authenticated origin, or no GitHub App credentials to rotate).
+/// Lets callers log accurately instead of assuming every `Ok` re-minted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshOutcome {
+    /// A fresh token was minted and the origin remote URL was updated.
+    Refreshed,
+    /// Nothing to refresh (no clone / no origin / no managed credentials).
+    Skipped,
+}
+
 #[async_trait]
 pub trait Sandbox: Send + Sync {
     async fn read_file_bytes(&self, path: &str) -> crate::Result<Vec<u8>>;
@@ -959,10 +971,11 @@ pub trait Sandbox: Send + Sync {
     }
 
     /// Refresh git push credentials (e.g. rotate an expiring GitHub App token).
-    /// Default is a no-op; Daytona overrides to update the remote URL with a
-    /// fresh token.
-    async fn refresh_push_credentials(&self) -> crate::Result<()> {
-        Ok(())
+    /// Default is a no-op; Docker/Daytona override to update the remote URL
+    /// with a fresh token. Returns [`RefreshOutcome`] so callers can tell
+    /// an actual re-mint from a skipped no-op.
+    async fn refresh_push_credentials(&self) -> crate::Result<RefreshOutcome> {
+        Ok(RefreshOutcome::Skipped)
     }
 
     /// Set the auto-stop interval in minutes (0 to disable).

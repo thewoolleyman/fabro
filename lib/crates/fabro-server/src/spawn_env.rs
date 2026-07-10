@@ -13,6 +13,11 @@ const WORKER_ENV_ALLOWLIST: &[&str] = &[
     EnvVars::FABRO_LOG,
     EnvVars::FABRO_HOME,
     EnvVars::FABRO_STORAGE_ROOT,
+    // Push-credential refresh-ahead tunables (FABRO_PUSH_CRED_REFRESH_*).
+    // `run_turn` executes in the worker, so these must survive `env_clear()` to
+    // reach the refresh-ahead loop in the ACP handler.
+    EnvVars::FABRO_PUSH_CRED_REFRESH_AHEAD,
+    EnvVars::FABRO_PUSH_CRED_REFRESH_INTERVAL_SECONDS,
     EnvVars::TERM,
     EnvVars::NO_COLOR,
     EnvVars::CLICOLOR,
@@ -87,6 +92,11 @@ mod tests {
                 "FABRO_STORAGE_ROOT".to_string(),
                 "/tmp/fabro-storage".to_string(),
             ),
+            ("FABRO_PUSH_CRED_REFRESH_AHEAD".to_string(), "0".to_string()),
+            (
+                "FABRO_PUSH_CRED_REFRESH_INTERVAL_SECONDS".to_string(),
+                "1800".to_string(),
+            ),
             ("TERM".to_string(), "xterm-256color".to_string()),
             ("NO_COLOR".to_string(), "1".to_string()),
             ("CLICOLOR".to_string(), "0".to_string()),
@@ -115,6 +125,20 @@ mod tests {
         assert_eq!(actual.get("PATH").map(String::as_str), Some("/bin"));
         assert_eq!(actual.get("HOME").map(String::as_str), Some("/tmp/home"));
         assert_eq!(actual.get("FABRO_LOG").map(String::as_str), Some("debug"));
+        // Push-credential refresh-ahead tunables must survive env_clear() into
+        // the worker so run_turn's refresh-ahead loop can read them.
+        assert_eq!(
+            actual
+                .get("FABRO_PUSH_CRED_REFRESH_AHEAD")
+                .map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            actual
+                .get("FABRO_PUSH_CRED_REFRESH_INTERVAL_SECONDS")
+                .map(String::as_str),
+            Some("1800")
+        );
         assert_eq!(
             actual.get("TERM").map(String::as_str),
             Some("xterm-256color")
