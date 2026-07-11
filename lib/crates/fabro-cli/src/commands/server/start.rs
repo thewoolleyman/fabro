@@ -365,7 +365,14 @@ async fn execute_daemon(
     }
 
     let poll_interval = Duration::from_millis(50);
-    let timeout = Duration::from_secs(5);
+    // Daemon-mode readiness wait. Opening a large SlateDB store can take well over
+    // the historical hardcoded 5s, so this is now env-overridable (default 60s)
+    // rather than forcing operators onto `--foreground`.
+    let timeout = std::env::var(EnvVars::FABRO_SERVER_START_READY_TIMEOUT_SECS)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(60));
     let deadline = Instant::now() + timeout;
 
     while Instant::now() < deadline {

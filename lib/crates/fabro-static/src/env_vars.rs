@@ -28,6 +28,8 @@ impl EnvVars {
     pub const FABRO_QUIET: &'static str = "FABRO_QUIET";
     pub const FABRO_SERVER: &'static str = "FABRO_SERVER";
     pub const FABRO_SERVER_MAX_CONCURRENT_RUNS: &'static str = "FABRO_SERVER_MAX_CONCURRENT_RUNS";
+    pub const FABRO_SERVER_START_READY_TIMEOUT_SECS: &'static str =
+        "FABRO_SERVER_START_READY_TIMEOUT_SECS";
     pub const FABRO_SLACK_APP_TOKEN: &'static str = "FABRO_SLACK_APP_TOKEN";
     pub const FABRO_SLACK_BOT_TOKEN: &'static str = "FABRO_SLACK_BOT_TOKEN";
     pub const FABRO_STORAGE_DIR: &'static str = "FABRO_STORAGE_DIR";
@@ -169,6 +171,7 @@ mod tests {
             EnvVars::FABRO_QUIET,
             EnvVars::FABRO_SERVER,
             EnvVars::FABRO_SERVER_MAX_CONCURRENT_RUNS,
+            EnvVars::FABRO_SERVER_START_READY_TIMEOUT_SECS,
             EnvVars::FABRO_SLACK_APP_TOKEN,
             EnvVars::FABRO_SLACK_BOT_TOKEN,
             EnvVars::FABRO_STORAGE_DIR,
