@@ -26,8 +26,38 @@ const WORKER_ENV_ALLOWLIST: &[&str] = &[
 
 const RENDER_GRAPH_ENV_ALLOWLIST: &[&str] = &[EnvVars::PATH, EnvVars::HOME, EnvVars::TMPDIR];
 
+// OTLP export config forwarded from the server's environment into the worker so
+// the worker's `otel_layer` (fabro-cli) exports its spans to the SAME collector
+// the server targets. Only the NON-SECRET vars are forwarded — the collector's
+// egress credential is stripped by `WORKER_OTEL_SECRET_DENYLIST` below.
+const WORKER_OTEL_EXPORT_ALLOWLIST: &[&str] = &[
+    EnvVars::OTEL_EXPORTER_OTLP_ENDPOINT,
+    EnvVars::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+    EnvVars::OTEL_EXPORTER_OTLP_PROTOCOL,
+    EnvVars::OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,
+    EnvVars::OTEL_SERVICE_NAME,
+];
+
+// The OTLP headers vars carry the collector's egress credential (e.g. a
+// Honeycomb API key). They MUST NOT reach the sandboxed worker: the worker
+// exports to the LOCAL collector, which adds egress auth itself. These are not
+// `fabro_static::EnvVars` constants — the `opentelemetry-otlp` SDK reads these
+// literal names itself, so we strip both the base and per-signal spellings.
+const WORKER_OTEL_SECRET_DENYLIST: &[&str] = &[
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+];
+
 pub(crate) fn apply_worker_env(cmd: &mut Command) {
     apply_allowlist(cmd, WORKER_ENV_ALLOWLIST, &process_env_var_os);
+}
+
+/// Re-inject the server's OTLP export config into an already-`env_clear`ed
+/// worker command so the worker exports its spans to the same collector. Call
+/// AFTER [`apply_worker_env`] — these are additive re-injections, not survivors
+/// of the `env_clear`. The collector's egress credential is never forwarded.
+pub(crate) fn apply_worker_otel_export_env(cmd: &mut Command) {
+    apply_otel_export(cmd, &process_env_var_os);
 }
 
 pub(crate) fn apply_render_graph_env(cmd: &mut Command) {
@@ -51,13 +81,29 @@ fn apply_allowlist(cmd: &mut Command, keys: &[&str], lookup: &dyn Fn(&str) -> Op
     }
 }
 
+/// Additive OTLP-export re-injection: forward the non-secret export vars and
+/// strip the credential-bearing headers vars. No `env_clear` — the caller has
+/// already cleared + allowlisted the worker env.
+fn apply_otel_export(cmd: &mut Command, lookup: &dyn Fn(&str) -> Option<OsString>) {
+    for key in WORKER_OTEL_EXPORT_ALLOWLIST {
+        if let Some(value) = lookup(key) {
+            cmd.env(key, value);
+        }
+    }
+    for key in WORKER_OTEL_SECRET_DENYLIST {
+        cmd.env_remove(key);
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use std::collections::HashMap;
     use std::ffi::OsString;
     use std::path::Path;
 
-    use super::{RENDER_GRAPH_ENV_ALLOWLIST, WORKER_ENV_ALLOWLIST, apply_allowlist};
+    use super::{
+        RENDER_GRAPH_ENV_ALLOWLIST, WORKER_ENV_ALLOWLIST, apply_allowlist, apply_otel_export,
+    };
 
     fn env_command() -> tokio::process::Command {
         assert!(Path::new("/usr/bin/env").exists());
@@ -184,5 +230,79 @@ mod tests {
             Some("off")
         );
         assert!(!actual.contains_key("SESSION_SECRET"));
+    }
+
+    #[tokio::test]
+    async fn worker_otel_export_forwards_config_but_never_headers() {
+        // The server's OTLP export config, plus the credential-bearing headers
+        // vars the server env may carry for its own outbound export.
+        let env = HashMap::from([
+            (
+                "OTEL_EXPORTER_OTLP_ENDPOINT".to_string(),
+                "http://collector:4318".to_string(),
+            ),
+            (
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT".to_string(),
+                "http://collector:4318/v1/traces".to_string(),
+            ),
+            (
+                "OTEL_EXPORTER_OTLP_PROTOCOL".to_string(),
+                "http/json".to_string(),
+            ),
+            (
+                "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL".to_string(),
+                "http/json".to_string(),
+            ),
+            ("OTEL_SERVICE_NAME".to_string(), "fabro".to_string()),
+            (
+                "OTEL_EXPORTER_OTLP_HEADERS".to_string(),
+                "x-honeycomb-team=secret".to_string(),
+            ),
+            (
+                "OTEL_EXPORTER_OTLP_TRACES_HEADERS".to_string(),
+                "x-honeycomb-team=secret".to_string(),
+            ),
+        ]);
+        let mut cmd = env_command();
+        cmd.env_clear();
+        // Pre-set a headers var on the worker env so the assertion proves the
+        // denylist STRIPS it, not merely that it is never forwarded.
+        cmd.env("OTEL_EXPORTER_OTLP_HEADERS", "x-honeycomb-team=leak");
+        apply_otel_export(&mut cmd, &|name| env.get(name).map(OsString::from));
+
+        let actual = env_output(cmd).await;
+
+        assert_eq!(
+            actual
+                .get("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .map(String::as_str),
+            Some("http://collector:4318")
+        );
+        assert_eq!(
+            actual
+                .get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+                .map(String::as_str),
+            Some("http://collector:4318/v1/traces")
+        );
+        assert_eq!(
+            actual
+                .get("OTEL_EXPORTER_OTLP_PROTOCOL")
+                .map(String::as_str),
+            Some("http/json")
+        );
+        assert_eq!(
+            actual
+                .get("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL")
+                .map(String::as_str),
+            Some("http/json")
+        );
+        assert_eq!(
+            actual.get("OTEL_SERVICE_NAME").map(String::as_str),
+            Some("fabro")
+        );
+        // The credential-bearing headers vars must never reach the worker —
+        // neither forwarded from the lookup nor surviving a pre-existing value.
+        assert!(!actual.contains_key("OTEL_EXPORTER_OTLP_HEADERS"));
+        assert!(!actual.contains_key("OTEL_EXPORTER_OTLP_TRACES_HEADERS"));
     }
 }
