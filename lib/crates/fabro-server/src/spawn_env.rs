@@ -28,21 +28,34 @@ const RENDER_GRAPH_ENV_ALLOWLIST: &[&str] = &[EnvVars::PATH, EnvVars::HOME, EnvV
 
 // OTLP export config forwarded from the server's environment into the worker so
 // the worker's `otel_layer` (fabro-cli) exports its spans to the SAME collector
-// the server targets. Only the NON-SECRET vars are forwarded — the collector's
-// egress credential is stripped by `WORKER_OTEL_SECRET_DENYLIST` below.
+// the server targets. This is a NON-SECRET allowlist, and it is the allowlist —
+// not the denylist below — that provides the fail-closed guarantee: the worker
+// env is `env_clear`ed and only these names are copied back, so no credential
+// var can reach the worker regardless of what the server env holds. The
+// topology this assumes is a LOCAL, no-auth collector (the collector adds
+// egress auth); pointing the server's endpoint straight at an authenticated
+// backend is unsupported — the worker would inherit the endpoint without the
+// auth header. `*_TIMEOUT` / `*_TRACES_TIMEOUT` are non-secret export knobs the
+// opentelemetry-otlp SDK reads itself; they have no `fabro_static::EnvVars`
+// constant, so they are listed by literal name.
 const WORKER_OTEL_EXPORT_ALLOWLIST: &[&str] = &[
     EnvVars::OTEL_EXPORTER_OTLP_ENDPOINT,
     EnvVars::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
     EnvVars::OTEL_EXPORTER_OTLP_PROTOCOL,
     EnvVars::OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,
     EnvVars::OTEL_SERVICE_NAME,
+    "OTEL_EXPORTER_OTLP_TIMEOUT",
+    "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
 ];
 
-// The OTLP headers vars carry the collector's egress credential (e.g. a
-// Honeycomb API key). They MUST NOT reach the sandboxed worker: the worker
-// exports to the LOCAL collector, which adds egress auth itself. These are not
-// `fabro_static::EnvVars` constants — the `opentelemetry-otlp` SDK reads these
-// literal names itself, so we strip both the base and per-signal spellings.
+// Belt-and-suspenders only. The OTLP headers vars carry the collector's egress
+// credential (e.g. a Honeycomb API key); they are `env_remove`d from the worker
+// command. In the current call graph this is redundant with the env_clear +
+// allowlist-only forwarding above (nothing sets them after the clear) — it
+// exists so an accidental future `cmd.env(HEADERS, ...)` added AFTER the
+// forwarding still cannot survive into the worker. Not `fabro_static::EnvVars`
+// constants — the `opentelemetry-otlp` SDK reads these literal names itself;
+// strip both the base and per-signal spellings.
 const WORKER_OTEL_SECRET_DENYLIST: &[&str] = &[
     "OTEL_EXPORTER_OTLP_HEADERS",
     "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
@@ -254,6 +267,11 @@ mod tests {
                 "http/json".to_string(),
             ),
             ("OTEL_SERVICE_NAME".to_string(), "fabro".to_string()),
+            ("OTEL_EXPORTER_OTLP_TIMEOUT".to_string(), "5000".to_string()),
+            (
+                "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT".to_string(),
+                "5000".to_string(),
+            ),
             (
                 "OTEL_EXPORTER_OTLP_HEADERS".to_string(),
                 "x-honeycomb-team=secret".to_string(),
@@ -265,9 +283,11 @@ mod tests {
         ]);
         let mut cmd = env_command();
         cmd.env_clear();
-        // Pre-set a headers var on the worker env so the assertion proves the
-        // denylist STRIPS it, not merely that it is never forwarded.
+        // Pre-set BOTH headers vars on the worker env so each assertion proves the
+        // denylist STRIPS a pre-existing value, not merely that it is never
+        // forwarded — making both denylist entries load-bearing.
         cmd.env("OTEL_EXPORTER_OTLP_HEADERS", "x-honeycomb-team=leak");
+        cmd.env("OTEL_EXPORTER_OTLP_TRACES_HEADERS", "x-honeycomb-team=leak");
         apply_otel_export(&mut cmd, &|name| env.get(name).map(OsString::from));
 
         let actual = env_output(cmd).await;
@@ -300,8 +320,19 @@ mod tests {
             actual.get("OTEL_SERVICE_NAME").map(String::as_str),
             Some("fabro")
         );
+        assert_eq!(
+            actual.get("OTEL_EXPORTER_OTLP_TIMEOUT").map(String::as_str),
+            Some("5000")
+        );
+        assert_eq!(
+            actual
+                .get("OTEL_EXPORTER_OTLP_TRACES_TIMEOUT")
+                .map(String::as_str),
+            Some("5000")
+        );
         // The credential-bearing headers vars must never reach the worker —
-        // neither forwarded from the lookup nor surviving a pre-existing value.
+        // neither forwarded from the lookup nor surviving a pre-existing value
+        // (both are pre-set above, so both denylist entries are exercised).
         assert!(!actual.contains_key("OTEL_EXPORTER_OTLP_HEADERS"));
         assert!(!actual.contains_key("OTEL_EXPORTER_OTLP_TRACES_HEADERS"));
     }

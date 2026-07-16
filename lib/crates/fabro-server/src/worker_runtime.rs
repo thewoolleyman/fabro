@@ -100,6 +100,9 @@ impl LocalWorkerRuntime {
         // Forward the server's OTLP export config so the worker's `otel_layer`
         // exports its spans to the same collector. The collector's egress
         // credential (OTEL_EXPORTER_OTLP_HEADERS) is deliberately NOT forwarded.
+        // MUST stay after `apply_worker_env`: that call `env_clear`s the command,
+        // so re-injecting earlier would be wiped and telemetry would silently
+        // vanish (a fail-safe direction — loss, never a leak — but still a bug).
         apply_worker_otel_export_env(&mut cmd);
 
         #[cfg(unix)]
