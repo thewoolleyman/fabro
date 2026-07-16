@@ -11,7 +11,7 @@ use futures_util::future::BoxFuture;
 use tokio::io::AsyncRead;
 use tokio::process::Command;
 
-use crate::spawn_env::apply_worker_env;
+use crate::spawn_env::{apply_worker_env, apply_worker_otel_export_env};
 
 #[async_trait]
 pub(crate) trait WorkerRuntime: Send + Sync {
@@ -97,6 +97,10 @@ impl LocalWorkerRuntime {
         if let Some(pem) = spec.github_app_private_key.as_deref() {
             cmd.env(EnvVars::GITHUB_APP_PRIVATE_KEY, pem);
         }
+        // Forward the server's OTLP export config so the worker's `otel_layer`
+        // exports its spans to the same collector. The collector's egress
+        // credential (OTEL_EXPORTER_OTLP_HEADERS) is deliberately NOT forwarded.
+        apply_worker_otel_export_env(&mut cmd);
 
         #[cfg(unix)]
         fabro_proc::pre_exec_setpgid(cmd.as_std_mut());
