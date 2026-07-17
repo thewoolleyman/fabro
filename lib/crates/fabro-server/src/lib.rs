@@ -30,6 +30,7 @@ pub mod install;
 pub mod jwt_auth;
 pub mod manifest_validation;
 mod migrations;
+mod otel_propagation;
 mod principal_middleware;
 mod request_id;
 mod run_files;

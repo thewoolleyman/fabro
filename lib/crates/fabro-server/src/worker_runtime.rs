@@ -41,6 +41,16 @@ pub(crate) struct WorkerLaunchSpec {
     pub(crate) fabro_log:              Option<String>,
     pub(crate) active_config_path:     PathBuf,
     pub(crate) github_app_private_key: Option<String>,
+    /// W3C `traceparent` of the server-side `run` span, so the worker can
+    /// parent its own `run` span on it and both land in ONE trace. `None` when
+    /// OTLP export is off (nothing to propagate).
+    ///
+    /// Carried on the spec rather than captured at launch time: that keeps
+    /// building the command a pure function of the spec (hence testable without
+    /// a live span), and keeps it correct if `start` is ever moved onto its own
+    /// task, where the run span would no longer be current. It IS current at
+    /// today's call site — this is deliberate insulation, not a workaround.
+    pub(crate) traceparent:            Option<String>,
 }
 
 pub(crate) struct StartedWorker {
@@ -104,6 +114,15 @@ impl LocalWorkerRuntime {
         // so re-injecting earlier would be wiped and telemetry would silently
         // vanish (a fail-safe direction — loss, never a leak — but still a bug).
         apply_worker_otel_export_env(&mut cmd);
+        // Parent the worker's `run` span on the server's, joining what would
+        // otherwise be two disconnected traces per run. Per-run data, so unlike
+        // the export config above it is threaded through the spec instead of
+        // copied from the server's environment. Absent when export is off,
+        // leaving the worker span a root exactly as before. MUST also stay
+        // after `apply_worker_env` (see above): `env_clear` would wipe it.
+        if let Some(traceparent) = spec.traceparent.as_deref() {
+            cmd.env(EnvVars::TRACEPARENT, traceparent);
+        }
 
         #[cfg(unix)]
         fabro_proc::pre_exec_setpgid(cmd.as_std_mut());
@@ -169,5 +188,54 @@ impl WorkerRuntime for LocalWorkerRuntime {
         {
             fabro_proc::process_running(*pid)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+
+    use super::*;
+
+    fn spec_with_traceparent(traceparent: Option<&str>) -> WorkerLaunchSpec {
+        WorkerLaunchSpec {
+            executable:             PathBuf::from("/usr/bin/true"),
+            server_target:          "127.0.0.1:0".to_string(),
+            storage_dir:            PathBuf::from("/tmp/fabro-storage"),
+            run_dir:                PathBuf::from("/tmp/fabro-run"),
+            run_id:                 RunId::new(),
+            mode:                   "start",
+            worker_token:           "token".to_string(),
+            log_destination:        LogDestination::File,
+            fabro_log:              None,
+            active_config_path:     PathBuf::from("/tmp/fabro.toml"),
+            github_app_private_key: None,
+            traceparent:            traceparent.map(str::to_string),
+        }
+    }
+
+    fn env_value(cmd: &Command, key: &str) -> Option<String> {
+        cmd.as_std()
+            .get_envs()
+            .find(|(name, _)| *name == OsStr::new(key))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn worker_command_carries_the_captured_traceparent() {
+        let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let cmd = LocalWorkerRuntime::command_for_spec(&spec_with_traceparent(Some(traceparent)));
+
+        assert_eq!(env_value(&cmd, "TRACEPARENT").as_deref(), Some(traceparent));
+    }
+
+    // Export off (nothing captured) must leave the worker exactly as it was
+    // before O2: no TRACEPARENT, so its run span stays a root.
+    #[test]
+    fn worker_command_omits_traceparent_when_none_was_captured() {
+        let cmd = LocalWorkerRuntime::command_for_spec(&spec_with_traceparent(None));
+
+        assert_eq!(env_value(&cmd, "TRACEPARENT"), None);
     }
 }

@@ -2612,7 +2612,16 @@ fn worker_command(
     run_dir: &Path,
     agent_fabro_tools_enabled: bool,
 ) -> anyhow::Result<Command> {
-    let spec = worker_launch_spec(state, run_id, mode, run_dir, agent_fabro_tools_enabled)?;
+    // `None` traceparent: these cover the worker env, not trace propagation,
+    // which `worker_runtime`'s own tests pin.
+    let spec = worker_launch_spec(
+        state,
+        run_id,
+        mode,
+        run_dir,
+        agent_fabro_tools_enabled,
+        None,
+    )?;
     Ok(LocalWorkerRuntime::command_for_spec(&spec))
 }
 

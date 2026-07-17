@@ -183,6 +183,33 @@ where
     )
 }
 
+/// The OpenTelemetry context to parent this process's root span on, read from
+/// the W3C `TRACEPARENT` env var, or `None` when it is unset/empty/malformed.
+///
+/// The server sets `TRACEPARENT` when it spawns a `fabro __run-worker`
+/// subprocess (see fabro-server's `otel_propagation`), so the worker's `run`
+/// span joins the server's trace instead of starting a second one. `None`
+/// leaves the caller's span a root — the pre-existing behavior, and what always
+/// happens for a directly-launched CLI process or when export is off.
+pub(crate) fn parent_context_from_env() -> Option<opentelemetry::Context> {
+    parent_context_from_traceparent(std::env::var(EnvVars::TRACEPARENT).ok().as_deref())
+}
+
+/// Pure parse of a `traceparent` value into a parent context. `None` for an
+/// unset, empty, or unparseable value: the propagator returns the context
+/// unchanged when it cannot extract a valid span context, and parenting a span
+/// on THAT would be a no-op with a misleading name, so it is filtered out here.
+fn parent_context_from_traceparent(raw: Option<&str>) -> Option<opentelemetry::Context> {
+    use opentelemetry::propagation::TextMapPropagator as _;
+    use opentelemetry::trace::TraceContextExt as _;
+    use opentelemetry_sdk::propagation::TraceContextPropagator;
+
+    let value = raw.map(str::trim).filter(|trimmed| !trimmed.is_empty())?;
+    let carrier = std::collections::HashMap::from([("traceparent".to_string(), value.to_string())]);
+    let cx = TraceContextPropagator::new().extract(&carrier);
+    cx.span().span_context().is_valid().then_some(cx)
+}
+
 /// Best-effort final flush + shutdown of the OTLP provider so the current batch
 /// drains on a normal exit. No-op when OTLP was never configured. Call once,
 /// late in `main`, right beside fabro's own `fabro_telemetry::shutdown()` and
@@ -202,6 +229,42 @@ pub(crate) fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parent_context_from_traceparent_extracts_a_valid_w3c_value() {
+        use opentelemetry::trace::TraceContextExt as _;
+
+        let cx = parent_context_from_traceparent(Some(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        ))
+        .expect("a valid traceparent yields a parent context");
+        let span_context = cx.span().span_context().clone();
+        assert!(span_context.is_valid());
+        assert_eq!(
+            span_context.trace_id().to_string(),
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+        assert_eq!(span_context.span_id().to_string(), "00f067aa0ba902b7");
+        assert!(span_context.is_sampled());
+    }
+
+    // Every non-propagating input must leave the caller's span a root rather
+    // than attach an invalid parent: the worker runs unparented today, and O2
+    // must not change that when export is off or the value is junk.
+    #[test]
+    fn parent_context_from_traceparent_rejects_unset_empty_and_malformed_values() {
+        assert!(parent_context_from_traceparent(None).is_none());
+        assert!(parent_context_from_traceparent(Some("")).is_none());
+        assert!(parent_context_from_traceparent(Some("   ")).is_none());
+        assert!(parent_context_from_traceparent(Some("not-a-traceparent")).is_none());
+        // Well-formed shape, but all-zero (invalid) trace and span ids.
+        assert!(
+            parent_context_from_traceparent(Some(
+                "00-00000000000000000000000000000000-0000000000000000-01"
+            ))
+            .is_none()
+        );
+    }
 
     #[test]
     fn parse_protocol_recognizes_json_and_protobuf() {

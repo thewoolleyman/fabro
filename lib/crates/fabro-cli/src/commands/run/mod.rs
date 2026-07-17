@@ -4,6 +4,7 @@ use tracing::Instrument as _;
 
 use crate::args::{AttachArgs, RunCommands, RunWorkerArgs, StartArgs};
 use crate::command_context::CommandContext;
+use crate::otel::parent_context_from_env;
 use crate::shared::print_json_pretty;
 #[cfg(feature = "sleep_inhibitor")]
 use crate::sleep_inhibitor;
@@ -94,6 +95,13 @@ pub(crate) async fn dispatch(
                     anyhow!("FABRO_WORKER_TOKEN is required for worker subprocess auth")
                 })?;
             let run_span = tracing::info_span!("run", id = %run_id);
+            // Join the server's trace when it propagated one (see fabro-server's
+            // `otel_propagation`); otherwise this span stays a root, as it always
+            // has for a directly-launched worker or when OTLP export is off.
+            if let Some(parent_cx) = parent_context_from_env() {
+                use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+                run_span.set_parent(parent_cx);
+            }
             Box::pin(
                 runner::execute(run_id, server, storage_dir, run_dir, mode, &worker_token)
                     .instrument(run_span),

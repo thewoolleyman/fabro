@@ -144,6 +144,10 @@ impl EnvVars {
     pub const OTEL_EXPORTER_OTLP_TRACES_PROTOCOL: &'static str =
         "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL";
     pub const OTEL_SERVICE_NAME: &'static str = "OTEL_SERVICE_NAME";
+    /// W3C Trace Context carrier used to parent a subprocess's spans on the
+    /// span that spawned it. Not an `OTEL_`-prefixed SDK knob: it is per-run
+    /// data (trace/span ids + flags), not export config, and it is non-secret.
+    pub const TRACEPARENT: &'static str = "TRACEPARENT";
 }
 
 #[cfg(test)]
@@ -280,6 +284,7 @@ mod tests {
             EnvVars::OTEL_EXPORTER_OTLP_PROTOCOL,
             EnvVars::OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,
             EnvVars::OTEL_SERVICE_NAME,
+            EnvVars::TRACEPARENT,
         ];
 
         for value in values {
