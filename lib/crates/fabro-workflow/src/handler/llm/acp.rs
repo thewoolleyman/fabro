@@ -22,6 +22,7 @@ use fabro_util::time::elapsed_ms;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
+use tracing::{Instrument as _, field};
 
 use super::super::agent::{CodergenBackend, CodergenResult, CodergenRunRequest, OneShotRequest};
 use super::activation_lease::{ActivationLease, ActivationLeaseOptions};
@@ -214,7 +215,7 @@ impl AgentAcpBackend {
             &Event::AgentAcpStarted {
                 node_id:     node.id.clone(),
                 visit:       stage_scope.visit,
-                command:     command_display,
+                command:     command_display.clone(),
                 config_name: config_name.clone(),
             },
             stage_scope,
@@ -330,6 +331,17 @@ impl AgentAcpBackend {
 
         let files_before = changed_files::detect_changed_files(sandbox).await;
         let launch_start = std::time::Instant::now();
+        // O4: a per-ACP-turn span carrying which command/config ran, the visit
+        // counter, and the terminal stop reason (recorded below on the arms that
+        // know it). Non-secret fields only — no prompt text, no tool output.
+        let turn_span = tracing::info_span!(
+            "run_turn",
+            node_id = %node.id,
+            command = %command_display,
+            config_name = config_name.as_deref().unwrap_or_default(),
+            visit = stage_scope.visit,
+            stop_reason = field::Empty,
+        );
         let result = match fabro_acp::run_acp_turn(AcpRunRequest {
             command: process_spec,
             prompt,
@@ -345,15 +357,18 @@ impl AgentAcpBackend {
                 on_steer_prompt,
             }),
         })
+        .instrument(turn_span.clone())
         .await
         {
             Ok(result) => {
+                let stop_reason = render_stop_reason(&result.stop_reason);
+                turn_span.record("stop_reason", field::display(&stop_reason));
                 emitter.emit_scoped(
                     &Event::AgentAcpCompleted {
-                        node_id:     node.id.clone(),
-                        stdout:      result.text.clone(),
-                        stderr:      result.stderr.clone(),
-                        stop_reason: render_stop_reason(&result.stop_reason),
+                        node_id: node.id.clone(),
+                        stdout: result.text.clone(),
+                        stderr: result.stderr.clone(),
+                        stop_reason,
                         duration_ms: result.duration_ms,
                     },
                     stage_scope,
@@ -361,6 +376,7 @@ impl AgentAcpBackend {
                 result
             }
             Err(AcpError::Cancelled) => {
+                turn_span.record("stop_reason", "cancelled");
                 emitter.emit_scoped(
                     &Event::AgentAcpCancelled {
                         node_id:     node.id.clone(),
@@ -373,6 +389,7 @@ impl AgentAcpBackend {
                 return Err(Error::Cancelled);
             }
             Err(AcpError::TimedOut { exec_output_tail }) => {
+                turn_span.record("stop_reason", "timed_out");
                 let stderr = exec_output_tail
                     .as_ref()
                     .and_then(|tail| tail.stderr.clone())
@@ -391,6 +408,7 @@ impl AgentAcpBackend {
                 }));
             }
             Err(AcpError::StopReason { stop_reason, text }) => {
+                turn_span.record("stop_reason", field::display(&stop_reason));
                 emitter.emit_scoped(
                     &Event::AgentAcpCompleted {
                         node_id:     node.id.clone(),
@@ -406,8 +424,16 @@ impl AgentAcpBackend {
                     text,
                 }));
             }
+            // Generic transport/protocol failures carry no model stop reason, so
+            // `stop_reason` stays empty on the span here (a Honeycomb query cannot
+            // assume it is always non-null on a `run_turn` span).
             Err(error) => return Err(acp_error_to_workflow(error)),
         };
+        // Close the turn span at ACP-turn end. The lease release and git file-diff
+        // scan below are post-turn workflow bookkeeping, not part of the turn, so
+        // they should not inflate its span duration. (Early-return arms above drop
+        // the handle at function exit instead, after their own `record`.)
+        drop(turn_span);
         if let Some(lease) = lease_for_completion
             .lock()
             .expect("ACP activation lease lock poisoned")
@@ -616,6 +642,12 @@ mod tests {
     use fabro_sandbox::test_support::MockSandbox;
     use fabro_types::{CommandTermination, EventBody, ExecOutputTail};
     use tokio_util::sync::CancellationToken;
+    use tracing::Subscriber;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::subscriber::set_default;
+    use tracing_subscriber::layer::{Context as LayerContext, Layer, SubscriberExt};
+    use tracing_subscriber::registry::LookupSpan;
 
     use super::{
         AgentAcpBackend, acp_error_to_workflow, parse_refresh_enabled, parse_refresh_interval,
@@ -1197,6 +1229,227 @@ mod tests {
                 .any(|cause| cause.contains("early boom")),
             "raw stderr belongs in exec_output_tail, not causes: {:?}",
             detail.causes
+        );
+    }
+
+    /// A minimal `tracing` layer that records each span's name plus its
+    /// captured field values — including deferred `record()` updates — so a
+    /// test can assert on the O4 `run_turn` span without a live OTLP
+    /// endpoint. Keyed by span id with no `on_close` eviction: the Registry
+    /// reuses ids after close, so this relies on the tested code creating no
+    /// further span after `run_turn` closes (true today — fabro-workflow's only
+    /// span is `run_turn`).
+    #[derive(Clone, Default)]
+    struct SpanCapture {
+        spans: Arc<Mutex<HashMap<u64, CapturedSpan>>>,
+    }
+
+    struct CapturedSpan {
+        name:   &'static str,
+        fields: HashMap<String, String>,
+    }
+
+    struct FieldCollector<'a>(&'a mut HashMap<String, String>);
+
+    impl Visit for FieldCollector<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    impl<S> Layer<S> for SpanCapture
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, _ctx: LayerContext<'_, S>) {
+            let mut fields = HashMap::new();
+            attrs.record(&mut FieldCollector(&mut fields));
+            self.spans
+                .lock()
+                .unwrap()
+                .insert(id.into_u64(), CapturedSpan {
+                    name: attrs.metadata().name(),
+                    fields,
+                });
+        }
+
+        fn on_record(&self, id: &Id, values: &Record<'_>, _ctx: LayerContext<'_, S>) {
+            if let Some(span) = self.spans.lock().unwrap().get_mut(&id.into_u64()) {
+                values.record(&mut FieldCollector(&mut span.fields));
+            }
+        }
+    }
+
+    /// O4: a completing ACP turn creates a `run_turn` span carrying the
+    /// non-secret command / config_name / visit fields, and records the
+    /// terminal `stop_reason` on the completing arm. This is the
+    /// field-wiring guard for the per-turn telemetry the Codex-era factory
+    /// relies on.
+    #[tokio::test]
+    async fn run_turn_emits_span_with_command_visit_and_stop_reason() {
+        let capture = SpanCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _guard = set_default(subscriber);
+
+        let tempdir = tempfile::tempdir().unwrap();
+        init_git(tempdir.path());
+        let script_path = tempdir.path().join("fake_acp_agent.py");
+        tokio::fs::write(&script_path, fake_acp_agent_script())
+            .await
+            .unwrap();
+
+        let mut node = Node::new("work");
+        node.attrs
+            .insert("backend".to_string(), AttrValue::String("acp".to_string()));
+        node.attrs.insert(
+            "acp.command".to_string(),
+            AttrValue::String(format!(
+                "python3 {}",
+                shell_quote(&script_path.to_string_lossy())
+            )),
+        );
+
+        let backend = AgentAcpBackend::new().with_env(HashMap::from([(
+            "ACP_MODE".to_string(),
+            "write_file".to_string(),
+        )]));
+        let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(tempdir.path().to_path_buf()));
+        let emitter = Arc::new(Emitter::default());
+        let context = Context::new();
+        backend
+            .run(CodergenRunRequest {
+                node:               &node,
+                prompt:             "write hello",
+                context:            &context,
+                thread_id:          None,
+                emitter:            &emitter,
+                sandbox:            &sandbox,
+                tool_hooks:         None,
+                cancel_token:       CancellationToken::new(),
+                agent_tool_runtime: fabro_agent::AgentToolRuntime::default(),
+            })
+            .await
+            .unwrap();
+
+        let spans = capture.spans.lock().unwrap();
+        let turn = spans
+            .values()
+            .find(|span| span.name == "run_turn")
+            .expect("a run_turn span should have been created");
+        assert!(
+            turn.fields
+                .get("command")
+                .is_some_and(|command| command.contains("python3")),
+            "command field should carry the launched process: {:?}",
+            turn.fields,
+        );
+        assert_eq!(
+            turn.fields.get("visit").map(String::as_str),
+            Some("1"),
+            "visit field should be the first-visit counter: {:?}",
+            turn.fields,
+        );
+        assert!(
+            turn.fields.contains_key("config_name"),
+            "config_name field should always be present (empty when unnamed): {:?}",
+            turn.fields,
+        );
+        assert_eq!(
+            turn.fields.get("node_id").map(String::as_str),
+            Some("work"),
+            "node_id field should carry the node id: {:?}",
+            turn.fields,
+        );
+        assert_eq!(
+            turn.fields.get("stop_reason").map(String::as_str),
+            Some("end_turn"),
+            "stop_reason should be recorded from the completing arm: {:?}",
+            turn.fields,
+        );
+    }
+
+    /// O4: an ACP turn that ends on a non-terminal stop reason takes the
+    /// `Err(AcpError::StopReason)` early-return arm, which must still record
+    /// the rendered stop reason on the `run_turn` span before the span
+    /// closes. This guards the deferred-record-on-an-early-return path —
+    /// distinct from the `Ok` arm covered above.
+    #[tokio::test]
+    async fn run_turn_records_stop_reason_on_the_error_arm() {
+        let capture = SpanCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _guard = set_default(subscriber);
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let script_path = tempdir.path().join("fake_acp_agent.py");
+        tokio::fs::write(&script_path, fake_acp_agent_script())
+            .await
+            .unwrap();
+
+        let mut node = Node::new("work");
+        node.attrs.insert(
+            "acp.command".to_string(),
+            AttrValue::String(format!(
+                "python3 {}",
+                shell_quote(&script_path.to_string_lossy())
+            )),
+        );
+
+        // `max_tokens` is neither EndTurn/Refusal (Ok) nor Cancelled, so
+        // run_acp_turn returns Err(AcpError::StopReason { .. }).
+        let backend = AgentAcpBackend::new().with_env(HashMap::from([(
+            "ACP_STOP_REASON".to_string(),
+            "max_tokens".to_string(),
+        )]));
+        let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(tempdir.path().to_path_buf()));
+        let emitter = Arc::new(Emitter::default());
+        let context = Context::new();
+        let result = backend
+            .run(CodergenRunRequest {
+                node:               &node,
+                prompt:             "write hello",
+                context:            &context,
+                thread_id:          None,
+                emitter:            &emitter,
+                sandbox:            &sandbox,
+                tool_hooks:         None,
+                cancel_token:       CancellationToken::new(),
+                agent_tool_runtime: fabro_agent::AgentToolRuntime::default(),
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "a max_tokens stop reason should surface as an error",
+        );
+
+        let spans = capture.spans.lock().unwrap();
+        let turn = spans
+            .values()
+            .find(|span| span.name == "run_turn")
+            .expect("a run_turn span should have been created");
+        assert_eq!(
+            turn.fields.get("stop_reason").map(String::as_str),
+            Some("max_tokens"),
+            "stop_reason should be recorded on the StopReason error arm: {:?}",
+            turn.fields,
+        );
+        assert_eq!(
+            turn.fields.get("node_id").map(String::as_str),
+            Some("work"),
+            "node_id should be present even on the error arm: {:?}",
+            turn.fields,
         );
     }
 
