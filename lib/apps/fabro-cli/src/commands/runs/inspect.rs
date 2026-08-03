@@ -26,10 +26,25 @@ pub(crate) async fn run(args: &InspectArgs, base_ctx: &CommandContext) -> Result
     let run = ServerRunInfo::from_run(client.resolve_run(&args.run).await?);
     let run_id = run.run_id();
     let state = client.get_run_state(&run_id).await?;
-    let output = inspect_run_state(&run, state);
-    let json = serde_json::to_string_pretty(&[output])?;
+    let mut output = inspect_run_state(&run, state);
+    redact_run_environment(&mut output.run_spec);
+    let output = fabro_redact::redact_json_value(serde_json::to_value([output])?);
+    let json = serde_json::to_string_pretty(&output)?;
     fabro_util::printout!(printer, "{json}");
     Ok(())
+}
+
+fn redact_run_environment(run_spec: &mut Option<serde_json::Value>) {
+    let Some(env) = run_spec
+        .as_mut()
+        .and_then(|spec| spec.pointer_mut("/settings/run/environment/env"))
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    for value in env.values_mut() {
+        *value = serde_json::Value::String("REDACTED".to_string());
+    }
 }
 
 fn inspect_run_state(run: &ServerRunInfo, state: RunProjection) -> InspectOutput {
