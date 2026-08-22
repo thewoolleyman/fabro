@@ -2803,9 +2803,10 @@ fn worker_token_claims(cmd: &Command, state: &AppState) -> crate::worker_token::
 
 #[derive(Default)]
 struct RecordingWorkerRuntime {
-    requested: StdMutex<Vec<WorkerRef>>,
-    forced:    StdMutex<Vec<WorkerRef>>,
-    alive:     AtomicBool,
+    requested:            StdMutex<Vec<WorkerRef>>,
+    forced:               StdMutex<Vec<WorkerRef>>,
+    alive:                AtomicBool,
+    started_traceparents: StdMutex<Vec<Option<String>>>,
 }
 
 impl RecordingWorkerRuntime {
@@ -2823,11 +2824,31 @@ impl RecordingWorkerRuntime {
     fn set_alive(&self, alive: bool) {
         self.alive.store(alive, Ordering::Relaxed);
     }
+
+    /// Every `traceparent` this runtime has been handed on a launch spec, in
+    /// call order. `None` entries are real observations, not absences: they are
+    /// exactly the silent-disconnection failure the O2 site guard exists to
+    /// catch.
+    fn started_traceparents(&self) -> Vec<Option<String>> {
+        self.started_traceparents
+            .lock()
+            .expect("started_traceparents lock poisoned")
+            .clone()
+    }
 }
 
 #[async_trait::async_trait]
 impl WorkerRuntime for RecordingWorkerRuntime {
-    async fn start(&self, _spec: WorkerLaunchSpec) -> anyhow::Result<StartedWorker> {
+    async fn start(&self, spec: WorkerLaunchSpec) -> anyhow::Result<StartedWorker> {
+        // Record the captured W3C context BEFORE bailing. This is the only
+        // point at which the traceparent the server captured for this run is
+        // observable from a test, and it is what lets the O2 site guard below
+        // assert on the capture SITE rather than on `current_traceparent`'s own
+        // behavior. Still bails afterwards, so existing callers are unaffected.
+        self.started_traceparents
+            .lock()
+            .expect("started_traceparents lock poisoned")
+            .push(spec.traceparent.clone());
         anyhow::bail!("recording runtime does not start workers")
     }
 
@@ -2849,6 +2870,186 @@ impl WorkerRuntime for RecordingWorkerRuntime {
     async fn is_alive(&self, _worker_ref: &WorkerRef) -> bool {
         self.alive.load(Ordering::Relaxed)
     }
+}
+
+/// Installs a PROCESS-GLOBAL subscriber carrying a real `tracing-opentelemetry`
+/// layer, so `current_traceparent()` has a valid span context to serialize.
+///
+/// Global rather than `with_default`, and that choice is load-bearing: the O2
+/// site guard drives a run through `spawn_scheduler`, whose work runs on tasks
+/// this thread does not own, so a thread-local dispatcher would never reach
+/// them. nextest is process-per-test (`.config/nextest.toml`), so the global
+/// slot is free. Under a plain `cargo test` several tests share one process and
+/// the second caller here FAILS rather than silently passing — the safe
+/// direction for a guard.
+///
+/// The returned provider must be held for the life of the test: dropping it
+/// shuts the tracer down and capture reverts to `None`.
+#[must_use]
+fn install_global_otel_subscriber() -> opentelemetry_sdk::trace::SdkTracerProvider {
+    use opentelemetry::trace::TracerProvider as _;
+
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("o2-site-guard")));
+    subscriber::set_global_default(subscriber)
+        .expect("nextest runs one test per process, so the global subscriber slot is free");
+    provider
+}
+
+fn assert_well_formed_traceparent(traceparent: &str) {
+    let parts = traceparent.split('-').collect::<Vec<_>>();
+    assert_eq!(parts.len(), 4, "malformed traceparent: {traceparent}");
+    assert_eq!(
+        parts[0], "00",
+        "unexpected traceparent version: {traceparent}"
+    );
+    assert_eq!(
+        parts[1].len(),
+        32,
+        "trace id must be 32 hex chars: {traceparent}"
+    );
+    assert_eq!(
+        parts[2].len(),
+        16,
+        "span id must be 16 hex chars: {traceparent}"
+    );
+    assert_ne!(
+        parts[1],
+        "0".repeat(32),
+        "trace id must be valid: {traceparent}"
+    );
+    assert_ne!(
+        parts[2],
+        "0".repeat(16),
+        "span id must be valid: {traceparent}"
+    );
+}
+
+/// An app state on the SUBPROCESS execution path — the path the O2 capture site
+/// lives on.
+///
+/// Three things matter here. It leaves `registry_factory_override` unset, so
+/// `execute_run` routes to `execute_run_subprocess` rather than running the run
+/// in process. It writes a `ServerDaemon` record, without which
+/// `worker_launch_spec` errors on a missing server record and the worker
+/// runtime is never called at all — the guard would then fail for a reason
+/// unrelated to tracing. And it installs the recording runtime, which is what
+/// makes the captured traceparent observable.
+fn traceparent_site_test_state(runtime: StdArc<RecordingWorkerRuntime>) -> Arc<AppState> {
+    let storage_dir = std::env::temp_dir().join(format!("fabro-server-o2-site-{}", Ulid::new()));
+    std::fs::create_dir_all(&storage_dir).expect("test storage dir should be creatable");
+    let source = format!(
+        r#"
+_version = 1
+
+[server.storage]
+root = "{}"
+
+[server.auth]
+methods = ["dev-token"]
+"#,
+        storage_dir.display()
+    );
+    let runtime_directory = Storage::new(&storage_dir).runtime_directory();
+    ServerDaemon::new(
+        std::process::id(),
+        Bind::Tcp("127.0.0.1:32276".parse::<std::net::SocketAddr>().unwrap()),
+        runtime_directory.log_path(),
+    )
+    .write(&runtime_directory)
+    .expect("test daemon record should be writable");
+
+    TestAppStateBuilder::new()
+        .runtime_settings(
+            server_settings_from_toml(&source),
+            manifest_run_defaults_from_toml(&source),
+        )
+        .max_concurrent_runs(5)
+        .worker_runtime(runtime)
+        .build()
+}
+
+/// Waits for the scheduler to reach `WorkerRuntime::start`, returning the
+/// traceparent it was handed. Panics rather than returning `None` if the launch
+/// is never attempted, so "the run never got that far" cannot masquerade as
+/// "the traceparent was absent".
+async fn await_first_started_traceparent(runtime: &RecordingWorkerRuntime) -> Option<String> {
+    for _ in 0..400 {
+        if let Some(first) = runtime.started_traceparents().first().cloned() {
+            return first;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!(
+        "the scheduler never reached WorkerRuntime::start, so the capture site was never exercised"
+    );
+}
+
+/// O2 SITE GUARD. `current_traceparent()` must be called inside the
+/// run-span-instrumented future in `execute_run_subprocess` — NOT inside the
+/// `spawn_blocking` closure that builds the launch spec a few lines below it.
+///
+/// Both arrangements compile and neither raises an error at runtime; the wrong
+/// one simply captures `None` forever, and every run silently reverts to two
+/// disconnected traces. Until now that property rested only on comments at both
+/// ends.
+///
+/// This drives a real run through `spawn_scheduler`, so it fails for EITHER
+/// regression named in the item: the capture moving off the instrumented
+/// future, or the `.instrument()` at the `spawn_scheduler` site being dropped.
+///
+/// Its companion control, `spawn_blocking_does_not_carry_the_run_span`, proves
+/// this assertion can fail.
+#[tokio::test]
+async fn run_traceparent_is_captured_inside_the_instrumented_run_future() {
+    let _provider = install_global_otel_subscriber();
+
+    let runtime = StdArc::new(RecordingWorkerRuntime::default());
+    let state = traceparent_site_test_state(StdArc::clone(&runtime));
+    let app = test_app_with_scheduler(state);
+
+    create_and_start_run(&app, MINIMAL_DOT).await;
+
+    let traceparent = await_first_started_traceparent(&runtime).await.expect(
+        "the run span must reach the launch spec: `None` here means the capture happened off the \
+         instrumented future — moved into `spawn_blocking`, or `.instrument()` dropped at the \
+         `spawn_scheduler` site — and every run would silently split into two traces",
+    );
+    assert_well_formed_traceparent(&traceparent);
+}
+
+/// CONTROL for the O2 site guard, proving its assertion is not vacuous.
+///
+/// Same process-global layer, same live `run` span; the ONLY variable is WHERE
+/// the capture happens. Inside the instrumented future it yields a well-formed
+/// traceparent; inside a `spawn_blocking` closure — a pool thread that does not
+/// carry the span — the identical call yields `None`.
+///
+/// That `None` is exactly what the guard above would observe if someone moved
+/// the call, which is what makes the guard's `Some` assertion meaningful rather
+/// than something that could never have failed.
+#[tokio::test]
+async fn spawn_blocking_does_not_carry_the_run_span() {
+    let _provider = install_global_otel_subscriber();
+
+    async {
+        let inside_instrumented_future = current_traceparent();
+        let inside_blocking_closure = tokio::task::spawn_blocking(current_traceparent)
+            .await
+            .expect("blocking capture task should join");
+
+        let captured =
+            inside_instrumented_future.expect("the instrumented future must carry the run span");
+        assert_well_formed_traceparent(&captured);
+        assert_eq!(
+            inside_blocking_closure, None,
+            "the `spawn_blocking` pool thread must NOT carry the run span — this is precisely why \
+             the capture site in `execute_run_subprocess` is load-bearing",
+        );
+    }
+    .instrument(tracing::info_span!("run", id = "o2-site-control"))
+    .await;
 }
 
 async fn worker_transport_with_receiver(
