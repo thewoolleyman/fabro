@@ -199,6 +199,15 @@ Informational, warning, or error notice emitted during the run.
 | `level` | string | `"info"`, `"warn"`, or `"error"` |
 | `code` | string | Machine-readable notice code |
 | `message` | string | Human-readable message |
+| `exec_output_tail` | object | Optional redacted stdout/stderr tail of the failing command, when one was captured |
+
+Checkpoint-related notice codes:
+
+| Code | Level | Scope | Meaning |
+|------|-------|-------|---------|
+| `checkpoint_empty` | `info` | node | The run-branch checkpoint found nothing staged after `git add`, so no checkpoint commit was created and HEAD is unchanged. No `git.commit` follows; the message names the unchanged HEAD. |
+| `parallel_branch_checkpoint_failed` | `warn` | parallel branch | The branch checkpoint's staged-change probe or commit failed (an exit code other than the probe's 0/1, or a commit error); the branch head is left at its previous commit and no `git.commit` is emitted. Carries `exec_output_tail` when available. |
+| `checkpoint_metadata_degraded` | `warn` | run | Summary signal that metadata snapshots are degraded; see `metadata.snapshot.failed`. |
 
 ### `run.interrupt`
 
@@ -1656,6 +1665,72 @@ Emitted when the agent fails over to a different LLM provider/model.
 | `error` | string | Error that triggered failover |
 
 ---
+
+### ACP agent events
+
+Emitted by the ACP (Agent Client Protocol) handler around one agent turn in the sandbox. The `stdout`/`stderr` fields on the terminal events are bounded tails, not full transcripts.
+
+### `agent.acp.started`
+
+Emitted when an ACP turn is launched.
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `visit` | number | Node visit count (1-based) |
+| `command` | string | Adapter command that was launched |
+| `config_name` | string | Optional named ACP config the turn resolved |
+
+### `agent.acp.completed`
+
+Emitted when an ACP turn ends with a stop reason.
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `stdout` | string | Bounded tail of the agent's message text |
+| `stderr` | string | Bounded tail of the adapter process's stderr |
+| `stop_reason` | string | ACP stop reason (e.g. `end_turn`) |
+| `duration_ms` | number | Milliseconds from launch to completion |
+
+### `agent.acp.cancelled`
+
+Emitted when an ACP turn is cancelled.
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `stdout` | string | Bounded tail of the agent's message text |
+| `stderr` | string | Bounded tail of the adapter process's stderr |
+| `duration_ms` | number | Milliseconds from launch to cancellation |
+
+### `agent.acp.timed_out`
+
+Emitted when an ACP turn exceeds its deadline. Carries the progress evidence the turn produced before the deadline so a stuck turn and a working-but-slow turn are distinguishable from the event alone.
+
+```json
+{
+  "id": "...", "ts": "...", "run_id": "...",
+  "event": "agent.acp.timed_out",
+  "node_id": "implement", "node_label": "implement",
+  "properties": {
+    "stdout": "…last agent message text before the deadline…",
+    "stderr": "",
+    "duration_ms": 14400071,
+    "tool_call_count": 57,
+    "update_count": 812,
+    "last_activity_ms": 14399120
+  }
+}
+```
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `stdout` | string | Bounded tail of the agent's MESSAGE TEXT streamed via `session/update` before the deadline, or the explicit marker `output not captured: no agent message text before the timeout` when none arrived. Never the adapter process's stdout and never empty. |
+| `stderr` | string | Bounded tail of the adapter process's stderr, when captured |
+| `duration_ms` | number | Milliseconds from launch to the deadline |
+| `tool_call_count` | number | Tool calls the agent started before the deadline (defaults to `0` on stored runs written before this field existed) |
+| `update_count` | number | `session/update` notifications received before the deadline. `0` is the zero-activity discriminator: the adapter never sent an update, as opposed to a turn that was working and ran out of time (defaults to `0` on older stored runs) |
+| `last_activity_ms` | number | Milliseconds from launch to the last `session/update`, absent when none arrived |
+
+The failure message on the corresponding `stage.failed` summarises the same three counters.
 
 ## Subgraph events
 

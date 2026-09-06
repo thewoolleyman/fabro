@@ -152,6 +152,13 @@ pub async fn git_checkpoint(
         .exec_command(&staged_cmd, checkpoint.commit_timeout_ms, None, None, None)
         .await;
     match staged_result {
+        // A probe that timed out or was cancelled carries no verdict about
+        // the index, whatever exit code the sandbox attached to it: reject it
+        // before any exit-code arm can read it as "nothing staged" or
+        // "changes staged".
+        Ok(r) if r.is_timed_out() || r.is_cancelled() => {
+            return Err(exec_err("git diff --cached", r));
+        }
         Ok(r) if r.is_success() => {
             let sha = git_head_sha(sandbox).await?;
             return Ok(GitCheckpoint {
@@ -1454,6 +1461,63 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.to_string(), "git diff --cached failed (exit 128)");
         assert_eq!(err.kind, GitCommandErrorKind::Failed);
+    }
+
+    #[tokio::test]
+    async fn git_checkpoint_rejects_a_timed_out_staged_probe_before_reading_its_exit_code() {
+        // add ok, then the probe times out while carrying exit code 1. Read
+        // by exit code alone that is "changes staged" and a commit follows;
+        // a timed-out probe must instead fail the checkpoint as timed out.
+        let timed_out_probe = ExecResult {
+            exit_code: Some(1),
+            ..exec_timed_out(45)
+        };
+        let sandbox = ScriptedSandbox::new(vec![exec_ok(), timed_out_probe]);
+        let err = git_checkpoint(
+            &sandbox,
+            "run1",
+            "work",
+            "success",
+            1,
+            None,
+            &RunCheckpointSettings::default(),
+            &crate::git::GitAuthor::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.to_string(), "git diff --cached timed out after 45ms");
+        assert_eq!(err.kind, GitCommandErrorKind::TimedOut);
+        let commands = sandbox.commands();
+        assert!(
+            !commands.iter().any(|c| c.contains(" commit ")),
+            "no commit may follow a timed-out probe; got {commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_checkpoint_rejects_a_cancelled_staged_probe_before_reading_its_exit_code() {
+        // add ok, then the probe is cancelled while carrying exit code 0,
+        // which read by exit code alone is "nothing staged, HEAD unchanged".
+        let cancelled_probe = ExecResult {
+            exit_code: Some(0),
+            termination: CommandTermination::Cancelled,
+            ..exec_timed_out(12)
+        };
+        let sandbox = ScriptedSandbox::new(vec![exec_ok(), cancelled_probe]);
+        let err = git_checkpoint(
+            &sandbox,
+            "run1",
+            "work",
+            "success",
+            1,
+            None,
+            &RunCheckpointSettings::default(),
+            &crate::git::GitAuthor::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.to_string(), "git diff --cached cancelled after 12ms");
+        assert_eq!(err.kind, GitCommandErrorKind::Cancelled);
     }
 
     #[test]
