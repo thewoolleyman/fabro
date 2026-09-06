@@ -1,6 +1,7 @@
 use fabro_types::{CommandTermination, ExecOutputTail};
 
 use crate::command::AcpCommandError;
+use crate::session::AcpTurnProgress;
 
 #[derive(Debug)]
 pub struct AcpProcessExit {
@@ -39,6 +40,9 @@ pub enum AcpError {
     #[error("ACP turn timed out")]
     TimedOut {
         exec_output_tail: Option<ExecOutputTail>,
+        /// What the agent had done before the deadline, so a working agent
+        /// is never reported as zero-output.
+        progress:         AcpTurnProgress,
     },
 
     #[error("{0}")]
@@ -55,7 +59,9 @@ impl AcpError {
     #[must_use]
     pub fn exec_output_tail(&self) -> Option<ExecOutputTail> {
         match self {
-            Self::TimedOut { exec_output_tail } => exec_output_tail.clone(),
+            Self::TimedOut {
+                exec_output_tail, ..
+            } => exec_output_tail.clone(),
             Self::ProcessExited(exit) => exit.exec_output_tail.clone(),
             Self::Sandbox(source) => source.default_redacted_output_tail(),
             _ => None,

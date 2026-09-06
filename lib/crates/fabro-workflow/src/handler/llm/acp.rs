@@ -388,23 +388,38 @@ impl AgentAcpBackend {
                 );
                 return Err(Error::Cancelled);
             }
-            Err(AcpError::TimedOut { exec_output_tail }) => {
+            Err(AcpError::TimedOut {
+                exec_output_tail,
+                progress,
+            }) => {
                 turn_span.record("stop_reason", "timed_out");
                 let stderr = exec_output_tail
                     .as_ref()
                     .and_then(|tail| tail.stderr.clone())
                     .unwrap_or_default();
+                // Never report a bare empty stdout: carry the agent's text
+                // tail when there is one, and say explicitly when there is
+                // not, beside the tool-call and update counts.
+                let stdout = if progress.text_tail.is_empty() {
+                    ACP_TIMEOUT_NO_OUTPUT_MARKER.to_string()
+                } else {
+                    progress.text_tail.clone()
+                };
                 emitter.emit_scoped(
                     &Event::AgentAcpTimedOut {
-                        node_id:     node.id.clone(),
-                        stdout:      String::new(),
-                        stderr:      stderr.clone(),
+                        node_id: node.id.clone(),
+                        stdout,
+                        stderr: stderr.clone(),
                         duration_ms: elapsed_ms(launch_start),
+                        tool_call_count: progress.tool_call_count,
+                        update_count: progress.update_count,
+                        last_activity_ms: progress.last_activity_ms,
                     },
                     stage_scope,
                 );
                 return Err(acp_error_to_workflow(AcpError::TimedOut {
                     exec_output_tail,
+                    progress,
                 }));
             }
             Err(AcpError::StopReason { stop_reason, text }) => {
@@ -607,12 +622,31 @@ fn resolve_acp_process_spec(node: &Node) -> Result<AcpProcessSpec, Error> {
     .map_err(acp_process_error_to_workflow)
 }
 
+/// Marker carried as `stdout` on a timed-out ACP turn that streamed no
+/// agent text, so an empty field is an explicit statement and not a gap.
+pub(crate) const ACP_TIMEOUT_NO_OUTPUT_MARKER: &str =
+    "output not captured: no agent message text before the timeout";
+
+/// One-line progress summary for a timed-out turn, rendered into the
+/// failure message so `fabro inspect` shows what the agent was doing.
+fn acp_timeout_message(progress: &fabro_acp::AcpTurnProgress) -> String {
+    let last_activity = progress.last_activity_ms.map_or_else(
+        || "no updates received".to_string(),
+        |ms| format!("last update at {ms}ms"),
+    );
+    format!(
+        "ACP turn timed out after {} tool call(s) and {} session update(s); {last_activity}",
+        progress.tool_call_count, progress.update_count
+    )
+}
+
 fn acp_error_to_workflow(error: AcpError) -> Error {
     match error {
         AcpError::Cancelled => Error::Cancelled,
-        AcpError::TimedOut { exec_output_tail } => {
-            Error::handler_with_exec_output_tail("ACP turn timed out", exec_output_tail)
-        }
+        AcpError::TimedOut {
+            exec_output_tail,
+            progress,
+        } => Error::handler_with_exec_output_tail(acp_timeout_message(&progress), exec_output_tail),
         AcpError::StopReason { stop_reason, text } => {
             Error::handler(format!("ACP prompt stopped with {stop_reason}: {text}"))
         }
@@ -1188,11 +1222,20 @@ mod tests {
             stderr_truncated: true,
         };
         let err = acp_error_to_workflow(AcpError::TimedOut {
+            progress:         fabro_acp::AcpTurnProgress {
+                text_tail:        "working...".to_string(),
+                update_count:     7,
+                tool_call_count:  3,
+                last_activity_ms: Some(1234),
+            },
             exec_output_tail: Some(tail.clone()),
         });
 
         let detail = err.to_failure_detail();
-        assert_eq!(detail.message, "ACP turn timed out");
+        assert_eq!(
+            detail.message,
+            "ACP turn timed out after 3 tool call(s) and 7 session update(s); last update at 1234ms"
+        );
         assert!(detail.causes.is_empty());
         assert_eq!(detail.exec_output_tail, Some(tail));
     }

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::{
     CancelNotification, ContentBlock, ContentChunk, InitializeRequest, PermissionOptionKind,
@@ -25,6 +25,75 @@ pub type AcpNaturalCompletionCallback = Arc<dyn Fn() -> bool + Send + Sync>;
 pub type AcpSteerPromptCallback = Arc<dyn Fn(String, Option<Principal>) + Send + Sync>;
 
 const CANCEL_GRACE_PERIOD: Duration = Duration::from_millis(500);
+
+/// Upper bound on the agent text tail carried in [`AcpTurnProgress`].
+pub const PROGRESS_TEXT_TAIL_BYTES: usize = 4096;
+
+/// Progress evidence gathered from the live ACP session, reported when a
+/// turn ends abnormally (today: on timeout). It exists so that a turn which
+/// exceeded its deadline while the agent was busy -- tool calls flowing,
+/// text streaming -- is never described as a zero-output hang.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AcpTurnProgress {
+    /// Tail of the agent message text accumulated so far, bounded to
+    /// [`PROGRESS_TEXT_TAIL_BYTES`] and cut on a char boundary.
+    pub text_tail:        String,
+    /// Number of `session/update` notifications received.
+    pub update_count:     u64,
+    /// Number of tool calls the agent started (`SessionUpdate::ToolCall`).
+    pub tool_call_count:  u64,
+    /// Milliseconds from turn launch to the most recent update, if any.
+    pub last_activity_ms: Option<u64>,
+}
+
+#[derive(Clone)]
+struct ProgressTracker {
+    inner:   Arc<Mutex<AcpTurnProgress>>,
+    started: Instant,
+}
+
+impl ProgressTracker {
+    fn new(started: Instant) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(AcpTurnProgress::default())),
+            started,
+        }
+    }
+
+    fn note_update(&self, is_tool_call: bool) {
+        let mut progress = self.inner.lock().expect("ACP progress lock poisoned");
+        progress.update_count += 1;
+        if is_tool_call {
+            progress.tool_call_count += 1;
+        }
+        progress.last_activity_ms = Some(elapsed_ms(self.started));
+    }
+
+    fn push_text(&self, text: &str) {
+        let mut progress = self.inner.lock().expect("ACP progress lock poisoned");
+        progress.text_tail.push_str(text);
+        trim_to_tail(&mut progress.text_tail, PROGRESS_TEXT_TAIL_BYTES);
+    }
+
+    fn snapshot(&self) -> AcpTurnProgress {
+        self.inner
+            .lock()
+            .expect("ACP progress lock poisoned")
+            .clone()
+    }
+}
+
+/// Keep only the last `max_bytes` of `text`, cutting on a char boundary.
+fn trim_to_tail(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let mut cut = text.len() - max_bytes;
+    while !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    text.drain(..cut);
+}
 
 #[derive(Default)]
 struct AcpControlState {
@@ -193,6 +262,8 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
     let live_control = live_control.unwrap_or_default();
     let start = std::time::Instant::now();
     let state = TransportState::new();
+    let progress = ProgressTracker::new(start);
+    let live_progress = progress.clone();
     let read_cancel_token = cancel_token.clone();
     let run_cancel_token = cancel_token.clone();
     let permission_cancel_token = cancel_token.clone();
@@ -228,6 +299,7 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
                         live_control.on_natural_completion.as_ref(),
                         live_control.on_steer_prompt.as_ref(),
                         on_activity.as_ref(),
+                        &live_progress,
                     )
                     .await
                 })
@@ -247,6 +319,7 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
                     }
                     Err(AcpError::TimedOut {
                         exec_output_tail: state.exec_output_tail().await,
+                        progress:         progress.snapshot(),
                     })
                 }
             }
@@ -342,6 +415,7 @@ async fn read_live_session(
     on_natural_completion: Option<&AcpNaturalCompletionCallback>,
     on_steer_prompt: Option<&AcpSteerPromptCallback>,
     on_activity: Option<&Arc<dyn Fn() + Send + Sync>>,
+    progress: &ProgressTracker,
 ) -> Result<(String, StopReason), ProtocolError> {
     let mut text = String::new();
     let mut prompt_active = true;
@@ -408,10 +482,15 @@ async fn read_live_session(
                     SessionMessage::SessionMessage(dispatch) => {
                         MatchDispatch::new(dispatch)
                             .if_notification(async |notification: SessionNotification| {
+                                progress.note_update(matches!(
+                                    notification.update,
+                                    SessionUpdate::ToolCall(_)
+                                ));
                                 if let SessionUpdate::AgentMessageChunk(ContentChunk {
                                     content: ContentBlock::Text(text_chunk),
                                     ..
                                 }) = notification.update {
+                                    progress.push_text(&text_chunk.text);
                                     text.push_str(&text_chunk.text);
                                 }
                                 Ok(())
@@ -475,5 +554,38 @@ mod tests {
 
         serde_json::from_value::<SessionNotification>(notification)
             .expect("Codex ACP usage_update notifications should be ignored, not fatal");
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn tracker_counts_updates_and_tool_calls_and_keeps_a_bounded_tail() {
+        let tracker = ProgressTracker::new(Instant::now());
+        assert_eq!(tracker.snapshot(), AcpTurnProgress::default());
+
+        tracker.note_update(false);
+        tracker.note_update(true);
+        tracker.note_update(true);
+        tracker.push_text("hello ");
+        tracker.push_text(&"x".repeat(PROGRESS_TEXT_TAIL_BYTES));
+
+        let progress = tracker.snapshot();
+        assert_eq!(progress.update_count, 3);
+        assert_eq!(progress.tool_call_count, 2);
+        assert!(progress.last_activity_ms.is_some());
+        assert_eq!(progress.text_tail.len(), PROGRESS_TEXT_TAIL_BYTES);
+        assert!(!progress.text_tail.contains("hello"));
+    }
+
+    #[test]
+    fn trim_to_tail_cuts_on_a_char_boundary() {
+        let mut text = "aé".repeat(10);
+        trim_to_tail(&mut text, 5);
+        assert!(text.len() <= 5);
+        assert!(std::str::from_utf8(text.as_bytes()).is_ok());
+        assert!(text.ends_with('é'));
     }
 }

@@ -2144,4 +2144,38 @@ mod tests {
             Some("api_transient|openai|rate_limited")
         );
     }
+
+    /// The live rendering of a checkpoint that exhausted its commit budget.
+    /// Routed through `Error::engine` (the old path) the words "timed out"
+    /// classify it as transient infrastructure; carried as
+    /// `Error::Checkpoint` (the path `pipeline::execute` now takes for
+    /// `fabro_core::Error::CheckpointBudgetExceeded`) it is deterministic.
+    #[test]
+    fn checkpoint_budget_expiry_is_deterministic_only_when_carried_typed() {
+        let rendered = "checkpoint operation budget exceeded on node \"review_fix\": git commit timed out after 30001ms";
+        assert_eq!(
+            Error::engine(rendered).failure_category(),
+            FailureCategory::TransientInfra,
+            "the string path still misclassifies; the typed path must be used"
+        );
+        let typed = Error::Checkpoint(rendered.to_string());
+        assert_eq!(typed.failure_category(), FailureCategory::Deterministic);
+        let detail = typed.to_failure_detail();
+        assert_eq!(detail.category, FailureCategory::Deterministic);
+        assert!(
+            detail
+                .message
+                .contains("git commit timed out after 30001ms")
+        );
+
+        // Genuinely transient timeouts keep their category.
+        assert_eq!(
+            classify_failure_reason("request timed out after 30s"),
+            FailureCategory::TransientInfra
+        );
+        assert_eq!(
+            classify_failure_reason("tls handshake timeout"),
+            FailureCategory::TransientInfra
+        );
+    }
 }

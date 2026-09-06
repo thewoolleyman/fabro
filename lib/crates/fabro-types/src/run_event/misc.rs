@@ -247,9 +247,18 @@ pub struct AgentAcpCancelledProps {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentAcpTimedOutProps {
-    pub stdout:      String,
-    pub stderr:      String,
-    pub duration_ms: u64,
+    pub stdout:           String,
+    pub stderr:           String,
+    pub duration_ms:      u64,
+    /// Tool calls the agent started before the deadline.
+    #[serde(default)]
+    pub tool_call_count:  u64,
+    /// `session/update` notifications received before the deadline.
+    #[serde(default)]
+    pub update_count:     u64,
+    /// Milliseconds from launch to the last update, if any arrived.
+    #[serde(default)]
+    pub last_activity_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -53,6 +53,8 @@ pub enum Error {
     },
     #[error("stall timeout on node \"{node_id}\"")]
     StallTimeout { node_id: String },
+    #[error("checkpoint operation budget exceeded on node \"{node_id}\": {message}")]
+    CheckpointBudgetExceeded { node_id: String, message: String },
     #[error("{detail}")]
     Handler { detail: Box<HandlerErrorDetail> },
     #[error("{0}")]

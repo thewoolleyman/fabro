@@ -1123,6 +1123,12 @@ fn host_config(config: &DockerSandboxOptions) -> HostConfig {
         network_mode: config.network_mode.clone(),
         memory: config.memory_limit,
         cpu_quota: config.cpu_quota,
+        // Run Docker's bundled init (tini) as PID 1 so orphaned children of
+        // the agent, the toolchain and the check suite are reaped. The
+        // container command is `sleep infinity`, which never calls wait(),
+        // so without an init every orphan stays defunct for the life of the
+        // sandbox (559 were measured in one live implement container).
+        init: Some(true),
         ..Default::default()
     }
 }
@@ -2070,6 +2076,20 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|value| !value.starts_with("DOCKER_HOST="))
+        );
+    }
+
+    #[test]
+    fn container_runs_docker_init_as_pid_1() {
+        // The sandbox command is `sleep infinity`, which reaps nothing; the
+        // host config must ask the daemon for its init so orphans are reaped.
+        let config = container_config(&DockerSandboxOptions::default(), None);
+        let host_config = config.host_config.expect("host config");
+        assert_eq!(host_config.init, Some(true));
+        let cmd = config.cmd.expect("container cmd");
+        assert!(
+            cmd.iter().any(|part| part.contains("sleep infinity")),
+            "sandbox command should still be the sleep-forever holder; got {cmd:?}"
         );
     }
 

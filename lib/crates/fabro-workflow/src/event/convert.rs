@@ -1266,11 +1266,17 @@ fn event_body_from_event(event: &Event) -> EventBody {
             stdout,
             stderr,
             duration_ms,
+            tool_call_count,
+            update_count,
+            last_activity_ms,
             ..
         } => EventBody::AgentAcpTimedOut(fabro_types::AgentAcpTimedOutProps {
-            stdout:      stdout.clone(),
-            stderr:      stderr.clone(),
-            duration_ms: *duration_ms,
+            stdout:           stdout.clone(),
+            stderr:           stderr.clone(),
+            duration_ms:      *duration_ms,
+            tool_call_count:  *tool_call_count,
+            update_count:     *update_count,
+            last_activity_ms: *last_activity_ms,
         }),
         Event::PullRequestCreated {
             pr_url,
@@ -2296,10 +2302,13 @@ mod tests {
         let timed_out = to_run_event_at(
             &fixtures::RUN_1,
             &Event::AgentAcpTimedOut {
-                node_id:     "code".to_string(),
-                stdout:      "partial".to_string(),
-                stderr:      "timeout".to_string(),
-                duration_ms: 99,
+                node_id:          "code".to_string(),
+                stdout:           "partial".to_string(),
+                stderr:           "timeout".to_string(),
+                duration_ms:      99,
+                tool_call_count:  3,
+                update_count:     7,
+                last_activity_ms: Some(42),
             },
             Utc::now(),
             Some(&scope),
@@ -2310,6 +2319,9 @@ mod tests {
             timed_out.body,
             EventBody::AgentAcpTimedOut(fabro_types::AgentAcpTimedOutProps {
                 duration_ms: 99,
+                tool_call_count: 3,
+                update_count: 7,
+                last_activity_ms: Some(42),
                 ..
             })
         ));
