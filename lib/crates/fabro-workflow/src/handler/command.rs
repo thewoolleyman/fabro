@@ -56,7 +56,7 @@ impl Handler for CommandHandler {
         &self,
         node: &Node,
         context: &Context,
-        _graph: &Graph,
+        graph: &Graph,
         run_dir: &Path,
         services: &EngineServices,
     ) -> Result<Outcome, Error> {
@@ -102,11 +102,23 @@ impl Handler for CommandHandler {
         );
 
         let timeout_ms = node.timeout().map_or(600_000, crate::millis_u64);
-        let env = services
+        let mut env = services
             .env_for_stage()
             .await
             .map_err(|err| Error::handler_with_anyhow("Failed to resolve stage env", err))?;
-        let env_vars = if env.is_empty() { None } else { Some(&env) };
+        // Script nodes get the same run-identity trio the hook executor
+        // exports (`fabro-hooks` executor.rs), so a script can name its own
+        // run -- a run-scoped preservation ref, for instance -- instead of
+        // falling back to a placeholder. A value the workflow declares itself
+        // wins over these defaults.
+        for (key, value) in [
+            ("FABRO_RUN_ID", services.run.emitter.run_id().to_string()),
+            ("FABRO_WORKFLOW", graph.name.clone()),
+            ("FABRO_NODE_ID", node.id.clone()),
+        ] {
+            env.entry(key.to_string()).or_insert(value);
+        }
+        let env_vars = Some(&env);
         let cancel_token = services.run.cancel_token().child_token();
         let stage_id = stage_scope.stage_id();
         let recorder = CommandLogRecorder::create(run_dir, &stage_id).await?;
@@ -1165,6 +1177,51 @@ mod tests {
         assert_eq!(
             captured_env.get("MY_VAR").map(String::as_str),
             Some("my_value")
+        );
+    }
+
+    #[tokio::test]
+    async fn exports_run_identity_trio_to_script_env() {
+        let spy = std::sync::Arc::new(SpySandbox::new(fabro_agent::sandbox::ExecResult {
+            stdout:      String::new(),
+            stderr:      String::new(),
+            exit_code:   Some(0),
+            termination: CommandTermination::Exited,
+            duration_ms: 5,
+        }));
+
+        let handler = CommandHandler;
+        let mut node = Node::new("script_node");
+        node.attrs
+            .insert("script".to_string(), AttrValue::String("true".to_string()));
+        let context = Context::new();
+        let graph = Graph::new("workflow-under-test");
+        let run_dir = tempfile::tempdir().unwrap();
+
+        let mut services = make_spy_services(spy.clone());
+        // A value the workflow declares must win over the default.
+        services
+            .base_env
+            .insert("FABRO_WORKFLOW".to_string(), "declared".to_string());
+        let expected_run_id = services.run.emitter.run_id().to_string();
+
+        handler
+            .execute(&node, &context, &graph, run_dir.path(), &services)
+            .await
+            .unwrap();
+
+        let captured_env = spy.captured_env_vars.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            captured_env.get("FABRO_RUN_ID").map(String::as_str),
+            Some(expected_run_id.as_str())
+        );
+        assert_eq!(
+            captured_env.get("FABRO_NODE_ID").map(String::as_str),
+            Some("script_node")
+        );
+        assert_eq!(
+            captured_env.get("FABRO_WORKFLOW").map(String::as_str),
+            Some("declared")
         );
     }
 

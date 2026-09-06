@@ -713,10 +713,13 @@ pub enum Event {
         duration_ms: u64,
     },
     AgentAcpTimedOut {
-        node_id:     String,
-        stdout:      String,
-        stderr:      String,
-        duration_ms: u64,
+        node_id:          String,
+        stdout:           String,
+        stderr:           String,
+        duration_ms:      u64,
+        tool_call_count:  u64,
+        update_count:     u64,
+        last_activity_ms: Option<u64>,
     },
     PullRequestCreated {
         pr_url:      String,

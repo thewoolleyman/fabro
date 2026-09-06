@@ -22,6 +22,7 @@ pub enum RunNoticeCode {
     ArtifactOffloadFailed,
     ArtifactSyncFailed,
     ArtifactUploadFailed,
+    CheckpointEmpty,
     CheckpointMetadataDegraded,
     CheckpointMetadataPushFailed,
     CheckpointMetadataWriteFailed,

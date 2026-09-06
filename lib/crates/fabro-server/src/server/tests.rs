@@ -11913,10 +11913,13 @@ async fn active_acp_steerable_marker_clears_on_terminal_paths() {
             duration_ms: 7,
         },
         workflow_event::Event::AgentAcpTimedOut {
-            node_id:     "agent".to_string(),
-            stdout:      "partial".to_string(),
-            stderr:      "timeout".to_string(),
-            duration_ms: 99,
+            node_id:          "agent".to_string(),
+            stdout:           "partial".to_string(),
+            stderr:           "timeout".to_string(),
+            duration_ms:      99,
+            tool_call_count:  0,
+            update_count:     0,
+            last_activity_ms: None,
         },
         workflow_event::Event::StageCompleted {
             node_id: "agent".to_string(),

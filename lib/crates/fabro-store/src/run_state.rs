@@ -2191,9 +2191,12 @@ mod tests {
             .apply_event(&test_stage_event(
                 4,
                 EventBody::AgentAcpTimedOut(AgentAcpTimedOutProps {
-                    stdout:      "partial".to_string(),
-                    stderr:      "timeout".to_string(),
-                    duration_ms: 99,
+                    stdout:           "partial".to_string(),
+                    stderr:           "timeout".to_string(),
+                    duration_ms:      99,
+                    tool_call_count:  0,
+                    update_count:     0,
+                    last_activity_ms: None,
                 }),
                 timed_out_stage_id.clone(),
             ))

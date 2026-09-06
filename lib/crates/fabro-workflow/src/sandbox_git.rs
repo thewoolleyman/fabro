@@ -12,12 +12,55 @@ use crate::artifact_snapshot;
 use crate::git::GitAuthor;
 use crate::sandbox_git_runtime::SandboxGitRuntime;
 
+/// How a sandbox git command ended, so callers can distinguish a Fabro
+/// operation budget (the configured command timeout) from a genuine failure
+/// without re-parsing the rendered message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitCommandErrorKind {
+    /// The command exceeded its configured timeout.
+    TimedOut,
+    /// The command was cancelled.
+    Cancelled,
+    /// The command exited non-zero or could not be executed.
+    Failed,
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub struct GitCommandError {
     pub message: String,
+    pub kind:    GitCommandErrorKind,
     #[source]
     pub source:  fabro_sandbox::Error,
+}
+
+/// Result of a git checkpoint: the sandbox HEAD after the checkpoint and
+/// whether a commit was actually created. An empty tree is never committed,
+/// so `committed == false` means HEAD is unchanged and no ordinary checkpoint
+/// commit exists for this node visit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitCheckpoint {
+    pub sha:       String,
+    pub committed: bool,
+}
+
+/// Error from the probe-guarded checkpoint entry point.
+#[derive(Debug, thiserror::Error)]
+pub enum CheckpointError {
+    #[error("{0}")]
+    GitUnavailable(#[source] SharedError),
+    #[error(transparent)]
+    Git(#[from] GitCommandError),
+}
+
+impl CheckpointError {
+    /// True when the checkpoint died because a Fabro-owned git command hit
+    /// its configured operation budget, not because of a network, provider
+    /// or SDK timeout.
+    #[must_use]
+    pub fn is_operation_budget_exceeded(&self) -> bool {
+        matches!(self, Self::Git(err) if err.kind == GitCommandErrorKind::TimedOut)
+    }
 }
 
 /// Captured git state for a workflow run, shared with handlers.
@@ -38,12 +81,14 @@ pub(crate) fn exec_err(label: &str, r: fabro_sandbox::ExecResult) -> GitCommandE
     if r.is_timed_out() {
         return GitCommandError {
             message: format!("{label} timed out after {}ms", r.duration_ms),
+            kind:    GitCommandErrorKind::TimedOut,
             source:  fabro_sandbox::Error::exec(label, r),
         };
     }
     if r.is_cancelled() {
         return GitCommandError {
             message: format!("{label} cancelled after {}ms", r.duration_ms),
+            kind:    GitCommandErrorKind::Cancelled,
             source:  fabro_sandbox::Error::exec(label, r),
         };
     }
@@ -51,6 +96,7 @@ pub(crate) fn exec_err(label: &str, r: fabro_sandbox::ExecResult) -> GitCommandE
     let exit = r.display_exit_code();
     GitCommandError {
         message: format!("{label} failed (exit {exit})"),
+        kind:    GitCommandErrorKind::Failed,
         source:  fabro_sandbox::Error::exec(label, r),
     }
 }
@@ -69,7 +115,7 @@ pub async fn git_checkpoint(
     shadow_sha: Option<String>,
     checkpoint: &RunCheckpointSettings,
     author: &GitAuthor,
-) -> std::result::Result<String, GitCommandError> {
+) -> std::result::Result<GitCheckpoint, GitCommandError> {
     let mut all_excludes: Vec<String> = artifact_snapshot::EXCLUDE_DIRS
         .iter()
         .map(|d| format!("**/{d}/**"))
@@ -90,6 +136,35 @@ pub async fn git_checkpoint(
         Err(e) => {
             return Err(GitCommandError {
                 message: "git add failed".to_string(),
+                kind:    GitCommandErrorKind::Failed,
+                source:  e,
+            });
+        }
+    }
+
+    // Never checkpoint an empty tree. The commit used to run with
+    // `--allow-empty`, so a run that produced nothing still emitted a chain
+    // of checkpoint commits and every "the run made progress" signal built
+    // on them (commit count, checkpoint events) was vacuous. `diff --cached
+    // --quiet` exits 0 when nothing is staged and 1 when something is.
+    let staged_cmd = format!("{GIT_REMOTE} diff --cached --quiet");
+    let staged_result = sandbox
+        .exec_command(&staged_cmd, checkpoint.commit_timeout_ms, None, None, None)
+        .await;
+    match staged_result {
+        Ok(r) if r.is_success() => {
+            let sha = git_head_sha(sandbox).await?;
+            return Ok(GitCheckpoint {
+                sha,
+                committed: false,
+            });
+        }
+        Ok(r) if r.exit_code == Some(1) => {}
+        Ok(r) => return Err(exec_err("git diff --cached", r)),
+        Err(e) => {
+            return Err(GitCommandError {
+                message: "git diff --cached failed".to_string(),
+                kind:    GitCommandErrorKind::Failed,
                 source:  e,
             });
         }
@@ -121,6 +196,7 @@ pub async fn git_checkpoint(
     if let Err(e) = sandbox.write_file(&msg_path, &message).await {
         return Err(GitCommandError {
             message: "failed to write commit message file".to_string(),
+            kind:    GitCommandErrorKind::Failed,
             source:  e,
         });
     }
@@ -132,7 +208,7 @@ pub async fn git_checkpoint(
         ""
     };
     let commit_cmd = format!(
-        "{GIT_REMOTE} -c user.name={name} -c user.email={email} commit --allow-empty{no_verify} -F {msg_path_q}",
+        "{GIT_REMOTE} -c user.name={name} -c user.email={email} commit{no_verify} -F {msg_path_q}",
         name = shell_quote(&author.name),
         email = shell_quote(&author.email),
     );
@@ -146,11 +222,20 @@ pub async fn git_checkpoint(
         Err(e) => {
             return Err(GitCommandError {
                 message: "git commit failed".to_string(),
+                kind:    GitCommandErrorKind::Failed,
                 source:  e,
             });
         }
     }
 
+    let sha = git_head_sha(sandbox).await?;
+    Ok(GitCheckpoint {
+        sha,
+        committed: true,
+    })
+}
+
+async fn git_head_sha(sandbox: &dyn Sandbox) -> std::result::Result<String, GitCommandError> {
     let sha_cmd = format!("{GIT_REMOTE} rev-parse HEAD");
     let sha_result = sandbox
         .exec_command(&sha_cmd, 10_000, None, None, None)
@@ -160,6 +245,7 @@ pub async fn git_checkpoint(
         Ok(r) => Err(exec_err("git rev-parse HEAD", r)),
         Err(e) => Err(GitCommandError {
             message: "git rev-parse HEAD failed".to_string(),
+            kind:    GitCommandErrorKind::Failed,
             source:  e,
         }),
     }
@@ -180,9 +266,11 @@ pub(crate) async fn checked_git_checkpoint(
     shadow_sha: Option<String>,
     checkpoint: &RunCheckpointSettings,
     author: &GitAuthor,
-) -> std::result::Result<String, SharedError> {
+) -> std::result::Result<GitCheckpoint, CheckpointError> {
     runtime.ensure_git_available(sandbox).await.map_err(|err| {
-        SharedError::new(anyhow::Error::new(err).context("sandbox git unavailable"))
+        CheckpointError::GitUnavailable(SharedError::new(
+            anyhow::Error::new(err).context("sandbox git unavailable"),
+        ))
     })?;
     git_checkpoint(
         sandbox,
@@ -195,7 +283,7 @@ pub(crate) async fn checked_git_checkpoint(
         author,
     )
     .await
-    .map_err(|err| SharedError::new(anyhow::Error::new(err)))
+    .map_err(CheckpointError::Git)
 }
 
 /// Run a git diff via the sandbox (30 s default timeout).
@@ -232,6 +320,7 @@ pub(crate) async fn git_diff_with_timeout(
         Ok(r) => Err(exec_err("git diff", r)),
         Err(e) => Err(GitCommandError {
             message: "git diff failed".to_string(),
+            kind:    GitCommandErrorKind::Failed,
             source:  e,
         }),
     }
@@ -1112,7 +1201,12 @@ mod tests {
         .await
         .unwrap_err();
 
-        let chain = anyhow::Error::new(err.clone())
+        assert!(
+            fabro_sandbox::default_redacted_output_tail(&err).is_some(),
+            "expected probe exec output tail to survive SharedError wrapping"
+        );
+        assert!(!err.is_operation_budget_exceeded());
+        let chain = anyhow::Error::new(err)
             .chain()
             .map(ToString::to_string)
             .collect::<Vec<_>>();
@@ -1120,15 +1214,13 @@ mod tests {
             chain.iter().any(|cause| cause == "sandbox git unavailable"),
             "expected sandbox git context, got {chain:#?}"
         );
-        assert!(
-            fabro_sandbox::default_redacted_output_tail(&err).is_some(),
-            "expected probe exec output tail to survive SharedError wrapping"
-        );
     }
 
     #[tokio::test]
     async fn git_checkpoint_reports_commit_timeout() {
-        let sandbox = ScriptedSandbox::new(vec![exec_ok(), exec_timed_out(88)]);
+        // add, diff --cached (changes staged), commit
+        let sandbox =
+            ScriptedSandbox::new(vec![exec_ok(), exec_failed(1, "", ""), exec_timed_out(88)]);
         let err = git_checkpoint(
             &sandbox,
             "run1",
@@ -1143,11 +1235,17 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.to_string(), "git commit timed out after 88ms");
+        assert_eq!(err.kind, GitCommandErrorKind::TimedOut);
     }
 
     #[tokio::test]
     async fn git_checkpoint_reports_rev_parse_killed_without_output() {
-        let sandbox = ScriptedSandbox::new(vec![exec_ok(), exec_ok(), exec_failed(-1, "", "")]);
+        let sandbox = ScriptedSandbox::new(vec![
+            exec_ok(),
+            exec_failed(1, "", ""),
+            exec_ok(),
+            exec_failed(-1, "", ""),
+        ]);
         let err = git_checkpoint(
             &sandbox,
             "run1",
@@ -1166,11 +1264,14 @@ mod tests {
 
     #[tokio::test]
     async fn git_checkpoint_uses_unique_commit_message_paths_for_same_run_and_node() {
+        // Two checkpoints: add, diff --cached (changes staged), commit, rev-parse each.
         let sandbox = ScriptedSandbox::new(vec![
             exec_ok(),
+            exec_failed(1, "", ""),
             exec_ok(),
             exec_ok(),
             exec_ok(),
+            exec_failed(1, "", ""),
             exec_ok(),
             exec_ok(),
         ]);
@@ -1235,7 +1336,12 @@ mod tests {
 
     #[tokio::test]
     async fn git_checkpoint_uses_configured_timeout_for_add_and_commit() {
-        let sandbox = ScriptedSandbox::new(vec![exec_ok(), exec_ok(), exec_ok()]);
+        let sandbox = ScriptedSandbox::new(vec![
+            exec_ok(),
+            exec_failed(1, "", ""),
+            exec_ok(),
+            exec_ok(),
+        ]);
         let checkpoint = RunCheckpointSettings {
             commit_timeout_ms: 600_000,
             ..RunCheckpointSettings::default()
@@ -1253,7 +1359,111 @@ mod tests {
         .await
         .expect("checkpoint should succeed");
 
-        assert_eq!(sandbox.timeouts(), vec![600_000, 600_000, 10_000]);
+        assert_eq!(sandbox.timeouts(), vec![600_000, 600_000, 600_000, 10_000]);
+    }
+
+    #[tokio::test]
+    async fn git_checkpoint_skips_commit_when_nothing_is_staged() {
+        // add, diff --cached (exit 0: nothing staged), rev-parse
+        let sandbox =
+            ScriptedSandbox::new(vec![exec_ok(), exec_ok(), exec_failed(0, "abc123\n", "")]);
+        let checkpoint = git_checkpoint(
+            &sandbox,
+            "run1",
+            "work",
+            "success",
+            1,
+            None,
+            &RunCheckpointSettings::default(),
+            &crate::git::GitAuthor::default(),
+        )
+        .await
+        .expect("empty checkpoint should not fail");
+
+        assert_eq!(checkpoint, GitCheckpoint {
+            sha:       "abc123".to_string(),
+            committed: false,
+        });
+        let commands = sandbox.commands();
+        assert!(
+            commands.iter().any(|c| c.contains("diff --cached --quiet")),
+            "staged-change probe should run; got {commands:?}"
+        );
+        assert!(
+            !commands.iter().any(|c| c.contains(" commit ")),
+            "no commit may be issued for an empty tree; got {commands:?}"
+        );
+        assert!(
+            sandbox.write_paths().is_empty(),
+            "no commit message should be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_checkpoint_commits_staged_changes_without_allow_empty() {
+        // add, diff --cached (exit 1: changes staged), commit, rev-parse
+        let sandbox = ScriptedSandbox::new(vec![
+            exec_ok(),
+            exec_failed(1, "", ""),
+            exec_ok(),
+            exec_failed(0, "def456\n", ""),
+        ]);
+        let checkpoint = git_checkpoint(
+            &sandbox,
+            "run1",
+            "work",
+            "success",
+            1,
+            None,
+            &RunCheckpointSettings::default(),
+            &crate::git::GitAuthor::default(),
+        )
+        .await
+        .expect("checkpoint should succeed");
+
+        assert_eq!(checkpoint, GitCheckpoint {
+            sha:       "def456".to_string(),
+            committed: true,
+        });
+        let commit_cmd = sandbox
+            .commands()
+            .into_iter()
+            .find(|c| c.contains(" commit "))
+            .expect("commit command should be issued");
+        assert!(
+            !commit_cmd.contains("--allow-empty"),
+            "checkpoint commit must not use --allow-empty; got {commit_cmd:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_checkpoint_reports_staged_probe_failure() {
+        // add ok, diff --cached exits 128 (neither 0 nor 1)
+        let sandbox = ScriptedSandbox::new(vec![exec_ok(), exec_failed(128, "", "fatal\n")]);
+        let err = git_checkpoint(
+            &sandbox,
+            "run1",
+            "work",
+            "success",
+            1,
+            None,
+            &RunCheckpointSettings::default(),
+            &crate::git::GitAuthor::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.to_string(), "git diff --cached failed (exit 128)");
+        assert_eq!(err.kind, GitCommandErrorKind::Failed);
+    }
+
+    #[test]
+    fn checkpoint_error_flags_only_a_timed_out_git_command_as_budget_exceeded() {
+        let timed_out = CheckpointError::Git(exec_err("git commit", exec_timed_out(30_001)));
+        assert!(timed_out.is_operation_budget_exceeded());
+        assert_eq!(timed_out.to_string(), "git commit timed out after 30001ms");
+
+        let failed = CheckpointError::Git(exec_err("git commit", exec_failed(1, "", "")));
+        assert!(!failed.is_operation_budget_exceeded());
     }
 
     #[tokio::test]
@@ -1282,8 +1492,13 @@ mod tests {
 
     #[tokio::test]
     async fn git_checkpoint_appends_no_verify_when_skip_hooks_enabled() {
-        // add, commit, rev-parse
-        let sandbox = ScriptedSandbox::new(vec![exec_ok(), exec_ok(), exec_ok()]);
+        // add, diff --cached (changes staged), commit, rev-parse
+        let sandbox = ScriptedSandbox::new(vec![
+            exec_ok(),
+            exec_failed(1, "", ""),
+            exec_ok(),
+            exec_ok(),
+        ]);
         let checkpoint = RunCheckpointSettings {
             skip_git_hooks: true,
             ..RunCheckpointSettings::default()
@@ -1314,7 +1529,12 @@ mod tests {
 
     #[tokio::test]
     async fn git_checkpoint_omits_no_verify_when_skip_hooks_disabled() {
-        let sandbox = ScriptedSandbox::new(vec![exec_ok(), exec_ok(), exec_ok()]);
+        let sandbox = ScriptedSandbox::new(vec![
+            exec_ok(),
+            exec_failed(1, "", ""),
+            exec_ok(),
+            exec_ok(),
+        ]);
         git_checkpoint(
             &sandbox,
             "run1",

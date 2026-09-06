@@ -22,7 +22,7 @@ use crate::run_metadata::{MetadataSnapshot, RunMetadataRuntime, RunMetadataWrite
 use crate::run_options::RunOptions;
 use crate::runtime_store::RunStoreHandle;
 use crate::sandbox_git::{
-    checked_git_checkpoint, git_diff, list_diff_numstat, summarize_diff_numstat,
+    GitCheckpoint, checked_git_checkpoint, git_diff, list_diff_numstat, summarize_diff_numstat,
 };
 use crate::sandbox_git_runtime::SandboxGitRuntime;
 
@@ -286,7 +286,19 @@ impl RunLifecycle<WorkflowGraph> for GitLifecycle {
         .await;
 
         match commit_result {
-            Ok(sha) => {
+            Ok(GitCheckpoint { sha, committed }) => {
+                if !committed {
+                    // Nothing was staged, so no checkpoint commit exists for
+                    // this visit: say so as a distinct notice rather than
+                    // letting an unchanged HEAD read as progress.
+                    self.emitter.notice(
+                        RunNoticeLevel::Info,
+                        RunNoticeCode::CheckpointEmpty,
+                        format!(
+                            "[node: {node_id}] checkpoint skipped: no staged changes (HEAD stays at {sha})"
+                        ),
+                    );
+                }
                 let mut git_result = GitCheckpointResult {
                     commit_sha:   Some(sha.clone()),
                     push_results: Vec::new(),
@@ -410,6 +422,16 @@ impl RunLifecycle<WorkflowGraph> for GitLifecycle {
                     },
                     &scope,
                 );
+                // A Fabro-owned git command exhausting its configured commit
+                // budget is an operation-budget failure, not transient
+                // infrastructure: carry it typed so the classifier never has
+                // to guess from the words "timed out" in the message.
+                if e.is_operation_budget_exceeded() {
+                    return Err(CoreError::CheckpointBudgetExceeded {
+                        node_id: node_id.to_string(),
+                        message: error,
+                    });
+                }
                 return Err(CoreError::Other(format!(
                     "git checkpoint commit failed for node '{node_id}': {error}"
                 )));
@@ -983,11 +1005,19 @@ mod tests {
 
         let events = events.lock().unwrap();
         let names = events.iter().map(RunEvent::event_name).collect::<Vec<_>>();
+        // The fixture checkpoints an unchanged tree, so the run-branch
+        // checkpoint is skipped and reported as a `checkpoint_empty` notice
+        // after the metadata notice.
         assert_eq!(names, vec![
             "metadata.snapshot.started",
             "metadata.snapshot.failed",
             "run.notice",
+            "run.notice",
         ]);
+        match &events[3].body {
+            EventBody::RunNotice(props) => assert_eq!(props.code, "checkpoint_empty"),
+            other => panic!("expected a checkpoint_empty notice, got {other:?}"),
+        }
         assert_eq!(events[1].node_id.as_deref(), Some("build"));
         match &events[1].body {
             EventBody::MetadataSnapshotFailed(props) => {
@@ -1282,15 +1312,23 @@ mod tests {
         .await;
 
         let events = events.lock().unwrap();
-        assert_eq!(events.len(), after_init);
+        // Degraded metadata emits nothing further; the one extra event is the
+        // run-branch checkpoint reporting the unchanged fixture tree as
+        // `checkpoint_empty`, which is not a metadata event.
+        assert_eq!(events.len(), after_init + 1);
         assert_eq!(
             events.iter().map(RunEvent::event_name).collect::<Vec<_>>(),
             vec![
                 "metadata.snapshot.started",
                 "metadata.snapshot.failed",
                 "run.notice",
+                "run.notice",
             ]
         );
+        match &events[3].body {
+            EventBody::RunNotice(props) => assert_eq!(props.code, "checkpoint_empty"),
+            other => panic!("expected a checkpoint_empty notice, got {other:?}"),
+        }
     }
 
     struct FailingStateStore;

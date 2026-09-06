@@ -347,9 +347,12 @@ mod tests {
         ));
         assert!(replay_event_for_fork_projection(
             &EventBody::AgentAcpTimedOut(fabro_types::run_event::AgentAcpTimedOutProps {
-                stdout:      "partial".to_string(),
-                stderr:      "timeout".to_string(),
-                duration_ms: 99,
+                stdout:           "partial".to_string(),
+                stderr:           "timeout".to_string(),
+                duration_ms:      99,
+                tool_call_count:  0,
+                update_count:     0,
+                last_activity_ms: None,
             })
         ));
         assert!(!replay_event_for_fork_projection(

@@ -19,7 +19,7 @@ use crate::millis_u64;
 use crate::outcome::{FailureCategory, FailureDetail, Outcome, OutcomeExt, StageOutcome};
 use crate::run_dir::visit_from_context;
 use crate::sandbox_git::{
-    GIT_REMOTE, checked_git_checkpoint, git_merge_ff_only, git_remove_worktree,
+    CheckpointError, GIT_REMOTE, checked_git_checkpoint, git_merge_ff_only, git_remove_worktree,
 };
 
 /// Fans out execution to multiple branches concurrently.
@@ -198,8 +198,8 @@ impl Handler for ParallelHandler {
             )
             .await;
             match result {
-                Ok(sha) => Some(sha),
-                Err(e) if e.to_string() == "sandbox git unavailable" => {
+                Ok(checkpoint) => Some(checkpoint.sha),
+                Err(e @ CheckpointError::GitUnavailable(_)) => {
                     return Err(Error::handler_with_source("sandbox git unavailable", e));
                 }
                 Err(e) => {
@@ -677,6 +677,10 @@ fn find_join_node(results: &[BranchResult], graph: &Graph) -> Option<String> {
 /// Build the parallel-branch checkpoint commit command. Appends
 /// `--no-verify` when `skip_git_hooks` is true so the commit bypasses the
 /// repository's local Git commit hooks (e.g. `pre-commit`, `commit-msg`).
+///
+/// The commit is guarded by `diff --cached --quiet`: a branch whose handler
+/// staged nothing gets no checkpoint commit at all (the branch tip stays at
+/// its base), instead of an `--allow-empty` commit that reads as progress.
 fn parallel_branch_commit_cmd(
     git_remote: &str,
     author_name: &str,
@@ -688,7 +692,9 @@ fn parallel_branch_commit_cmd(
     let name = fabro_sandbox::shell_quote(&format!("user.name={author_name}"));
     let email = fabro_sandbox::shell_quote(&format!("user.email={author_email}"));
     let msg = fabro_sandbox::shell_quote(message);
-    format!("{git_remote} -c {name} -c {email} commit --allow-empty{no_verify} -m {msg}")
+    format!(
+        "if {git_remote} diff --cached --quiet; then echo fabro-checkpoint-empty; else {git_remote} -c {name} -c {email} commit{no_verify} -m {msg}; fi"
+    )
 }
 
 #[cfg(test)]
@@ -968,7 +974,8 @@ mod tests {
             cmd.contains("--no-verify"),
             "expected --no-verify when skip_git_hooks=true; got {cmd:?}"
         );
-        assert!(cmd.contains("commit --allow-empty"));
+        assert!(!cmd.contains("--allow-empty"));
+        assert!(cmd.contains("diff --cached --quiet"));
     }
 
     #[test]
@@ -984,6 +991,7 @@ mod tests {
             !cmd.contains("--no-verify"),
             "expected no --no-verify when skip_git_hooks=false; got {cmd:?}"
         );
-        assert!(cmd.contains("commit --allow-empty"));
+        assert!(!cmd.contains("--allow-empty"));
+        assert!(cmd.contains("diff --cached --quiet"));
     }
 }

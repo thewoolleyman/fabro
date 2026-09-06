@@ -289,6 +289,13 @@ pub async fn execute(init: Initialized) -> Executed {
         Err(fabro_core::Error::Blocked { message }) => {
             (Err(Error::engine(message)), initial_context)
         }
+        // A checkpoint that exhausted its configured git budget is a
+        // deterministic Fabro operation failure. `Error::Checkpoint` carries
+        // that category structurally; routing it through `Error::engine`
+        // would let the "timed out" wording classify it as transient infra.
+        Err(err @ fabro_core::Error::CheckpointBudgetExceeded { .. }) => {
+            (Err(Error::Checkpoint(err.to_string())), initial_context)
+        }
         Err(e) => (Err(Error::engine(e.to_string())), initial_context),
     };
 
