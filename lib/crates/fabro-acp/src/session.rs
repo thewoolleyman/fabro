@@ -1,11 +1,14 @@
 use std::collections::{HashMap, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::{
     CancelNotification, ContentBlock, ContentChunk, InitializeRequest, PermissionOptionKind,
     ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason,
+    SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason, ToolCallStatus,
+    ToolKind,
 };
 use agent_client_protocol::util::MatchDispatch;
 use agent_client_protocol::{ActiveSession, Agent, Client, Error as ProtocolError, SessionMessage};
@@ -23,6 +26,133 @@ use crate::transport::{SandboxAcpTransport, TransportState};
 
 pub type AcpNaturalCompletionCallback = Arc<dyn Fn() -> bool + Send + Sync>;
 pub type AcpSteerPromptCallback = Arc<dyn Fn(String, Option<Principal>) + Send + Sync>;
+
+/// A tool call the agent started or finished, as observed on the ACP
+/// `session/update` stream. Bounded by construction: an id, a title, a kind
+/// and timing -- never the tool's input or output, which stay in the adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcpToolEvent {
+    Started {
+        tool_call_id: String,
+        title:        String,
+        kind:         String,
+    },
+    Completed {
+        tool_call_id: String,
+        title:        String,
+        kind:         String,
+        /// `true` when the adapter reported the call `completed`, `false` on
+        /// `failed`.
+        ok:           bool,
+        elapsed_ms:   u64,
+    },
+}
+
+pub type AcpToolEventCallback = Arc<dyn Fn(AcpToolEvent) + Send + Sync>;
+
+/// Upper bound on the tool title carried in an [`AcpToolEvent`].
+pub const TOOL_TITLE_MAX_BYTES: usize = 200;
+
+/// One option the adapter offered on a `session/request_permission`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpPermissionOption {
+    pub option_id: String,
+    pub name:      String,
+    /// The serde name of the option kind: `allow_once`, `allow_always`,
+    /// `reject_once` or `reject_always`.
+    pub kind:      String,
+}
+
+/// A permission request the adapter raised, reduced to what a human needs
+/// to decide it: which tool call, what it is, and the offered options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpPermissionQuestion {
+    pub tool_call_id: String,
+    pub title:        String,
+    pub kind:         String,
+    pub options:      Vec<AcpPermissionOption>,
+}
+
+/// How a parked permission question was resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcpPermissionAnswer {
+    /// The `option_id` of the chosen option.
+    Selected(String),
+    /// The question was cancelled, interrupted or skipped: the adapter is
+    /// told the request was cancelled and the turn continues.
+    Cancelled,
+    /// Nobody answered before the question's deadline: the adapter is told
+    /// the request was cancelled and the TURN IS ENDED with
+    /// [`AcpError::PermissionTimedOut`], so a workflow routes the node to
+    /// its human gate rather than letting the agent carry on unanswered.
+    TimedOut,
+}
+
+pub type AcpPermissionResolver = Arc<
+    dyn Fn(AcpPermissionQuestion) -> Pin<Box<dyn Future<Output = AcpPermissionAnswer> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// The serde name of a permission option kind (`allow_once`, ...).
+fn permission_kind_name(kind: PermissionOptionKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "other".to_string())
+}
+
+/// Reduce a `session/request_permission` to the question a resolver sees.
+fn permission_question(request: &RequestPermissionRequest) -> AcpPermissionQuestion {
+    let tool_call_id = request.tool_call.tool_call_id.to_string();
+    let mut title = request
+        .tool_call
+        .fields
+        .title
+        .clone()
+        .unwrap_or_else(|| tool_call_id.clone());
+    trim_to_head(&mut title, TOOL_TITLE_MAX_BYTES);
+    AcpPermissionQuestion {
+        tool_call_id,
+        title,
+        kind: request
+            .tool_call
+            .fields
+            .kind
+            .map_or_else(|| "other".to_string(), tool_kind_name),
+        options: request
+            .options
+            .iter()
+            .map(|option| AcpPermissionOption {
+                option_id: option.option_id.to_string(),
+                name:      option.name.clone(),
+                kind:      permission_kind_name(option.kind),
+            })
+            .collect(),
+    }
+}
+
+/// Turn a resolver's answer into the outcome sent back to the adapter. A
+/// selection that names no offered option is a cancellation, never a guess.
+fn permission_outcome_for_answer(
+    request: &RequestPermissionRequest,
+    answer: &AcpPermissionAnswer,
+) -> RequestPermissionOutcome {
+    match answer {
+        AcpPermissionAnswer::Selected(option_id) => request
+            .options
+            .iter()
+            .find(|option| option.option_id.to_string() == *option_id)
+            .map_or(RequestPermissionOutcome::Cancelled, |option| {
+                RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                    option.option_id.clone(),
+                ))
+            }),
+        AcpPermissionAnswer::Cancelled | AcpPermissionAnswer::TimedOut => {
+            RequestPermissionOutcome::Cancelled
+        }
+    }
+}
 
 const CANCEL_GRACE_PERIOD: Duration = Duration::from_millis(500);
 
@@ -93,6 +223,148 @@ fn trim_to_tail(text: &mut String, max_bytes: usize) {
         cut += 1;
     }
     text.drain(..cut);
+}
+
+/// Keep only the first `max_bytes` of `text`, cutting on a char boundary.
+fn trim_to_head(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let mut cut = max_bytes;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
+}
+
+/// The serde name of a tool kind (`execute`, `read`, ...), which is what the
+/// adapter put on the wire.
+fn tool_kind_name(kind: ToolKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "other".to_string())
+}
+
+fn tool_call_is_terminal(status: ToolCallStatus) -> Option<bool> {
+    match status {
+        ToolCallStatus::Completed => Some(true),
+        ToolCallStatus::Failed => Some(false),
+        _ => None,
+    }
+}
+
+struct OpenToolCall {
+    title:   String,
+    kind:    String,
+    started: Instant,
+}
+
+/// Tracks the tool calls a turn has opened so a later `tool_call_update` can
+/// be reported against the title, kind and start time of the call it closes.
+#[derive(Default)]
+struct ToolCallLedger {
+    open: HashMap<String, OpenToolCall>,
+}
+
+impl ToolCallLedger {
+    /// Turn one `session/update` into the tool events it implies: a
+    /// `ToolCall` opens a call (and closes it too when it already carries a
+    /// terminal status); a `ToolCallUpdate` with a terminal status closes it.
+    /// Every other update yields nothing.
+    fn observe(&mut self, update: &SessionUpdate, now: Instant) -> Vec<AcpToolEvent> {
+        match update {
+            SessionUpdate::ToolCall(call) => {
+                let tool_call_id = call.tool_call_id.to_string();
+                let mut title = call.title.clone();
+                trim_to_head(&mut title, TOOL_TITLE_MAX_BYTES);
+                let kind = tool_kind_name(call.kind);
+                let mut events = Vec::new();
+                if !self.open.contains_key(&tool_call_id) {
+                    events.push(AcpToolEvent::Started {
+                        tool_call_id: tool_call_id.clone(),
+                        title:        title.clone(),
+                        kind:         kind.clone(),
+                    });
+                }
+                match tool_call_is_terminal(call.status) {
+                    Some(ok) => {
+                        let elapsed_ms = self
+                            .open
+                            .remove(&tool_call_id)
+                            .map_or(0, |open| elapsed_since(open.started, now));
+                        events.push(AcpToolEvent::Completed {
+                            tool_call_id,
+                            title,
+                            kind,
+                            ok,
+                            elapsed_ms,
+                        });
+                    }
+                    None => {
+                        self.open
+                            .entry(tool_call_id)
+                            .and_modify(|open| {
+                                open.title.clone_from(&title);
+                                open.kind.clone_from(&kind);
+                            })
+                            .or_insert(OpenToolCall {
+                                title,
+                                kind,
+                                started: now,
+                            });
+                    }
+                }
+                events
+            }
+            SessionUpdate::ToolCallUpdate(update) => {
+                let tool_call_id = update.tool_call_id.to_string();
+                if let Some(open) = self.open.get_mut(&tool_call_id) {
+                    if let Some(title) = update.fields.title.as_ref() {
+                        open.title.clone_from(title);
+                        trim_to_head(&mut open.title, TOOL_TITLE_MAX_BYTES);
+                    }
+                    if let Some(kind) = update.fields.kind {
+                        open.kind = tool_kind_name(kind);
+                    }
+                }
+                let Some(ok) = update.fields.status.and_then(tool_call_is_terminal) else {
+                    return Vec::new();
+                };
+                let (title, kind, elapsed_ms) = if let Some(open) = self.open.remove(&tool_call_id)
+                {
+                    (open.title, open.kind, elapsed_since(open.started, now))
+                } else {
+                    // A terminal update for a call whose start we never saw:
+                    // report it against what the update carries so the
+                    // completion is not lost, with no elapsed time.
+                    let mut title = update
+                        .fields
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| tool_call_id.clone());
+                    trim_to_head(&mut title, TOOL_TITLE_MAX_BYTES);
+                    let kind = update
+                        .fields
+                        .kind
+                        .map_or_else(|| "other".to_string(), tool_kind_name);
+                    (title, kind, 0)
+                };
+                vec![AcpToolEvent::Completed {
+                    tool_call_id,
+                    title,
+                    kind,
+                    ok,
+                    elapsed_ms,
+                }]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+fn elapsed_since(started: Instant, now: Instant) -> u64 {
+    u64::try_from(now.saturating_duration_since(started).as_millis()).unwrap_or(u64::MAX)
 }
 
 #[derive(Default)]
@@ -228,15 +500,22 @@ impl AcpLiveControl {
 }
 
 pub struct AcpRunRequest {
-    pub command:      AcpProcessSpec,
-    pub prompt:       String,
-    pub cwd:          String,
-    pub timeout_ms:   Option<u64>,
-    pub env:          HashMap<String, String>,
-    pub sandbox:      Arc<dyn Sandbox>,
-    pub cancel_token: CancellationToken,
-    pub on_activity:  Option<Arc<dyn Fn() + Send + Sync>>,
-    pub live_control: Option<AcpLiveControl>,
+    pub command:               AcpProcessSpec,
+    pub prompt:                String,
+    pub cwd:                   String,
+    pub timeout_ms:            Option<u64>,
+    pub env:                   HashMap<String, String>,
+    pub sandbox:               Arc<dyn Sandbox>,
+    pub cancel_token:          CancellationToken,
+    pub on_activity:           Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Receives one event per tool call the agent starts or finishes, so the
+    /// run can surface per-tool progress without the adapter's payloads.
+    pub on_tool_event:         Option<AcpToolEventCallback>,
+    /// Decides the adapter's `session/request_permission` requests. `None`
+    /// keeps today's behaviour: the most permissive offered option is chosen
+    /// inline, without parking. `Some` parks each request on the resolver.
+    pub on_permission_request: Option<AcpPermissionResolver>,
+    pub live_control:          Option<AcpLiveControl>,
 }
 
 #[derive(Debug)]
@@ -257,6 +536,8 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
         sandbox,
         cancel_token,
         on_activity,
+        on_tool_event,
+        on_permission_request,
         live_control,
     } = request;
     let live_control = live_control.unwrap_or_default();
@@ -268,6 +549,11 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
     let run_cancel_token = cancel_token.clone();
     let permission_cancel_token = cancel_token.clone();
     let transport = SandboxAcpTransport::new(command, cwd.clone(), env, sandbox, state.clone());
+    // Set by the permission handler when a parked question went unanswered:
+    // the turn is torn down and reported as `PermissionTimedOut` below.
+    let permission_timeout: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
+    let permission_timeout_for_handler = Arc::clone(&permission_timeout);
+    let permission_state = state.clone();
 
     let run = Client
         .builder()
@@ -276,6 +562,21 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
             async move |request: RequestPermissionRequest, responder, _connection| {
                 let outcome = if permission_cancel_token.is_cancelled() {
                     RequestPermissionOutcome::Cancelled
+                } else if let Some(resolver) = on_permission_request.as_ref() {
+                    let question = permission_question(&request);
+                    let answer = resolver(question.clone()).await;
+                    if answer == AcpPermissionAnswer::TimedOut {
+                        *permission_timeout_for_handler
+                            .lock()
+                            .expect("ACP permission timeout lock poisoned") =
+                            Some((question.tool_call_id, question.title));
+                        // End the turn: an unanswered permission is a human
+                        // decision the loop cannot make, not a denial to work
+                        // around. The teardown error is reported after the
+                        // timeout slot is read, so a failure here is not lost.
+                        let _ = permission_state.terminate().await;
+                    }
+                    permission_outcome_for_answer(&request, &answer)
                 } else {
                     select_permission_outcome(&request)
                 };
@@ -299,6 +600,7 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
                         live_control.on_natural_completion.as_ref(),
                         live_control.on_steer_prompt.as_ref(),
                         on_activity.as_ref(),
+                        on_tool_event.as_ref(),
                         &live_progress,
                     )
                     .await
@@ -327,7 +629,7 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
         }
     };
     let outcome = tokio::select! {
-        result = run_outcome => result?,
+        result = run_outcome => result,
         () = async {
             cancel_deadline_token.cancelled().await;
             sleep(Duration::from_millis(500)).await;
@@ -336,6 +638,21 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
             return Err(AcpError::Cancelled);
         }
     };
+    // Bind before the `if let`: an `if let` scrutinee's temporaries live for the
+    // whole construct in edition 2021, so locking inline would hold the guard
+    // across the `terminate().await` below and make this future `!Send`.
+    let timed_out_permission = permission_timeout
+        .lock()
+        .expect("ACP permission timeout lock poisoned")
+        .take();
+    if let Some((tool_call_id, title)) = timed_out_permission {
+        state.terminate().await?;
+        return Err(AcpError::PermissionTimedOut {
+            tool_call_id,
+            title,
+        });
+    }
+    let outcome = outcome?;
     let (text, stop_reason) = match outcome {
         Ok(result) => result,
         Err(_) if run_cancel_token.is_cancelled() => {
@@ -415,9 +732,11 @@ async fn read_live_session(
     on_natural_completion: Option<&AcpNaturalCompletionCallback>,
     on_steer_prompt: Option<&AcpSteerPromptCallback>,
     on_activity: Option<&Arc<dyn Fn() + Send + Sync>>,
+    on_tool_event: Option<&AcpToolEventCallback>,
     progress: &ProgressTracker,
 ) -> Result<(String, StopReason), ProtocolError> {
     let mut text = String::new();
+    let mut tools = ToolCallLedger::default();
     let mut prompt_active = true;
     let mut cancel_sent = false;
     let mut last_stop_reason: Option<StopReason> = None;
@@ -486,6 +805,11 @@ async fn read_live_session(
                                     notification.update,
                                     SessionUpdate::ToolCall(_)
                                 ));
+                                for event in tools.observe(&notification.update, Instant::now()) {
+                                    if let Some(on_tool_event) = on_tool_event {
+                                        on_tool_event(event);
+                                    }
+                                }
                                 if let SessionUpdate::AgentMessageChunk(ContentChunk {
                                     content: ContentBlock::Text(text_chunk),
                                     ..
@@ -578,6 +902,169 @@ mod progress_tests {
         assert!(progress.last_activity_ms.is_some());
         assert_eq!(progress.text_tail.len(), PROGRESS_TEXT_TAIL_BYTES);
         assert!(!progress.text_tail.contains("hello"));
+    }
+
+    #[test]
+    fn tool_ledger_opens_and_closes_calls_with_bounded_titles() {
+        use agent_client_protocol::schema::{Plan, ToolCall, ToolCallUpdate, ToolCallUpdateFields};
+
+        let mut ledger = ToolCallLedger::default();
+        let t0 = Instant::now();
+        let started = ledger.observe(
+            &SessionUpdate::ToolCall(
+                ToolCall::new("call-1", "Bash: sleep 25")
+                    .kind(ToolKind::Execute)
+                    .status(ToolCallStatus::InProgress),
+            ),
+            t0,
+        );
+        assert_eq!(started, vec![AcpToolEvent::Started {
+            tool_call_id: "call-1".to_string(),
+            title:        "Bash: sleep 25".to_string(),
+            kind:         "execute".to_string(),
+        }]);
+
+        // A non-terminal update changes nothing but the recorded title.
+        let none = ledger.observe(
+            &SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                "call-1",
+                ToolCallUpdateFields::new().title("Bash: sleep 25 (running)".to_string()),
+            )),
+            t0 + Duration::from_millis(5),
+        );
+        assert!(none.is_empty());
+
+        let completed = ledger.observe(
+            &SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                "call-1",
+                ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+            )),
+            t0 + Duration::from_millis(1234),
+        );
+        assert_eq!(completed, vec![AcpToolEvent::Completed {
+            tool_call_id: "call-1".to_string(),
+            title:        "Bash: sleep 25 (running)".to_string(),
+            kind:         "execute".to_string(),
+            ok:           true,
+            elapsed_ms:   1234,
+        }]);
+        assert!(ledger.open.is_empty(), "a closed call must not linger");
+
+        // A failed call reports ok=false; a call opened already-terminal
+        // yields both events at once; an unknown id still reports its close.
+        let failed = ledger.observe(
+            &SessionUpdate::ToolCall(
+                ToolCall::new("call-2", "x".repeat(TOOL_TITLE_MAX_BYTES + 50))
+                    .kind(ToolKind::Read)
+                    .status(ToolCallStatus::Failed),
+            ),
+            t0,
+        );
+        assert_eq!(failed.len(), 2);
+        assert!(
+            matches!(&failed[0], AcpToolEvent::Started { title, kind, .. }
+            if title.len() == TOOL_TITLE_MAX_BYTES && kind == "read")
+        );
+        assert!(matches!(&failed[1], AcpToolEvent::Completed {
+            ok: false,
+            elapsed_ms: 0,
+            ..
+        }));
+        let orphan = ledger.observe(
+            &SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                "never-opened",
+                ToolCallUpdateFields::new().status(ToolCallStatus::Completed),
+            )),
+            t0,
+        );
+        assert_eq!(orphan, vec![AcpToolEvent::Completed {
+            tool_call_id: "never-opened".to_string(),
+            title:        "never-opened".to_string(),
+            kind:         "other".to_string(),
+            ok:           true,
+            elapsed_ms:   0,
+        }]);
+
+        // Text chunks and plans are not tool events.
+        let plan = ledger.observe(&SessionUpdate::Plan(Plan::new(Vec::new())), t0);
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn permission_question_and_answer_mapping_are_bounded_and_exact() {
+        use agent_client_protocol::schema::{
+            PermissionOption, PermissionOptionId, SessionId, ToolCallUpdate, ToolCallUpdateFields,
+        };
+
+        let request = RequestPermissionRequest::new(
+            SessionId::new("session-1"),
+            ToolCallUpdate::new(
+                "call-9",
+                ToolCallUpdateFields::new()
+                    .title("Bash: rm -rf build/".to_string())
+                    .kind(ToolKind::Execute),
+            ),
+            vec![
+                PermissionOption::new(
+                    PermissionOptionId::new("allow"),
+                    "Allow",
+                    PermissionOptionKind::AllowOnce,
+                ),
+                PermissionOption::new(
+                    PermissionOptionId::new("always"),
+                    "Always allow",
+                    PermissionOptionKind::AllowAlways,
+                ),
+                PermissionOption::new(
+                    PermissionOptionId::new("reject"),
+                    "Reject",
+                    PermissionOptionKind::RejectOnce,
+                ),
+            ],
+        );
+
+        let question = permission_question(&request);
+        assert_eq!(question.tool_call_id, "call-9");
+        assert_eq!(question.title, "Bash: rm -rf build/");
+        assert_eq!(question.kind, "execute");
+        assert_eq!(
+            question
+                .options
+                .iter()
+                .map(|option| (option.option_id.as_str(), option.kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("allow", "allow_once"),
+                ("always", "allow_always"),
+                ("reject", "reject_once")
+            ]
+        );
+
+        // The default (no resolver) still picks the most permissive option.
+        assert!(matches!(
+            select_permission_outcome(&request),
+            RequestPermissionOutcome::Selected(selected) if selected.option_id.to_string() == "always"
+        ));
+        // A resolver's selection is honoured only when it names an offered option.
+        assert!(matches!(
+            permission_outcome_for_answer(&request, &AcpPermissionAnswer::Selected("reject".to_string())),
+            RequestPermissionOutcome::Selected(selected) if selected.option_id.to_string() == "reject"
+        ));
+        assert!(matches!(
+            permission_outcome_for_answer(
+                &request,
+                &AcpPermissionAnswer::Selected("nope".to_string())
+            ),
+            RequestPermissionOutcome::Cancelled
+        ));
+        assert!(matches!(
+            permission_outcome_for_answer(&request, &AcpPermissionAnswer::Cancelled),
+            RequestPermissionOutcome::Cancelled
+        ));
+        assert!(matches!(
+            permission_outcome_for_answer(&request, &AcpPermissionAnswer::TimedOut),
+            RequestPermissionOutcome::Cancelled
+        ));
     }
 
     #[test]

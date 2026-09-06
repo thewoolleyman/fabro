@@ -1668,7 +1668,7 @@ Emitted when the agent fails over to a different LLM provider/model.
 
 ### ACP agent events
 
-Emitted by the ACP (Agent Client Protocol) handler around one agent turn in the sandbox. `stderr` fields are bounded tails of the adapter process's stderr; `stdout` fields carry agent message text as described per event, never the adapter process's stdout.
+Emitted by the ACP (Agent Client Protocol) handler around one agent turn in the sandbox. During the turn the handler also emits the ordinary `agent.tool.started` / `agent.tool.completed` events (above) for every tool call the adapter reports on the `session/update` stream, so `attach` and `dump` show per-tool progress; on that backend `arguments` is `{"kind": <tool kind>}` and `output` is `{"kind", "status": "completed"|"failed", "elapsed_ms"}` — the tool's own input and output are never carried. An ACP node with `acp.permission_policy="ask"` parks each adapter `session/request_permission` as an `interview.started` question (options = the adapter's permission options, keyed by option id) and resumes on `interview.completed`; an `interview.timeout` ends the turn as a deterministic node failure. The default policy `auto` answers inline as before and emits no interview events. `stderr` fields are bounded tails of the adapter process's stderr; `stdout` fields carry agent message text as described per event, never the adapter process's stdout.
 
 ### `agent.acp.started`
 

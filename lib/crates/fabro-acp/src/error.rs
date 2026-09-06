@@ -48,6 +48,17 @@ pub enum AcpError {
     #[error("{0}")]
     ProcessExited(AcpProcessExit),
 
+    /// A `session/request_permission` parked on a human question that was
+    /// not answered before the question's deadline; the turn was ended so
+    /// the node can route to its human-gate edge instead of hanging.
+    #[error(
+        "ACP permission question for tool call {tool_call_id} ({title}) went unanswered past its deadline"
+    )]
+    PermissionTimedOut {
+        tool_call_id: String,
+        title:        String,
+    },
+
     #[error("ACP prompt stopped with {stop_reason}: {text}")]
     StopReason {
         stop_reason: String,

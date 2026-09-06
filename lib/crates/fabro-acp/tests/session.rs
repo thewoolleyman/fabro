@@ -42,6 +42,8 @@ async fn stdio_spawn_failure_returns_sandbox_error() {
     let sandbox: Arc<dyn Sandbox> = Arc::new(sandbox);
 
     let result = run_acp_turn(AcpRunRequest {
+        on_tool_event: None,
+        on_permission_request: None,
         command,
         prompt: "hello".to_string(),
         cwd: "/workspace".to_string(),
@@ -76,6 +78,8 @@ async fn clean_stdio_exit_after_final_response_completes_turn() {
     let command = AcpProcessSpec::from_command_attr("mock-acp-agent").expect("parse ACP command");
 
     let result = run_acp_turn(AcpRunRequest {
+        on_tool_event: None,
+        on_permission_request: None,
         command,
         prompt: "hello".to_string(),
         cwd: "/workspace".to_string(),
@@ -107,6 +111,8 @@ async fn session_lifecycle_initializes_sends_prompt_and_aggregates_text() {
     let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(tempdir.path().to_path_buf()));
 
     let result = run_acp_turn(AcpRunRequest {
+        on_tool_event: None,
+        on_permission_request: None,
         command,
         prompt: "hello".to_string(),
         cwd: tempdir.path().to_string_lossy().into_owned(),
@@ -152,6 +158,8 @@ async fn steering_sends_followup_session_prompt_over_acp() {
     let queued_for_activity = Arc::clone(&queued);
 
     let result = run_acp_turn(AcpRunRequest {
+        on_tool_event: None,
+        on_permission_request: None,
         command,
         prompt: "hello".to_string(),
         cwd: tempdir.path().to_string_lossy().into_owned(),
@@ -215,6 +223,8 @@ async fn interrupt_then_steer_sends_cancel_then_followup_session_prompt_over_acp
     let queued_for_activity = Arc::clone(&queued);
 
     let result = run_acp_turn(AcpRunRequest {
+        on_tool_event: None,
+        on_permission_request: None,
         command,
         prompt: "hello".to_string(),
         cwd: tempdir.path().to_string_lossy().into_owned(),
@@ -290,6 +300,8 @@ async fn inline_interrupt_terminates_agent_that_ignores_cancel() {
     let interrupted_for_activity = Arc::clone(&interrupted);
 
     let err = run_acp_turn(AcpRunRequest {
+        on_tool_event: None,
+        on_permission_request: None,
         command,
         prompt: "hello".to_string(),
         cwd: tempdir.path().to_string_lossy().into_owned(),
@@ -675,6 +687,8 @@ async fn run_fake_agent_with_activity(
         .or_insert_with(|| "C".to_string());
 
     run_acp_turn(AcpRunRequest {
+        on_tool_event: None,
+        on_permission_request: None,
         command,
         prompt: "hello".to_string(),
         cwd: tempdir.to_string_lossy().into_owned(),
