@@ -60,7 +60,12 @@ fn build_checkpoint(
 /// Result of a git checkpoint operation, shared with EventLifecycle.
 #[derive(Debug, Clone)]
 pub(crate) struct GitCheckpointResult {
+    /// The sandbox HEAD after the checkpoint. When `committed` is false this
+    /// is the unchanged previous HEAD, not a new checkpoint commit.
     pub commit_sha:   Option<String>,
+    /// Whether this checkpoint created a commit. An empty tree is never
+    /// committed, and consumers must not report a `git.commit` for it.
+    pub committed:    bool,
     pub push_results: Vec<PushResult>,
     pub diff:         Option<String>,
     pub diff_summary: Option<DiffSummary>,
@@ -300,9 +305,10 @@ impl RunLifecycle<WorkflowGraph> for GitLifecycle {
                     );
                 }
                 let mut git_result = GitCheckpointResult {
-                    commit_sha:   Some(sha.clone()),
+                    commit_sha: Some(sha.clone()),
+                    committed,
                     push_results: Vec::new(),
-                    diff:         None,
+                    diff: None,
                     diff_summary: None,
                 };
 

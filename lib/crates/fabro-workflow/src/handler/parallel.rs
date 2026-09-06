@@ -409,7 +409,7 @@ impl Handler for ParallelHandler {
                         .sandbox
                         .exec_command(&add_cmd, checkpoint.commit_timeout_ms, None, None, None)
                         .await;
-                    if add_result
+                    let branch_checkpoint = if add_result
                         .as_ref()
                         .is_ok_and(fabro_sandbox::ExecResult::is_success)
                     {
@@ -421,7 +421,7 @@ impl Handler for ParallelHandler {
                             &msg,
                             checkpoint.skip_git_hooks,
                         );
-                        let _ = setup
+                        let commit_result = setup
                             .sandbox
                             .exec_command(
                                 &commit_cmd,
@@ -431,7 +431,33 @@ impl Handler for ParallelHandler {
                                 None,
                             )
                             .await;
-                    }
+                        let classified = classify_parallel_branch_checkpoint(&commit_result);
+                        if classified == ParallelBranchCheckpoint::Failed {
+                            let (detail, exec_output_tail) = match &commit_result {
+                                Ok(r) => (
+                                    format!("exit {}", r.display_exit_code()),
+                                    fabro_sandbox::default_redacted_output_tail(
+                                        &fabro_sandbox::Error::exec("git commit", r.clone()),
+                                    ),
+                                ),
+                                Err(e) => (
+                                    fabro_sandbox::display_for_log(e),
+                                    fabro_sandbox::default_redacted_output_tail(e),
+                                ),
+                            };
+                            parent_run.emitter.notice_with_tail(
+                                RunNoticeLevel::Warn,
+                                RunNoticeCode::ParallelBranchCheckpointFailed,
+                                format!(
+                                    "[branch: {nid}] checkpoint commit failed ({detail}); branch head left at its previous commit"
+                                ),
+                                exec_output_tail,
+                            );
+                        }
+                        classified
+                    } else {
+                        ParallelBranchCheckpoint::Failed
+                    };
                     let sha_cmd = format!("{git_r} rev-parse HEAD");
                     let sha_result = setup
                         .sandbox
@@ -440,13 +466,18 @@ impl Handler for ParallelHandler {
                     match sha_result {
                         Ok(r) if r.is_success() => {
                             let sha = r.stdout.trim().to_string();
-                            parent_run.emitter.emit_scoped(
-                                &Event::GitCommit {
-                                    node_id: Some(setup.target_id.clone()),
-                                    sha:     sha.clone(),
-                                },
-                                &branch_scope,
-                            );
+                            // Only a checkpoint that made a commit is a
+                            // `git.commit`; an empty or failed one leaves
+                            // HEAD where it was and must not read as progress.
+                            if branch_checkpoint == ParallelBranchCheckpoint::Committed {
+                                parent_run.emitter.emit_scoped(
+                                    &Event::GitCommit {
+                                        node_id: Some(setup.target_id.clone()),
+                                        sha:     sha.clone(),
+                                    },
+                                    &branch_scope,
+                                );
+                            }
                             Some(sha)
                         }
                         _ => None,
@@ -692,9 +723,38 @@ fn parallel_branch_commit_cmd(
     let name = fabro_sandbox::shell_quote(&format!("user.name={author_name}"));
     let email = fabro_sandbox::shell_quote(&format!("user.email={author_email}"));
     let msg = fabro_sandbox::shell_quote(message);
+    // `diff --cached --quiet` exits 0 for nothing staged and 1 for staged
+    // changes; any other status is a probe failure (corrupt index, no repo)
+    // and must surface as one rather than be read as "changes staged".
     format!(
-        "if {git_remote} diff --cached --quiet; then echo fabro-checkpoint-empty; else {git_remote} -c {name} -c {email} commit{no_verify} -m {msg}; fi"
+        "{git_remote} diff --cached --quiet; rc=$?; if [ \"$rc\" -eq 0 ]; then echo {PARALLEL_CHECKPOINT_EMPTY_MARKER}; elif [ \"$rc\" -eq 1 ]; then {git_remote} -c {name} -c {email} commit{no_verify} -m {msg}; else echo \"fabro-checkpoint-probe-failed rc=$rc\" >&2; exit \"$rc\"; fi"
     )
+}
+
+/// Stdout marker the branch checkpoint command prints when nothing was staged.
+const PARALLEL_CHECKPOINT_EMPTY_MARKER: &str = "fabro-checkpoint-empty";
+
+/// What a parallel-branch checkpoint command actually did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParallelBranchCheckpoint {
+    /// A checkpoint commit was created.
+    Committed,
+    /// Nothing was staged; no commit exists for this branch visit.
+    Empty,
+    /// The probe or the commit failed; HEAD is whatever it was.
+    Failed,
+}
+
+fn classify_parallel_branch_checkpoint(
+    result: &fabro_sandbox::Result<fabro_sandbox::ExecResult>,
+) -> ParallelBranchCheckpoint {
+    match result {
+        Ok(r) if r.is_success() && r.stdout.contains(PARALLEL_CHECKPOINT_EMPTY_MARKER) => {
+            ParallelBranchCheckpoint::Empty
+        }
+        Ok(r) if r.is_success() => ParallelBranchCheckpoint::Committed,
+        _ => ParallelBranchCheckpoint::Failed,
+    }
 }
 
 #[cfg(test)]
@@ -976,6 +1036,48 @@ mod tests {
         );
         assert!(!cmd.contains("--allow-empty"));
         assert!(cmd.contains("diff --cached --quiet"));
+        assert!(
+            cmd.contains("-eq 0"),
+            "probe exit 0 must be the empty branch"
+        );
+        assert!(
+            cmd.contains("-eq 1"),
+            "probe exit 1 must be the commit branch"
+        );
+        assert!(
+            cmd.contains("exit \"$rc\""),
+            "any other probe status must propagate; got {cmd:?}"
+        );
+    }
+
+    #[test]
+    fn parallel_branch_checkpoint_is_classified_by_marker_and_status() {
+        use fabro_types::CommandTermination;
+        let exec = |exit_code: i32, stdout: &str| fabro_sandbox::ExecResult {
+            stdout:      stdout.to_string(),
+            stderr:      String::new(),
+            exit_code:   Some(exit_code),
+            termination: CommandTermination::Exited,
+            duration_ms: 1,
+        };
+        assert_eq!(
+            super::classify_parallel_branch_checkpoint(&Ok(exec(0, "[branch abc] msg\n"))),
+            super::ParallelBranchCheckpoint::Committed
+        );
+        assert_eq!(
+            super::classify_parallel_branch_checkpoint(&Ok(exec(0, "fabro-checkpoint-empty\n"))),
+            super::ParallelBranchCheckpoint::Empty
+        );
+        assert_eq!(
+            super::classify_parallel_branch_checkpoint(&Ok(exec(128, ""))),
+            super::ParallelBranchCheckpoint::Failed
+        );
+        assert_eq!(
+            super::classify_parallel_branch_checkpoint(&Err(fabro_sandbox::Error::message(
+                "sandbox gone"
+            ))),
+            super::ParallelBranchCheckpoint::Failed
+        );
     }
 
     #[test]

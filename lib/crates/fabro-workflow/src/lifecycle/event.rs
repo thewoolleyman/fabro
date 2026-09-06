@@ -423,9 +423,11 @@ impl RunLifecycle<WorkflowGraph> for EventLifecycle {
             &scope,
         );
 
-        // Emit GitCommit + GitPush events if git produced results
+        // Emit GitCommit + GitPush events if git produced results. An empty
+        // checkpoint carries the unchanged HEAD as `commit_sha` for resume,
+        // but it made no commit, so it must not announce one.
         if let Some(ref result) = git_result {
-            if let Some(ref sha) = result.commit_sha {
+            if let (true, Some(sha)) = (result.committed, result.commit_sha.as_ref()) {
                 self.emitter.emit_scoped(
                     &Event::GitCommit {
                         node_id: Some(node.id().to_string()),
