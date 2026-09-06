@@ -1668,7 +1668,7 @@ Emitted when the agent fails over to a different LLM provider/model.
 
 ### ACP agent events
 
-Emitted by the ACP (Agent Client Protocol) handler around one agent turn in the sandbox. The `stdout`/`stderr` fields on the terminal events are bounded tails, not full transcripts.
+Emitted by the ACP (Agent Client Protocol) handler around one agent turn in the sandbox. `stderr` fields are bounded tails of the adapter process's stderr; `stdout` fields carry agent message text as described per event, never the adapter process's stdout.
 
 ### `agent.acp.started`
 
@@ -1686,7 +1686,7 @@ Emitted when an ACP turn ends with a stop reason.
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `stdout` | string | Bounded tail of the agent's message text |
+| `stdout` | string | The agent's accumulated message text for the turn (not the adapter process's stdout) |
 | `stderr` | string | Bounded tail of the adapter process's stderr |
 | `stop_reason` | string | ACP stop reason (e.g. `end_turn`) |
 | `duration_ms` | number | Milliseconds from launch to completion |
@@ -1697,7 +1697,7 @@ Emitted when an ACP turn is cancelled.
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `stdout` | string | Bounded tail of the agent's message text |
+| `stdout` | string | Always empty on cancellation; no agent text is carried |
 | `stderr` | string | Bounded tail of the adapter process's stderr |
 | `duration_ms` | number | Milliseconds from launch to cancellation |
 
@@ -1728,7 +1728,7 @@ Emitted when an ACP turn exceeds its deadline. Carries the progress evidence the
 | `duration_ms` | number | Milliseconds from launch to the deadline |
 | `tool_call_count` | number | Tool calls the agent started before the deadline (defaults to `0` on stored runs written before this field existed) |
 | `update_count` | number | `session/update` notifications received before the deadline. `0` is the zero-activity discriminator: the adapter never sent an update, as opposed to a turn that was working and ran out of time (defaults to `0` on older stored runs) |
-| `last_activity_ms` | number | Milliseconds from launch to the last `session/update`, absent when none arrived |
+| `last_activity_ms` | number or null | Milliseconds from launch to the last `session/update`; `null` when none arrived |
 
 The failure message on the corresponding `stage.failed` summarises the same three counters.
 
