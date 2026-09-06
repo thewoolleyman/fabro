@@ -267,6 +267,33 @@ fn build_llm_source(vault: Option<Arc<AsyncRwLock<Vault>>>) -> Arc<dyn Credentia
     }
 }
 
+/// A remote sandbox is staged by cloning the source branch from origin, so a
+/// pre-run push that was attempted and FAILED means origin does not carry the
+/// source checkout's HEAD and the clone would silently ride a base missing the
+/// operator's commits (or, when the branch is new, fail later in the sandbox
+/// with a misleading clone error). Refuse at staging instead, naming the
+/// branch, the unpushed HEAD and the push error, before any sandbox exists.
+/// A push that was not needed, skipped, or succeeded is not a refusal.
+fn refused_pre_run_push(git: Option<&fabro_types::GitContext>) -> Option<String> {
+    let git = git?;
+    let fabro_types::PreRunPushOutcome::Failed {
+        remote,
+        branch,
+        message,
+    } = &git.push_outcome
+    else {
+        return None;
+    };
+    let head = git.sha.as_deref().unwrap_or("<unknown>");
+    Some(format!(
+        "pre-run push of branch '{branch}' to '{remote}' failed, so the sandbox clone \
+         would not carry the source checkout's HEAD {head}; refusing to stage rather \
+         than run on a base that is missing it. Push the branch (or dispatch from a \
+         checkout whose branch is on origin) and retry. Push error: {}",
+        message.trim()
+    ))
+}
+
 /// INITIALIZE phase: prepare the sandbox, env, and handlers for execution.
 pub async fn initialize(
     persisted: Persisted,
@@ -315,6 +342,11 @@ pub async fn initialize(
             RunNoticeCode::DirtyWorktree,
             "Uncommitted changes will not be included in the remote sandbox.",
         );
+    }
+    if !attach_existing && !matches!(options.sandbox, SandboxSpec::Local { .. }) {
+        if let Some(refusal) = refused_pre_run_push(options.run_options.pre_run_git.as_ref()) {
+            return Err(Error::Precondition(refusal));
+        }
     }
 
     let sandbox_event_callback: SandboxEventCallback = {
@@ -1334,5 +1366,131 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(Error::Cancelled)));
+    }
+
+    fn git_context(push_outcome: fabro_types::PreRunPushOutcome) -> fabro_types::GitContext {
+        fabro_types::GitContext {
+            origin_url: "https://github.com/acme/widgets".to_string(),
+            branch: "feat/topic".to_string(),
+            sha: Some("7c60f74134e4223edca2d2d0696cdf1273f88ffe".to_string()),
+            dirty: fabro_types::DirtyStatus::Clean,
+            push_outcome,
+        }
+    }
+
+    /// A failed pre-run push is the one outcome that leaves origin without the
+    /// source HEAD; every other outcome stages normally.
+    #[test]
+    fn only_a_failed_pre_run_push_refuses_staging() {
+        let refusal =
+            refused_pre_run_push(Some(&git_context(fabro_types::PreRunPushOutcome::Failed {
+                remote:  "origin".to_string(),
+                branch:  "feat/topic".to_string(),
+                message: "livespec: refusing commit/push at primary checkout; use a worktree\n"
+                    .to_string(),
+            })))
+            .expect("a failed push must refuse");
+        assert!(refusal.contains("feat/topic"), "{refusal}");
+        assert!(refusal.contains("7c60f74134e4"), "{refusal}");
+        assert!(
+            refusal.contains("refusing commit/push at primary checkout"),
+            "{refusal}"
+        );
+
+        for benign in [
+            fabro_types::PreRunPushOutcome::NotAttempted,
+            fabro_types::PreRunPushOutcome::SkippedNoRemote,
+            fabro_types::PreRunPushOutcome::SkippedRemoteMismatch {
+                remote:          "a".to_string(),
+                repo_origin_url: "b".to_string(),
+            },
+            fabro_types::PreRunPushOutcome::Succeeded {
+                remote: "origin".to_string(),
+                branch: "feat/topic".to_string(),
+            },
+        ] {
+            assert!(refused_pre_run_push(Some(&git_context(benign))).is_none());
+        }
+        assert!(refused_pre_run_push(None).is_none());
+    }
+
+    /// The refusal fires in `initialize` BEFORE a remote sandbox is created:
+    /// with a Docker spec and a failed push, no container is ever requested
+    /// (this test has no Docker daemon to talk to) and the error is a
+    /// deterministic precondition naming the branch.
+    #[tokio::test]
+    async fn initialize_refuses_a_remote_sandbox_after_a_failed_pre_run_push() {
+        let temp = tempfile::tempdir().unwrap();
+        let run_dir = temp.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let (graph, source) = simple_graph();
+        let persisted = test_persisted(graph, source, &run_dir);
+        let emitter = Arc::new(crate::event::Emitter::new(test_run_id()));
+        let mut run_options = test_settings(&run_dir);
+        run_options.pre_run_git = Some(git_context(fabro_types::PreRunPushOutcome::Failed {
+            remote:  "origin".to_string(),
+            branch:  "feat/topic".to_string(),
+            message: "hook refused".to_string(),
+        }));
+
+        let result = initialize(persisted, InitOptions {
+            run_id: test_run_id(),
+            run_store: {
+                let store = memory_store();
+                let inner = store.create_run(&test_run_id()).await.unwrap();
+                inner.into()
+            },
+            dry_run: false,
+            emitter: emitter.clone(),
+            sandbox: SandboxSpec::Docker {
+                config:           fabro_sandbox::DockerSandboxOptions::default(),
+                github_app:       None,
+                run_id:           None,
+                clone_origin_url: Some("https://github.com/acme/widgets".to_string()),
+                clone_branch:     Some("feat/topic".to_string()),
+            },
+            llm: LlmSpec {
+                model:          "test-model".to_string(),
+                provider_id:    fabro_model::ProviderId::anthropic(),
+                fallback_chain: Vec::new(),
+                mcp_servers:    Vec::new(),
+                model_controls: RunModelControls::default(),
+                dry_run:        true,
+            },
+            interviewer: Arc::new(AutoApproveInterviewer::engine()),
+            steering_hub: Arc::new(crate::steering_hub::SteeringHub::new(emitter.clone())),
+            catalog: test_catalog(),
+            lifecycle: crate::run_options::LifecycleOptions {
+                setup_commands:           vec![],
+                setup_command_timeout_ms: 1_000,
+            },
+            run_options,
+            workflow_path: None,
+            workflow_bundle: None,
+            hooks: fabro_hooks::HookSettings { hooks: vec![] },
+            sandbox_env: SandboxEnvSpec {
+                toml_env:           HashMap::new(),
+                github_permissions: None,
+                origin_url:         None,
+            },
+            vault: None,
+            git: None,
+            run_control: None,
+            registry_override: None,
+            artifact_sink: None,
+            seed_context: None,
+            fabro_run_tools: None,
+            checkpoint: None,
+        })
+        .await;
+
+        match result {
+            Err(Error::Precondition(message)) => {
+                assert!(message.contains("feat/topic"), "{message}");
+                assert!(message.contains("hook refused"), "{message}");
+            }
+            Err(other) => panic!("expected a precondition refusal, got {other:?}"),
+            Ok(_) => panic!("a failed pre-run push must not stage a remote sandbox"),
+        }
     }
 }

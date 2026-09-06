@@ -7,11 +7,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use fabro_acp::{
-    AcpCommandError, AcpControlHandle, AcpError, AcpLiveControl, AcpProcessSpec, AcpRunRequest,
-    render_stop_reason,
+    AcpCommandError, AcpControlHandle, AcpError, AcpLiveControl, AcpPermissionAnswer,
+    AcpPermissionQuestion, AcpPermissionResolver, AcpProcessSpec, AcpRunRequest, AcpToolEvent,
+    AcpToolEventCallback, render_stop_reason,
 };
 use fabro_agent::{
-    AgentEvent, RefreshOutcome, Sandbox, StaticEnvProvider, SteeringItem, ToolEnvProvider,
+    AgentEvent, AgentQuestion, AgentQuestionAnswer, AgentQuestionAnswerStatus,
+    AgentQuestionRuntime, RefreshOutcome, Sandbox, StaticEnvProvider, SteeringItem,
+    ToolEnvProvider,
 };
 use fabro_graphviz::graph::Node;
 use fabro_static::EnvVars;
@@ -194,6 +197,10 @@ impl AgentAcpBackend {
         self
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one ACP turn needs the node, its prompt, the run's emitter and scope, the sandbox, cancellation, and the question runtime"
+    )]
     async fn run_turn(
         &self,
         node: &Node,
@@ -202,8 +209,10 @@ impl AgentAcpBackend {
         stage_scope: &StageScope,
         sandbox: &Arc<dyn Sandbox>,
         cancel_token: CancellationToken,
+        question_runtime: Option<Arc<dyn AgentQuestionRuntime>>,
     ) -> Result<CodergenResult, Error> {
         let process_spec = resolve_acp_process_spec(node)?;
+        let permission_policy = resolve_acp_permission_policy(node)?;
         let config_name = process_spec.name().map(str::to_string);
         let launch_env = self.resolve_launch_env(emitter).await?;
         let on_activity = {
@@ -221,8 +230,61 @@ impl AgentAcpBackend {
             stage_scope,
         );
 
+        // Under `acp.permission_policy="ask"` the adapter's permission requests
+        // park on the workflow's question runtime (the same one the API-agent
+        // backend uses), so the question is DATA on GET /runs/{id}/questions
+        // and the node waits for POST .../answer. `auto` (the default) keeps
+        // the inline most-permissive answer for existing adopters.
+        let on_permission_request: Option<AcpPermissionResolver> = match permission_policy {
+            AcpPermissionPolicy::Auto => None,
+            AcpPermissionPolicy::Ask => {
+                let runtime = question_runtime.ok_or_else(|| {
+                    Error::Validation(
+                        "acp.permission_policy=\"ask\" needs the workflow question runtime, which this run did not provide"
+                            .to_string(),
+                    )
+                })?;
+                let cancel_token = cancel_token.clone();
+                Some(Arc::new(move |question: AcpPermissionQuestion| {
+                    let runtime = Arc::clone(&runtime);
+                    let cancel_token = cancel_token.clone();
+                    Box::pin(async move {
+                        resolve_permission_via_interview(runtime.as_ref(), question, cancel_token)
+                            .await
+                    })
+                        as std::pin::Pin<
+                            Box<dyn std::future::Future<Output = AcpPermissionAnswer> + Send>,
+                        >
+                }) as AcpPermissionResolver)
+            }
+        };
         let control_handle = AcpControlHandle::new();
         let activation_session_id = format!("acp-{}", uuid::Uuid::new_v4());
+        // Per-tool progress: every tool call the adapter reports becomes an
+        // `agent.tool.started` / `agent.tool.completed` run event (the same
+        // vocabulary the API-agent backend emits), so `attach` and `dump`
+        // show what the agent is doing instead of node-level events only.
+        // The payload is bounded by construction (see `tool_event_to_agent_event`).
+        let on_tool_event = {
+            let emitter = Arc::clone(emitter);
+            let stage_scope = stage_scope.clone();
+            let node_id = node.id.clone();
+            let session_id = activation_session_id.clone();
+            Arc::new(move |tool_event: AcpToolEvent| {
+                let (tool_call_id, event) = tool_event_to_agent_event(tool_event);
+                emitter.emit_scoped(
+                    &Event::Agent {
+                        stage: node_id.clone(),
+                        visit: stage_scope.visit,
+                        event,
+                        session_id: Some(session_id.clone()),
+                        parent_session_id: None,
+                        tool_call_id: Some(tool_call_id),
+                    },
+                    &stage_scope,
+                );
+            }) as AcpToolEventCallback
+        };
         let activation_lease = self.activate_control_session(
             &control_handle,
             &activation_session_id,
@@ -351,6 +413,8 @@ impl AgentAcpBackend {
             sandbox: Arc::clone(sandbox),
             cancel_token: cancel_token.child_token(),
             on_activity: Some(on_activity),
+            on_tool_event: Some(on_tool_event),
+            on_permission_request,
             live_control: Some(AcpLiveControl {
                 handle: control_handle.clone(),
                 on_natural_completion,
@@ -574,6 +638,7 @@ impl CodergenBackend for AgentAcpBackend {
             &stage_scope,
             request.sandbox,
             request.cancel_token,
+            request.agent_tool_runtime.question_runtime(),
         )
         .await
     }
@@ -622,6 +687,139 @@ fn resolve_acp_process_spec(node: &Node) -> Result<AcpProcessSpec, Error> {
     .map_err(acp_process_error_to_workflow)
 }
 
+/// How an ACP node answers the adapter's `session/request_permission`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcpPermissionPolicy {
+    /// Today's behaviour: pick the most permissive offered option inline.
+    Auto,
+    /// Park the request on a typed interview question and wait for the answer.
+    Ask,
+}
+
+fn resolve_acp_permission_policy(node: &Node) -> Result<AcpPermissionPolicy, Error> {
+    match node.acp_permission_policy_attr().map(str::trim) {
+        None | Some("" | "auto") => Ok(AcpPermissionPolicy::Auto),
+        Some("ask") => Ok(AcpPermissionPolicy::Ask),
+        Some(other) => Err(Error::Validation(format!(
+            "acp.permission_policy must be \"auto\" or \"ask\", got {other:?}"
+        ))),
+    }
+}
+
+/// The interview question a parked permission request becomes: one
+/// multiple-choice question whose options are exactly the adapter's, keyed
+/// by `option_id` and labelled by the adapter's own option names.
+fn permission_interview_question(question: &AcpPermissionQuestion) -> AgentQuestion {
+    AgentQuestion {
+        original_id:       Some(question.tool_call_id.clone()),
+        original_question: question.title.clone(),
+        header:            Some("Permission".to_string()),
+        text:              format!(
+            "The agent asks permission for a {} tool call: {}",
+            question.kind, question.title
+        ),
+        question_type:     fabro_types::QuestionType::MultipleChoice,
+        options:           question
+            .options
+            .iter()
+            .map(|option| fabro_types::InterviewOption {
+                key:         option.option_id.clone(),
+                label:       option.name.clone(),
+                description: Some(option.kind.clone()),
+                preview:     None,
+            })
+            .collect(),
+        allow_freeform:    false,
+    }
+}
+
+/// Map the runtime's answer back onto the adapter's options. Answers carry
+/// option LABELS (the runtime renders keys to labels), so a label match wins;
+/// a raw `option_id` is accepted too. Anything else is a cancellation, and
+/// a deadline expiry is the one answer that ends the turn.
+fn permission_answer_from(
+    question: &AcpPermissionQuestion,
+    answer: Option<&AgentQuestionAnswer>,
+) -> AcpPermissionAnswer {
+    let Some(answer) = answer else {
+        return AcpPermissionAnswer::Cancelled;
+    };
+    match answer.status {
+        AgentQuestionAnswerStatus::Timeout => AcpPermissionAnswer::TimedOut,
+        AgentQuestionAnswerStatus::Answered => answer
+            .answers
+            .iter()
+            .find_map(|chosen| {
+                question
+                    .options
+                    .iter()
+                    .find(|option| option.name == *chosen || option.option_id == *chosen)
+            })
+            .map_or(AcpPermissionAnswer::Cancelled, |option| {
+                AcpPermissionAnswer::Selected(option.option_id.clone())
+            }),
+        AgentQuestionAnswerStatus::Cancelled
+        | AgentQuestionAnswerStatus::Interrupted
+        | AgentQuestionAnswerStatus::Skipped => AcpPermissionAnswer::Cancelled,
+    }
+}
+
+async fn resolve_permission_via_interview(
+    runtime: &dyn AgentQuestionRuntime,
+    question: AcpPermissionQuestion,
+    cancel_token: CancellationToken,
+) -> AcpPermissionAnswer {
+    let interview = permission_interview_question(&question);
+    match runtime
+        .ask_questions(&question.tool_call_id, vec![interview], cancel_token)
+        .await
+    {
+        Ok(answers) => permission_answer_from(&question, answers.first()),
+        Err(error) => {
+            tracing::warn!(
+                tool_call_id = %question.tool_call_id,
+                error = %error,
+                "ACP permission question could not be asked; cancelling the request"
+            );
+            AcpPermissionAnswer::Cancelled
+        }
+    }
+}
+
+/// Map one ACP tool event onto the run's agent-event vocabulary. The
+/// `arguments` and `output` payloads carry only the tool kind, the terminal
+/// status and the elapsed time -- never the tool's input or output, which
+/// would make every event as large as the transcript it summarises.
+fn tool_event_to_agent_event(event: AcpToolEvent) -> (String, AgentEvent) {
+    match event {
+        AcpToolEvent::Started {
+            tool_call_id,
+            title,
+            kind,
+        } => (tool_call_id.clone(), AgentEvent::ToolCallStarted {
+            tool_name: title,
+            tool_call_id,
+            arguments: serde_json::json!({ "kind": kind }),
+        }),
+        AcpToolEvent::Completed {
+            tool_call_id,
+            title,
+            kind,
+            ok,
+            elapsed_ms,
+        } => (tool_call_id.clone(), AgentEvent::ToolCallCompleted {
+            tool_name: title,
+            tool_call_id,
+            output: serde_json::json!({
+                "kind": kind,
+                "status": if ok { "completed" } else { "failed" },
+                "elapsed_ms": elapsed_ms,
+            }),
+            is_error: !ok,
+        }),
+    }
+}
+
 /// Marker carried as `stdout` on a timed-out ACP turn that streamed no
 /// agent text, so an empty field is an explicit statement and not a gap.
 pub(crate) const ACP_TIMEOUT_NO_OUTPUT_MARKER: &str =
@@ -643,6 +841,14 @@ fn acp_timeout_message(progress: &fabro_acp::AcpTurnProgress) -> String {
 fn acp_error_to_workflow(error: AcpError) -> Error {
     match error {
         AcpError::Cancelled => Error::Cancelled,
+        // Deterministic by wording as well as by intent: a parked permission
+        // that nobody answered is a human decision, never transient infra.
+        AcpError::PermissionTimedOut {
+            tool_call_id,
+            title,
+        } => Error::handler(format!(
+            "ACP permission question for tool call {tool_call_id} ({title}) went unanswered past its deadline; the node parks for a human decision"
+        )),
         AcpError::TimedOut {
             exec_output_tail,
             progress,
@@ -1507,5 +1713,216 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success());
+    }
+
+    /// The per-tool run events carry a bounded payload: kind, status and
+    /// elapsed time only, never the tool's input or output.
+    #[test]
+    fn tool_events_map_to_bounded_agent_tool_events() {
+        use fabro_acp::AcpToolEvent;
+        use fabro_agent::AgentEvent;
+
+        use super::tool_event_to_agent_event;
+
+        let (id, started) = tool_event_to_agent_event(AcpToolEvent::Started {
+            tool_call_id: "call-7".to_string(),
+            title:        "Bash: just check".to_string(),
+            kind:         "execute".to_string(),
+        });
+        assert_eq!(id, "call-7");
+        match started {
+            AgentEvent::ToolCallStarted {
+                tool_name,
+                tool_call_id,
+                arguments,
+            } => {
+                assert_eq!(tool_name, "Bash: just check");
+                assert_eq!(tool_call_id, "call-7");
+                assert_eq!(arguments, serde_json::json!({ "kind": "execute" }));
+            }
+            other => panic!("expected ToolCallStarted, got {other:?}"),
+        }
+
+        let (id, completed) = tool_event_to_agent_event(AcpToolEvent::Completed {
+            tool_call_id: "call-7".to_string(),
+            title:        "Bash: just check".to_string(),
+            kind:         "execute".to_string(),
+            ok:           false,
+            elapsed_ms:   4210,
+        });
+        assert_eq!(id, "call-7");
+        match completed {
+            AgentEvent::ToolCallCompleted {
+                tool_name,
+                tool_call_id,
+                output,
+                is_error,
+            } => {
+                assert_eq!(tool_name, "Bash: just check");
+                assert_eq!(tool_call_id, "call-7");
+                assert!(is_error);
+                assert_eq!(
+                    output,
+                    serde_json::json!({ "kind": "execute", "status": "failed", "elapsed_ms": 4210 })
+                );
+                let keys: Vec<&str> = output
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                assert_eq!(
+                    keys.len(),
+                    3,
+                    "payload must stay bounded to kind/status/elapsed_ms"
+                );
+            }
+            other => panic!("expected ToolCallCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn permission_policy_attr_parses_auto_ask_and_rejects_the_rest() {
+        use super::{AcpPermissionPolicy, resolve_acp_permission_policy};
+        use crate::error::Error;
+
+        let mut node = Node::new("implement");
+        assert_eq!(
+            resolve_acp_permission_policy(&node).unwrap(),
+            AcpPermissionPolicy::Auto
+        );
+        node.attrs.insert(
+            "acp.permission_policy".to_string(),
+            fabro_types::AttrValue::String("ask".to_string()),
+        );
+        assert_eq!(
+            resolve_acp_permission_policy(&node).unwrap(),
+            AcpPermissionPolicy::Ask
+        );
+        node.attrs.insert(
+            "acp.permission_policy".to_string(),
+            fabro_types::AttrValue::String("sometimes".to_string()),
+        );
+        assert!(matches!(
+            resolve_acp_permission_policy(&node),
+            Err(Error::Validation(message)) if message.contains("sometimes")
+        ));
+    }
+
+    /// A parked permission request becomes one multiple-choice question with
+    /// the adapter's exact options; the human's label answer maps back to the
+    /// option id, a deadline expiry ends the turn, everything else cancels.
+    #[test]
+    fn permission_requests_round_trip_through_interview_questions() {
+        use fabro_acp::{AcpPermissionAnswer, AcpPermissionOption, AcpPermissionQuestion};
+        use fabro_agent::{AgentQuestionAnswer, AgentQuestionAnswerStatus};
+
+        use super::{permission_answer_from, permission_interview_question};
+
+        let question = AcpPermissionQuestion {
+            tool_call_id: "call-9".to_string(),
+            title:        "Bash: rm -rf build/".to_string(),
+            kind:         "execute".to_string(),
+            options:      vec![
+                AcpPermissionOption {
+                    option_id: "allow".to_string(),
+                    name:      "Allow".to_string(),
+                    kind:      "allow_once".to_string(),
+                },
+                AcpPermissionOption {
+                    option_id: "reject".to_string(),
+                    name:      "Reject".to_string(),
+                    kind:      "reject_once".to_string(),
+                },
+            ],
+        };
+        let interview = permission_interview_question(&question);
+        assert_eq!(interview.original_id.as_deref(), Some("call-9"));
+        assert_eq!(
+            interview.question_type,
+            fabro_types::QuestionType::MultipleChoice
+        );
+        assert!(!interview.allow_freeform);
+        assert_eq!(
+            interview
+                .options
+                .iter()
+                .map(|option| (option.key.as_str(), option.label.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("allow", "Allow"), ("reject", "Reject")]
+        );
+        assert!(interview.text.contains("execute") && interview.text.contains("rm -rf build/"));
+
+        let answered = |answers: Vec<&str>, status| AgentQuestionAnswer {
+            original_id: Some("call-9".to_string()),
+            original_question: question.title.clone(),
+            answers: answers.into_iter().map(str::to_string).collect(),
+            status,
+        };
+        assert_eq!(
+            permission_answer_from(
+                &question,
+                Some(&answered(
+                    vec!["Reject"],
+                    AgentQuestionAnswerStatus::Answered
+                ))
+            ),
+            AcpPermissionAnswer::Selected("reject".to_string())
+        );
+        assert_eq!(
+            permission_answer_from(
+                &question,
+                Some(&answered(
+                    vec!["allow"],
+                    AgentQuestionAnswerStatus::Answered
+                ))
+            ),
+            AcpPermissionAnswer::Selected("allow".to_string())
+        );
+        assert_eq!(
+            permission_answer_from(
+                &question,
+                Some(&answered(
+                    vec!["Maybe"],
+                    AgentQuestionAnswerStatus::Answered
+                ))
+            ),
+            AcpPermissionAnswer::Cancelled
+        );
+        assert_eq!(
+            permission_answer_from(
+                &question,
+                Some(&answered(vec![], AgentQuestionAnswerStatus::Timeout))
+            ),
+            AcpPermissionAnswer::TimedOut
+        );
+        assert_eq!(
+            permission_answer_from(
+                &question,
+                Some(&answered(vec![], AgentQuestionAnswerStatus::Interrupted))
+            ),
+            AcpPermissionAnswer::Cancelled
+        );
+        assert_eq!(
+            permission_answer_from(&question, None),
+            AcpPermissionAnswer::Cancelled
+        );
+    }
+
+    /// An unanswered permission question ends the turn as a DETERMINISTIC
+    /// handler failure, so the workflow's failed edge routes the node to its
+    /// human gate instead of retrying it as transient infrastructure.
+    #[test]
+    fn permission_timeout_is_a_deterministic_handler_failure() {
+        let err = acp_error_to_workflow(AcpError::PermissionTimedOut {
+            tool_call_id: "call-9".to_string(),
+            title:        "Bash: rm -rf build/".to_string(),
+        });
+        let detail = err.to_failure_detail();
+        assert_eq!(
+            detail.category,
+            crate::outcome::FailureCategory::Deterministic
+        );
+        assert!(detail.message.contains("call-9") && detail.message.contains("human"));
     }
 }

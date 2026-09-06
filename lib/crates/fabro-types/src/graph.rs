@@ -287,6 +287,15 @@ impl Node {
         self.str_attr("acp.config")
     }
 
+    /// How an ACP node answers the adapter's `session/request_permission`:
+    /// `auto` (the default; the engine picks the most permissive option, as
+    /// it always has) or `ask` (the request parks the node on a typed
+    /// interview question that a human answers through the questions API).
+    #[must_use]
+    pub fn acp_permission_policy_attr(&self) -> Option<&str> {
+        self.str_attr("acp.permission_policy")
+    }
+
     #[must_use]
     pub fn selection(&self) -> &str {
         self.str_attr("selection").unwrap_or("deterministic")
