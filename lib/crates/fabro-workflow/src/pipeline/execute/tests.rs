@@ -27,7 +27,7 @@ use crate::error::Error;
 use crate::event::{Emitter, Event, StoreProgressLogger, append_event};
 use crate::handler::start::StartHandler;
 use crate::handler::{Handler as HandlerTrait, HandlerRegistry};
-use crate::outcome::{Outcome, OutcomeExt, StageOutcome};
+use crate::outcome::{FailureCategory, Outcome, OutcomeExt, StageOutcome};
 use crate::pipeline::initialize;
 use crate::pipeline::types::{InitOptions, LlmSpec, Persisted, SandboxEnvSpec};
 use crate::records::RunSpec;
@@ -1220,4 +1220,35 @@ async fn run_with_lifecycle_emits_initialize_and_setup_events() {
     assert!(sandbox_idx < setup_idx);
     assert!(setup_idx < run_started_idx);
     assert!(run_started_idx < run_running_idx);
+}
+
+/// Pins the typed checkpoint-budget wiring at the pipeline site: the typed
+/// core error must leave as `Error::Checkpoint` (deterministic), while the
+/// other engine failures keep their existing routes.
+#[test]
+fn checkpoint_budget_exceeded_maps_to_the_typed_checkpoint_error() {
+    let err = engine_error_to_workflow(fabro_core::Error::CheckpointBudgetExceeded {
+        node_id: "review_fix".to_string(),
+        message: "git commit timed out after 30001ms".to_string(),
+    });
+    assert!(matches!(err, Error::Checkpoint(_)), "got {err:?}");
+    assert_eq!(err.failure_category(), FailureCategory::Deterministic);
+    assert!(
+        err.to_string()
+            .contains("git commit timed out after 30001ms")
+    );
+
+    let blocked = engine_error_to_workflow(fabro_core::Error::Blocked {
+        message: "held at a gate".to_string(),
+    });
+    assert!(!matches!(blocked, Error::Checkpoint(_)), "got {blocked:?}");
+    assert!(
+        blocked.to_string().ends_with("held at a gate"),
+        "got {blocked}"
+    );
+
+    assert!(matches!(
+        engine_error_to_workflow(fabro_core::Error::Cancelled),
+        Error::Cancelled
+    ));
 }

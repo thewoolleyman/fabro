@@ -245,10 +245,26 @@ pub struct AgentAcpCancelledProps {
     pub duration_ms: u64,
 }
 
+/// Emitted when an ACP turn exceeds its deadline.
+///
+/// `stdout` is NOT the adapter process's stdout: it is the bounded tail of the
+/// agent's message text (the `session/update` agent-message chunks streamed
+/// before the deadline), or the explicit marker
+/// `output not captured: no agent message text before the timeout` when no
+/// text arrived. It is never empty.
+///
+/// `update_count == 0` is the zero-activity discriminator: the adapter sent
+/// no `session/update` at all before the deadline (a turn that never
+/// started), as opposed to a turn that was working and ran out of time, which
+/// carries a positive count and a `last_activity_ms`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgentAcpTimedOutProps {
+    /// Bounded tail of the agent's message text, or the explicit no-output
+    /// marker; never the adapter process's stdout and never empty.
     pub stdout:           String,
+    /// Tail of the adapter process's stderr, when one was captured.
     pub stderr:           String,
+    /// Milliseconds from launch to the deadline.
     pub duration_ms:      u64,
     /// Tool calls the agent started before the deadline.
     #[serde(default)]

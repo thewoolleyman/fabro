@@ -32,6 +32,25 @@ fn seed_context_from_checkpoint(checkpoint: Option<&Checkpoint>) -> Context {
 /// EXECUTE phase: run the workflow graph.
 ///
 /// Infallible at the function level — engine errors are captured in `outcome`.
+/// Map an engine failure that emits no event of its own to the workflow
+/// error the run reports. The stall-timeout arm stays inline in [`execute`]
+/// because it also emits `StallWatchdogTimeout`; everything else routes here
+/// so the mapping can be pinned by a unit test.
+fn engine_error_to_workflow(err: fabro_core::Error) -> Error {
+    match err {
+        fabro_core::Error::Cancelled => Error::Cancelled,
+        fabro_core::Error::Blocked { message } => Error::engine(message),
+        // A checkpoint that exhausted its configured git budget is a
+        // deterministic Fabro operation failure. `Error::Checkpoint` carries
+        // that category structurally; routing it through `Error::engine`
+        // would let the "timed out" wording classify it as transient infra.
+        err @ fabro_core::Error::CheckpointBudgetExceeded { .. } => {
+            Error::Checkpoint(err.to_string())
+        }
+        err => Error::engine(err.to_string()),
+    }
+}
+
 pub async fn execute(init: Initialized) -> Executed {
     let Initialized {
         graph,
@@ -285,18 +304,7 @@ pub async fn execute(init: Initialized) -> Executed {
                 initial_context,
             )
         }
-        Err(fabro_core::Error::Cancelled) => (Err(Error::Cancelled), initial_context),
-        Err(fabro_core::Error::Blocked { message }) => {
-            (Err(Error::engine(message)), initial_context)
-        }
-        // A checkpoint that exhausted its configured git budget is a
-        // deterministic Fabro operation failure. `Error::Checkpoint` carries
-        // that category structurally; routing it through `Error::engine`
-        // would let the "timed out" wording classify it as transient infra.
-        Err(err @ fabro_core::Error::CheckpointBudgetExceeded { .. }) => {
-            (Err(Error::Checkpoint(err.to_string())), initial_context)
-        }
-        Err(e) => (Err(Error::engine(e.to_string())), initial_context),
+        Err(err) => (Err(engine_error_to_workflow(err)), initial_context),
     };
 
     engine.registry.shutdown_all(&engine.run.emitter).await;

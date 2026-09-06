@@ -22,7 +22,8 @@ use crate::run_metadata::{MetadataSnapshot, RunMetadataRuntime, RunMetadataWrite
 use crate::run_options::RunOptions;
 use crate::runtime_store::RunStoreHandle;
 use crate::sandbox_git::{
-    GitCheckpoint, checked_git_checkpoint, git_diff, list_diff_numstat, summarize_diff_numstat,
+    CheckpointError, GitCheckpoint, checked_git_checkpoint, git_diff, list_diff_numstat,
+    summarize_diff_numstat,
 };
 use crate::sandbox_git_runtime::SandboxGitRuntime;
 
@@ -55,6 +56,27 @@ fn build_checkpoint(
         loop_failure_signatures,
         restart_failure_signatures,
     }
+}
+
+/// Map a failed run-branch checkpoint to the engine error the pipeline sees.
+///
+/// A Fabro-owned git command exhausting its configured commit budget is an
+/// operation-budget failure, not transient infrastructure: it is carried as
+/// the typed [`CoreError::CheckpointBudgetExceeded`], which
+/// `pipeline::execute` turns into the deterministic `Error::Checkpoint`, so
+/// the failure classifier never has to guess from the words "timed out" in
+/// the rendered message. Every other checkpoint failure stays an untyped
+/// engine error.
+fn checkpoint_failure_error(node_id: &str, err: &CheckpointError, rendered: String) -> CoreError {
+    if err.is_operation_budget_exceeded() {
+        return CoreError::CheckpointBudgetExceeded {
+            node_id: node_id.to_string(),
+            message: rendered,
+        };
+    }
+    CoreError::Other(format!(
+        "git checkpoint commit failed for node '{node_id}': {rendered}"
+    ))
 }
 
 /// Result of a git checkpoint operation, shared with EventLifecycle.
@@ -428,19 +450,7 @@ impl RunLifecycle<WorkflowGraph> for GitLifecycle {
                     },
                     &scope,
                 );
-                // A Fabro-owned git command exhausting its configured commit
-                // budget is an operation-budget failure, not transient
-                // infrastructure: carry it typed so the classifier never has
-                // to guess from the words "timed out" in the message.
-                if e.is_operation_budget_exceeded() {
-                    return Err(CoreError::CheckpointBudgetExceeded {
-                        node_id: node_id.to_string(),
-                        message: error,
-                    });
-                }
-                return Err(CoreError::Other(format!(
-                    "git checkpoint commit failed for node '{node_id}': {error}"
-                )));
+                return Err(checkpoint_failure_error(node_id, &e, error));
             }
         }
 
@@ -1363,6 +1373,47 @@ mod tests {
 
         async fn read_run_log(&self) -> Result<Option<Vec<u8>>> {
             Ok(None)
+        }
+    }
+
+    /// Pins the typed checkpoint-budget wiring at the lifecycle site: a git
+    /// command that hit its operation budget must leave as
+    /// `CheckpointBudgetExceeded`, and nothing else may.
+    #[test]
+    fn checkpoint_budget_expiry_is_carried_as_the_typed_core_error() {
+        use fabro_agent::ExecResult;
+        use fabro_types::CommandTermination;
+
+        use crate::sandbox_git::exec_err;
+
+        let timed_out = CheckpointError::Git(exec_err("git commit", ExecResult {
+            stdout:      String::new(),
+            stderr:      String::new(),
+            exit_code:   None,
+            termination: CommandTermination::TimedOut,
+            duration_ms: 30_001,
+        }));
+        match checkpoint_failure_error("review_fix", &timed_out, timed_out.to_string()) {
+            CoreError::CheckpointBudgetExceeded { node_id, message } => {
+                assert_eq!(node_id, "review_fix");
+                assert_eq!(message, "git commit timed out after 30001ms");
+            }
+            other => panic!("expected the typed budget error, got {other:?}"),
+        }
+
+        let failed = CheckpointError::Git(exec_err("git commit", ExecResult {
+            stdout:      String::new(),
+            stderr:      String::new(),
+            exit_code:   Some(1),
+            termination: CommandTermination::Exited,
+            duration_ms: 3,
+        }));
+        match checkpoint_failure_error("review_fix", &failed, failed.to_string()) {
+            CoreError::Other(message) => assert_eq!(
+                message,
+                "git checkpoint commit failed for node 'review_fix': git commit failed (exit 1)"
+            ),
+            other => panic!("expected an untyped engine error, got {other:?}"),
         }
     }
 }
