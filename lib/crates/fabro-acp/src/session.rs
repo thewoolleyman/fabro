@@ -619,9 +619,12 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
                     let outcome = tokio::select! {
                         biased;
                         // The turn ended for another reason while this permission
-                        // was parked: drop the task without responding, the
-                        // connection is being torn down.
-                        () = task_shutdown.cancelled() => return,
+                        // was parked. Answer Cancelled rather than dropping the
+                        // responder, so an agent that is somehow still listening
+                        // gets a protocol response instead of hanging until the
+                        // forced-termination grace period; the shared respond
+                        // below is ignored if the transport is already gone.
+                        () = task_shutdown.cancelled() => RequestPermissionOutcome::Cancelled,
                         outcome = async {
                             if cancel.is_cancelled() {
                                 RequestPermissionOutcome::Cancelled

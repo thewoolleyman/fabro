@@ -16,7 +16,7 @@ use fabro_util::error::collect_chain;
 use tokio::fs::{read_to_string, write};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::process::Command;
-use tokio::sync::Notify;
+use tokio::sync::{Barrier, Notify};
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -448,18 +448,28 @@ async fn permission_resolver_does_not_block_the_dispatch_loop() {
     assert!(permission.contains(r#""outcome":"selected""#));
 }
 
-/// Two permission requests can be in flight at once (only because the handler
-/// is non-blocking). When both time out, the per-request slot must record a
-/// bounded, single `PermissionTimedOut` -- never lose it, never report a wrong
-/// terminal error. Reverting the slot to logic that drops or mis-records a
-/// concurrent timeout would fail here.
+/// Two permission requests must be able to be IN FLIGHT AT ONCE -- only possible
+/// because the handler is non-blocking. A two-party barrier proves it: each
+/// resolver blocks until BOTH have been entered before returning, so the run can
+/// only progress if the dispatch loop spawned the second handler while the first
+/// was parked. (If the handler blocked inline, only one resolver would ever run,
+/// the barrier would never release, and the turn would time out and fail here.)
+/// Then, with both timing out, the per-request slot must record a bounded, single
+/// `PermissionTimedOut` -- never lose it, never report a wrong terminal error.
 #[tokio::test]
 async fn concurrent_permission_timeouts_report_one_bounded_permission_timed_out() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
 
-    // Every permission times out immediately.
-    let on_permission_request: fabro_acp::AcpPermissionResolver =
-        Arc::new(move |_question| Box::pin(async move { AcpPermissionAnswer::TimedOut }));
+    // Each resolver waits until BOTH permission handlers have entered before it
+    // times out: the barrier can only be cleared if two handlers run concurrently.
+    let both_in_flight = Arc::new(Barrier::new(2));
+    let on_permission_request: fabro_acp::AcpPermissionResolver = Arc::new(move |_question| {
+        let both_in_flight = both_in_flight.clone();
+        Box::pin(async move {
+            both_in_flight.wait().await;
+            AcpPermissionAnswer::TimedOut
+        })
+    });
 
     let script_path = tempdir.path().join("fake_acp_agent.py");
     write(&script_path, fake_acp_agent_script())
