@@ -373,6 +373,81 @@ async fn permission_request_selects_allow_always() {
     assert!(permission.contains(r#""optionId":"always""#));
 }
 
+/// The ask-policy permission handler MUST respond from a spawned task so the
+/// connection's dispatch loop keeps processing other messages while it awaits
+/// the human. This test parks the resolver until the loop has processed a
+/// session/update the agent sent RIGHT AFTER its permission request; if the
+/// handler blocked the loop inline (the pre-fix behaviour and the obvious
+/// mutation), that update would never be processed, `on_activity` would never
+/// fire, the resolver would never be released, and the turn would time out and
+/// fail here. So this passing is the seam: it holds only while the handler is
+/// non-blocking.
+#[tokio::test]
+async fn permission_resolver_does_not_block_the_dispatch_loop() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let permission_path = tempdir.path().join("permission.json");
+
+    let interleaved_seen = Arc::new(Notify::new());
+    let seen_for_activity = interleaved_seen.clone();
+    let on_activity: Arc<dyn Fn() + Send + Sync> =
+        Arc::new(move || seen_for_activity.notify_one());
+
+    let seen_for_resolver = interleaved_seen.clone();
+    let on_permission_request: fabro_acp::AcpPermissionResolver = Arc::new(move |_question| {
+        let seen = seen_for_resolver.clone();
+        Box::pin(async move {
+            // Park until the interleaved session/update has been processed by
+            // the loop -- proof the loop is not blocked by this handler.
+            seen.notified().await;
+            AcpPermissionAnswer::Selected("always".to_string())
+        })
+    });
+
+    let script_path = tempdir.path().join("fake_acp_agent.py");
+    write(&script_path, fake_acp_agent_script())
+        .await
+        .expect("write fake ACP agent");
+    let raw_command = format!("python3 {}", shell_quote(&script_path.to_string_lossy()));
+    let command = AcpProcessSpec::from_command_attr(&raw_command).expect("parse ACP command");
+    let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(tempdir.path().to_path_buf()));
+
+    let result = run_acp_turn(AcpRunRequest {
+        on_tool_event: None,
+        on_permission_request: Some(on_permission_request),
+        command,
+        prompt: "hello".to_string(),
+        cwd: tempdir.path().to_string_lossy().into_owned(),
+        timeout_ms: Some(ACP_TEST_TIMEOUT_MS),
+        env: HashMap::from([
+            ("ACP_MODE".to_string(), "permission_concurrent".to_string()),
+            (
+                "ACP_PERMISSION".to_string(),
+                permission_path.to_string_lossy().into_owned(),
+            ),
+            ("LC_ALL".to_string(), "C".to_string()),
+        ]),
+        sandbox,
+        cancel_token: CancellationToken::new(),
+        on_activity: Some(on_activity),
+        live_control: None,
+    })
+    .await
+    .expect("run ACP turn");
+
+    // The interleaved update was processed DURING the parked permission (its text
+    // is in the tail), and the turn completed after the resolver allowed.
+    assert!(
+        result.text.contains("concurrent"),
+        "interleaved update was not processed while the permission was parked: {}",
+        result.text
+    );
+    assert!(result.text.contains("hello from acp"), "text: {}", result.text);
+    let permission = read_to_string(permission_path)
+        .await
+        .expect("read permission record");
+    assert!(permission.contains(r#""outcome":"selected""#));
+}
+
 #[tokio::test]
 async fn runs_inside_sandbox_and_uses_requested_cwd() {
     let tempdir = tempfile::tempdir().expect("create tempdir");

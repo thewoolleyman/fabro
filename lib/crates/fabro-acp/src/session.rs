@@ -577,9 +577,13 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
     let run_cancel_token = cancel_token.clone();
     let permission_cancel_token = cancel_token.clone();
     let transport = SandboxAcpTransport::new(command, cwd.clone(), env, sandbox, state.clone());
-    // Set by the permission handler when a parked question went unanswered:
-    // the turn is torn down and reported as `PermissionTimedOut` below.
-    let permission_timeout: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
+    // Pushed by the permission handler when a parked question went unanswered:
+    // the turn is torn down and the FIRST timed-out permission is reported as
+    // `PermissionTimedOut` below. This is a Vec, not a single slot, because the
+    // handler no longer serialises permission requests (see the spawn note in
+    // the handler): with concurrent requests each could time out, and a single
+    // slot would race last-writer-wins.
+    let permission_timeout: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let permission_timeout_for_handler = Arc::clone(&permission_timeout);
     let permission_state = state.clone();
 
@@ -588,27 +592,52 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
         .name("fabro")
         .on_receive_request(
             async move |request: RequestPermissionRequest, responder, _connection| {
-                let outcome = if permission_cancel_token.is_cancelled() {
-                    RequestPermissionOutcome::Cancelled
-                } else if let Some(resolver) = on_permission_request.as_ref() {
-                    let question = permission_question(&request);
-                    let answer = resolver(question.clone()).await;
-                    if answer == AcpPermissionAnswer::TimedOut {
-                        *permission_timeout_for_handler
-                            .lock()
-                            .expect("ACP permission timeout lock poisoned") =
-                            Some((question.tool_call_id, question.title));
-                        // End the turn: an unanswered permission is a human
-                        // decision the loop cannot make, not a denial to work
-                        // around. The teardown error is reported after the
-                        // timeout slot is read, so a failure here is not lost.
-                        let _ = permission_state.terminate().await;
-                    }
-                    permission_outcome_for_answer(&request, &answer)
-                } else {
-                    select_permission_outcome(&request)
-                };
-                responder.respond(RequestPermissionResponse::new(outcome))
+                // Resolve and respond from a SPAWNED TASK, never inline.
+                // agent-client-protocol documents (its Deadlock Risk section)
+                // that the connection's dispatch loop processes no other message
+                // while an `on_receive_request` handler is running, so awaiting a
+                // human permission answer inline freezes every session/update --
+                // agent text, tool-call events and the activity heartbeat -- for
+                // the whole wait, which is exactly when an operator inspects a run
+                // that looks stuck. Returning immediately and answering from the
+                // task keeps the loop pumping. Each captured handle is cloned per
+                // call so this `Fn` handler can spawn on every request.
+                let resolver = on_permission_request.clone();
+                let cancel = permission_cancel_token.clone();
+                let timeout_slot = Arc::clone(&permission_timeout_for_handler);
+                let permission_state = permission_state.clone();
+                tokio::spawn(async move {
+                    let outcome = if cancel.is_cancelled() {
+                        RequestPermissionOutcome::Cancelled
+                    } else if let Some(resolver) = resolver.as_ref() {
+                        let question = permission_question(&request);
+                        let answer = resolver(question.clone()).await;
+                        if answer == AcpPermissionAnswer::TimedOut {
+                            // Append (do not overwrite): concurrent permission
+                            // requests can each time out now that the loop is not
+                            // serialised, and the read site reports the first.
+                            timeout_slot
+                                .lock()
+                                .expect("ACP permission timeout lock poisoned")
+                                .push((question.tool_call_id, question.title));
+                            // End the turn: an unanswered permission is a human
+                            // decision the loop cannot make, not a denial to work
+                            // around. The teardown error is reported after the
+                            // timeout slot is read, so a failure here is not lost.
+                            let _ = permission_state.terminate().await;
+                        }
+                        permission_outcome_for_answer(&request, &answer)
+                    } else {
+                        select_permission_outcome(&request)
+                    };
+                    // The connection may already be tearing down (e.g. a timeout
+                    // called terminate above), so a failed respond is expected and
+                    // ignored rather than propagated out of the detached task.
+                    let _ = responder.respond(RequestPermissionResponse::new(outcome));
+                });
+                // The handler returns immediately; the spawned task owns the
+                // response. The dispatch loop is free to process the next message.
+                Ok(())
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -669,10 +698,14 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
     // Bind before the `if let`: an `if let` scrutinee's temporaries live for the
     // whole construct in edition 2021, so locking inline would hold the guard
     // across the `terminate().await` below and make this future `!Send`.
+    // Report the FIRST permission that timed out (the one whose teardown ended
+    // the turn); draining clears the slot. More than one entry is possible now
+    // that permission requests are handled concurrently.
     let timed_out_permission = permission_timeout
         .lock()
         .expect("ACP permission timeout lock poisoned")
-        .take();
+        .drain(..)
+        .next();
     if let Some((tool_call_id, title)) = timed_out_permission {
         state.terminate().await?;
         return Err(AcpError::PermissionTimedOut {
