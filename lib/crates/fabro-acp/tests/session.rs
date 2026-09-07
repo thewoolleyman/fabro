@@ -448,6 +448,56 @@ async fn permission_resolver_does_not_block_the_dispatch_loop() {
     assert!(permission.contains(r#""outcome":"selected""#));
 }
 
+/// Two permission requests can be in flight at once (only because the handler
+/// is non-blocking). When both time out, the per-request slot must record a
+/// bounded, single `PermissionTimedOut` -- never lose it, never report a wrong
+/// terminal error. Reverting the slot to logic that drops or mis-records a
+/// concurrent timeout would fail here.
+#[tokio::test]
+async fn concurrent_permission_timeouts_report_one_bounded_permission_timed_out() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+
+    // Every permission times out immediately.
+    let on_permission_request: fabro_acp::AcpPermissionResolver =
+        Arc::new(move |_question| Box::pin(async move { AcpPermissionAnswer::TimedOut }));
+
+    let script_path = tempdir.path().join("fake_acp_agent.py");
+    write(&script_path, fake_acp_agent_script())
+        .await
+        .expect("write fake ACP agent");
+    let raw_command = format!("python3 {}", shell_quote(&script_path.to_string_lossy()));
+    let command = AcpProcessSpec::from_command_attr(&raw_command).expect("parse ACP command");
+    let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(tempdir.path().to_path_buf()));
+
+    let result = run_acp_turn(AcpRunRequest {
+        on_tool_event: None,
+        on_permission_request: Some(on_permission_request),
+        command,
+        prompt: "hello".to_string(),
+        cwd: tempdir.path().to_string_lossy().into_owned(),
+        timeout_ms: Some(ACP_TEST_TIMEOUT_MS),
+        env: HashMap::from([
+            ("ACP_MODE".to_string(), "permission_two_timeout".to_string()),
+            ("LC_ALL".to_string(), "C".to_string()),
+        ]),
+        sandbox,
+        cancel_token: CancellationToken::new(),
+        on_activity: None,
+        live_control: None,
+    })
+    .await;
+
+    match result {
+        Err(AcpError::PermissionTimedOut { tool_call_id, .. }) => {
+            assert!(
+                tool_call_id == "tool-1" || tool_call_id == "tool-2",
+                "unexpected timed-out tool_call_id: {tool_call_id}"
+            );
+        }
+        other => panic!("expected a single PermissionTimedOut, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn runs_inside_sandbox_and_uses_requested_cwd() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
