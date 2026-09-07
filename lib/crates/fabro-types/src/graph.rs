@@ -296,6 +296,22 @@ impl Node {
         self.str_attr("acp.permission_policy")
     }
 
+    /// How long a parked `acp.permission_policy="ask"` question may go
+    /// unanswered before the turn ends as a deterministic failure.
+    ///
+    /// This exists because the question runtime itself has NO clock: it waits
+    /// on the answer or on cancellation and nothing else. Without a deadline
+    /// here, an unanswered permission simply hangs until the node's own
+    /// `timeout` fires, and the run then reports a generic ACP turn timeout
+    /// rather than naming the permission nobody answered. Absent means no
+    /// permission deadline, which is the pre-existing behaviour.
+    #[must_use]
+    pub fn acp_permission_timeout(&self) -> Option<Duration> {
+        self.attrs
+            .get("acp.permission_timeout")
+            .and_then(AttrValue::as_duration)
+    }
+
     #[must_use]
     pub fn selection(&self) -> &str {
         self.str_attr("selection").unwrap_or("deterministic")

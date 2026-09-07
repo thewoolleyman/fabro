@@ -245,12 +245,18 @@ impl AgentAcpBackend {
                     )
                 })?;
                 let cancel_token = cancel_token.clone();
+                let permission_deadline = node.acp_permission_timeout();
                 Some(Arc::new(move |question: AcpPermissionQuestion| {
                     let runtime = Arc::clone(&runtime);
                     let cancel_token = cancel_token.clone();
                     Box::pin(async move {
-                        resolve_permission_via_interview(runtime.as_ref(), question, cancel_token)
-                            .await
+                        resolve_permission_via_interview(
+                            runtime.as_ref(),
+                            question,
+                            cancel_token,
+                            permission_deadline,
+                        )
+                        .await
                     })
                         as std::pin::Pin<
                             Box<dyn std::future::Future<Output = AcpPermissionAnswer> + Send>,
@@ -709,7 +715,37 @@ fn resolve_acp_permission_policy(node: &Node) -> Result<AcpPermissionPolicy, Err
 /// The interview question a parked permission request becomes: one
 /// multiple-choice question whose options are exactly the adapter's, keyed
 /// by `option_id` and labelled by the adapter's own option names.
+/// Rank one permission option for DISPLAY order: most permissive first,
+/// rejections last, ties broken by the adapter's own order.
+///
+/// This ordering is load-bearing, not cosmetic. An interviewer that answers
+/// without a human -- `AutoApproveInterviewer`, installed for every run whose
+/// `execution.approval` is `auto`, which is the unattended dark-factory
+/// configuration -- answers a multiple-choice question with `options.first()`.
+/// Nothing in ACP orders an adapter's options, and `PermissionOptionKind`
+/// includes `reject_once` and `reject_always`, so with the adapter's raw
+/// order a reject-first adapter would turn every tool call into a SILENT
+/// denial under `ask`, while the `auto` policy on the same run would have
+/// allowed it.
+///
+/// Ordering here makes `ask` degrade to exactly what `auto` would have chosen
+/// when no human is present, instead of to whatever the adapter happened to
+/// list first. It changes nothing for a human, who picks by identity: the
+/// option key is the `option_id`, so the answer round-trips regardless of
+/// display order.
+fn permission_option_rank(kind: &str) -> u8 {
+    match kind {
+        "allow_always" => 0,
+        "allow_once" => 1,
+        "reject_once" => 3,
+        "reject_always" => 4,
+        _ => 2,
+    }
+}
+
 fn permission_interview_question(question: &AcpPermissionQuestion) -> AgentQuestion {
+    let mut ordered: Vec<_> = question.options.iter().enumerate().collect();
+    ordered.sort_by_key(|(index, option)| (permission_option_rank(&option.kind), *index));
     AgentQuestion {
         original_id:       Some(question.tool_call_id.clone()),
         original_question: question.title.clone(),
@@ -719,10 +755,9 @@ fn permission_interview_question(question: &AcpPermissionQuestion) -> AgentQuest
             question.kind, question.title
         ),
         question_type:     fabro_types::QuestionType::MultipleChoice,
-        options:           question
-            .options
-            .iter()
-            .map(|option| fabro_types::InterviewOption {
+        options:           ordered
+            .into_iter()
+            .map(|(_, option)| fabro_types::InterviewOption {
                 key:         option.option_id.clone(),
                 label:       option.name.clone(),
                 description: Some(option.kind.clone()),
@@ -733,10 +768,25 @@ fn permission_interview_question(question: &AcpPermissionQuestion) -> AgentQuest
     }
 }
 
-/// Map the runtime's answer back onto the adapter's options. Answers carry
-/// option LABELS (the runtime renders keys to labels), so a label match wins;
-/// a raw `option_id` is accepted too. Anything else is a cancellation, and
-/// a deadline expiry is the one answer that ends the turn.
+/// Map the runtime's answer back onto the adapter's options.
+///
+/// The identity we send out is the `option_id` (it is `InterviewOption.key`,
+/// and the API validates the human's choice against those keys), but the
+/// runtime renders keys back to LABELS before the answer reaches us, so a
+/// label match has to be accepted too.
+///
+/// That reverse mapping is the delicate part, because a label is a DISPLAY
+/// field and nothing makes it unique. Two adapter options sharing a name
+/// would otherwise collapse to whichever is listed first -- and with the
+/// common allow-then-reject ordering, a human who chose reject would grant the
+/// call. So this resolves in identity-first order and FAILS CLOSED:
+///
+/// 1. an exact `option_id` match wins outright, for every chosen value, before
+///    any label is considered;
+/// 2. otherwise a label match is accepted only when it is UNAMBIGUOUS -- if a
+///    label matches more than one option we cancel rather than guess;
+/// 3. anything else is a cancellation, and a deadline expiry is the one answer
+///    that ends the turn.
 fn permission_answer_from(
     question: &AcpPermissionQuestion,
     answer: Option<&AgentQuestionAnswer>,
@@ -746,34 +796,71 @@ fn permission_answer_from(
     };
     match answer.status {
         AgentQuestionAnswerStatus::Timeout => AcpPermissionAnswer::TimedOut,
-        AgentQuestionAnswerStatus::Answered => answer
-            .answers
-            .iter()
-            .find_map(|chosen| {
+        AgentQuestionAnswerStatus::Answered => {
+            // Identity first: an option_id is unique by construction, so it is
+            // never ambiguous and never needs the label fallback.
+            if let Some(option) = answer.answers.iter().find_map(|chosen| {
                 question
                     .options
                     .iter()
-                    .find(|option| option.name == *chosen || option.option_id == *chosen)
-            })
-            .map_or(AcpPermissionAnswer::Cancelled, |option| {
-                AcpPermissionAnswer::Selected(option.option_id.clone())
-            }),
+                    .find(|option| option.option_id == *chosen)
+            }) {
+                return AcpPermissionAnswer::Selected(option.option_id.clone());
+            }
+            // Label fallback, unambiguous only. `find` would silently pick the
+            // first of several equal labels; a permission decision must not be
+            // resolved by list order.
+            for chosen in &answer.answers {
+                let mut matching = question
+                    .options
+                    .iter()
+                    .filter(|option| option.name == *chosen);
+                let (Some(option), None) = (matching.next(), matching.next()) else {
+                    continue;
+                };
+                return AcpPermissionAnswer::Selected(option.option_id.clone());
+            }
+            AcpPermissionAnswer::Cancelled
+        }
         AgentQuestionAnswerStatus::Cancelled
         | AgentQuestionAnswerStatus::Interrupted
         | AgentQuestionAnswerStatus::Skipped => AcpPermissionAnswer::Cancelled,
     }
 }
 
+/// Park one adapter permission request on the workflow's question runtime,
+/// and enforce the deadline the runtime itself does not have.
+///
+/// The question runtime waits on an answer or on cancellation and NOTHING
+/// else -- it carries no timer and emits `timeout_seconds: None`. So the only
+/// route to an answered-with-Timeout status is a client explicitly POSTing
+/// one. Without the deadline applied here, an unanswered permission hangs
+/// until the NODE's own `timeout` fires (itself optional), at which point the
+/// run reports a generic ACP turn timeout and never names the permission that
+/// nobody answered. `deadline` is `acp.permission_timeout`; `None` preserves
+/// the wait-forever behaviour.
 async fn resolve_permission_via_interview(
     runtime: &dyn AgentQuestionRuntime,
     question: AcpPermissionQuestion,
     cancel_token: CancellationToken,
+    deadline: Option<Duration>,
 ) -> AcpPermissionAnswer {
     let interview = permission_interview_question(&question);
-    match runtime
-        .ask_questions(&question.tool_call_id, vec![interview], cancel_token)
-        .await
-    {
+    let ask = runtime.ask_questions(&question.tool_call_id, vec![interview], cancel_token);
+    let asked = if let Some(deadline) = deadline {
+        let Ok(asked) = timeout(deadline, ask).await else {
+            tracing::warn!(
+                tool_call_id = %question.tool_call_id,
+                deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+                "ACP permission question went unanswered past its deadline; ending the turn"
+            );
+            return AcpPermissionAnswer::TimedOut;
+        };
+        asked
+    } else {
+        ask.await
+    };
+    match asked {
         Ok(answers) => permission_answer_from(&question, answers.first()),
         Err(error) => {
             tracing::warn!(
@@ -786,10 +873,24 @@ async fn resolve_permission_via_interview(
     }
 }
 
-/// Map one ACP tool event onto the run's agent-event vocabulary. The
-/// `arguments` and `output` payloads carry only the tool kind, the terminal
-/// status and the elapsed time -- never the tool's input or output, which
-/// would make every event as large as the transcript it summarises.
+/// Map one ACP tool event onto the run's agent-event vocabulary.
+///
+/// **What is carried, stated precisely, because the obvious summary is
+/// wrong.** The `arguments` and `output` payloads carry only the tool kind,
+/// the terminal status and the elapsed time -- never the tool's arguments or
+/// its results, which would make every event as large as the transcript it
+/// summarises.
+///
+/// `tool_name`, however, is the adapter's own tool-call TITLE, and adapters
+/// routinely title a call with the command it is about to run
+/// (`Bash: cargo test`). So this event does carry a bounded, adapter-supplied
+/// description of the tool INPUT: at most `TOOL_TITLE_MAX_BYTES` (200) bytes,
+/// trimmed on a char boundary, and nothing else. That is deliberate -- a
+/// per-tool event with no name is not usable in a console -- but it must not be
+/// described as "never carries tool input", because an adapter that titles a
+/// call with a credential-bearing command line puts that prefix into the run
+/// store, the console, `fabro dump` and OTLP export. Do not widen it further,
+/// and do not assume `tool_name` is redacted anywhere downstream.
 fn tool_event_to_agent_event(event: AcpToolEvent) -> (String, AgentEvent) {
     match event {
         AcpToolEvent::Started {
@@ -1812,6 +1913,115 @@ mod tests {
     /// A parked permission request becomes one multiple-choice question with
     /// the adapter's exact options; the human's label answer maps back to the
     /// option id, a deadline expiry ends the turn, everything else cancels.
+    /// A permission decision must never be resolved by LIST ORDER.
+    ///
+    /// Two adapter options can carry the same display name, and the runtime
+    /// renders the human's chosen key back to a label before it reaches us.
+    /// A naive `find` on the label would then return whichever option is
+    /// listed first -- so with the usual allow-then-reject ordering a human
+    /// who chose reject would GRANT the call. Identity wins first, and an
+    /// ambiguous label fails closed.
+    #[test]
+    fn a_duplicate_option_label_never_resolves_to_the_wrong_permission() {
+        use fabro_acp::{AcpPermissionAnswer, AcpPermissionOption, AcpPermissionQuestion};
+        use fabro_agent::{AgentQuestionAnswer, AgentQuestionAnswerStatus};
+
+        use super::permission_answer_from;
+
+        let question = AcpPermissionQuestion {
+            tool_call_id: "call-9".to_string(),
+            title:        "Bash: rm -rf build/".to_string(),
+            kind:         "execute".to_string(),
+            options:      vec![
+                AcpPermissionOption {
+                    option_id: "allow".to_string(),
+                    name:      "Confirm".to_string(),
+                    kind:      "allow_once".to_string(),
+                },
+                AcpPermissionOption {
+                    option_id: "reject".to_string(),
+                    name:      "Confirm".to_string(),
+                    kind:      "reject_once".to_string(),
+                },
+            ],
+        };
+        let answered = |answers: Vec<&str>| AgentQuestionAnswer {
+            original_id:       Some("call-9".to_string()),
+            original_question: question.title.clone(),
+            answers:           answers.into_iter().map(str::to_string).collect(),
+            status:            AgentQuestionAnswerStatus::Answered,
+        };
+
+        // The identity round-trip still resolves exactly, for BOTH options --
+        // this is the path a real answer takes, since the option key is the
+        // option_id and the API validates against it.
+        assert_eq!(
+            permission_answer_from(&question, Some(&answered(vec!["reject"]))),
+            AcpPermissionAnswer::Selected("reject".to_string()),
+            "an option_id must resolve to itself even when labels collide"
+        );
+        assert_eq!(
+            permission_answer_from(&question, Some(&answered(vec!["allow"]))),
+            AcpPermissionAnswer::Selected("allow".to_string())
+        );
+
+        // The ambiguous label fails CLOSED. Selecting "allow" here -- the
+        // first match, which is what a plain `find` returns -- would grant a
+        // call the human may have rejected.
+        assert_eq!(
+            permission_answer_from(&question, Some(&answered(vec!["Confirm"]))),
+            AcpPermissionAnswer::Cancelled,
+            "an ambiguous label must cancel, never pick the first match"
+        );
+    }
+
+    /// Interview options are presented most-permissive first, so a run with
+    /// no human degrades to what `auto` would have chosen.
+    ///
+    /// `AutoApproveInterviewer` -- installed for every run whose approval mode
+    /// is `auto` -- answers a multiple-choice question with `options.first()`.
+    /// ACP does not order an adapter's options, so under the adapter's raw
+    /// order a reject-first adapter would make `ask` silently deny every tool
+    /// call while `auto` on the same run allowed it.
+    #[test]
+    fn permission_options_are_presented_most_permissive_first() {
+        use fabro_acp::{AcpPermissionOption, AcpPermissionQuestion};
+
+        use super::permission_interview_question;
+
+        let option = |id: &str, kind: &str| AcpPermissionOption {
+            option_id: id.to_string(),
+            name:      id.to_string(),
+            kind:      kind.to_string(),
+        };
+        // Deliberately the worst adapter order: rejections first.
+        let question = AcpPermissionQuestion {
+            tool_call_id: "call-9".to_string(),
+            title:        "Bash: rm -rf build/".to_string(),
+            kind:         "execute".to_string(),
+            options:      vec![
+                option("reject_always", "reject_always"),
+                option("reject_once", "reject_once"),
+                option("other", "something_else"),
+                option("once", "allow_once"),
+                option("always", "allow_always"),
+            ],
+        };
+
+        let keys: Vec<_> = permission_interview_question(&question)
+            .options
+            .into_iter()
+            .map(|option| option.key)
+            .collect();
+        assert_eq!(keys, vec![
+            "always",
+            "once",
+            "other",
+            "reject_once",
+            "reject_always"
+        ]);
+    }
+
     #[test]
     fn permission_requests_round_trip_through_interview_questions() {
         use fabro_acp::{AcpPermissionAnswer, AcpPermissionOption, AcpPermissionQuestion};
