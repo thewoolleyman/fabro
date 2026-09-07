@@ -248,6 +248,26 @@ for line in sys.stdin:
             permission_response = json.loads(sys.stdin.readline())
             with open(os.environ["ACP_PERMISSION"], "w", encoding="utf-8") as permission:
                 permission.write(json.dumps(permission_response.get("result", {}), separators=(",", ":")))
+        if mode == "permission_two_timeout":
+            # Two permission requests in flight at once -- only reachable because
+            # the client handler is non-blocking. Both are expected to time out;
+            # the run must still report a single, bounded PermissionTimedOut.
+            for request_id, tool_call_id in (("permission-1", "tool-1"), ("permission-2", "tool-2")):
+                send({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "session/request_permission",
+                    "params": {
+                        "sessionId": session_id,
+                        "toolCall": {"toolCallId": tool_call_id},
+                        "options": [
+                            {"optionId": "always", "name": "Allow always", "kind": "allow_always"}
+                        ]
+                    }
+                })
+            # The timed-out permission tears the turn down; block until killed.
+            for _line in sys.stdin:
+                pass
         if mode == "interrupt_steer":
             if prompt_count == 1:
                 send({
