@@ -343,7 +343,13 @@ pub async fn initialize(
             "Uncommitted changes will not be included in the remote sandbox.",
         );
     }
-    if !attach_existing && !matches!(options.sandbox, SandboxSpec::Local { .. }) {
+    // Refuse only when this run's sandbox will actually CLONE origin. A spec
+    // that creates an empty workspace (`skip_clone`, or no usable
+    // `clone_origin_url`) never reads origin, so a refused push cannot have
+    // given it a stale base and refusing it would be a false alarm with no
+    // override. `clones_from_origin` delegates to the same `decide_clone` the
+    // sandbox itself uses, so the guard cannot drift from the behaviour.
+    if !attach_existing && options.sandbox.clones_from_origin() {
         if let Some(refusal) = refused_pre_run_push(options.run_options.pre_run_git.as_ref()) {
             return Err(Error::Precondition(refusal));
         }

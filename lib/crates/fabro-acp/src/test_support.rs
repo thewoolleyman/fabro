@@ -156,6 +156,47 @@ for line in sys.stdin:
                             record.write("session/cancel\n")
                     record_methods()
                     time.sleep(60)
+        if mode == "tool_calls":
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tool-a",
+                        "title": "Bash: cargo test",
+                        "kind": "execute",
+                        "status": "in_progress"
+                    }
+                }
+            })
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "tool-a",
+                        "status": "completed"
+                    }
+                }
+            })
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tool-b",
+                        "title": "Read: src/main.rs",
+                        "kind": "read",
+                        "status": "failed"
+                    }
+                }
+            })
         if mode == "permission":
             send({
                 "jsonrpc": "2.0",

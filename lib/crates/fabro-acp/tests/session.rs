@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::StopReason;
 use fabro_acp::{
-    AcpControlHandle, AcpError, AcpLiveControl, AcpProcessSpec, AcpRunRequest, AcpRunResult,
-    run_acp_turn,
+    AcpControlHandle, AcpError, AcpLiveControl, AcpPermissionAnswer, AcpProcessSpec, AcpRunRequest,
+    AcpRunResult, AcpToolEvent, run_acp_turn,
 };
 use fabro_sandbox::test_support::{MockSandbox, MockStdioProcess};
 use fabro_sandbox::{LocalSandbox, Sandbox, shell_quote};
@@ -700,6 +700,150 @@ async fn run_fake_agent_with_activity(
         live_control: None,
     })
     .await
+}
+
+/// Drive the fake agent with the two Wave B callbacks wired, which the other
+/// helpers deliberately leave as `None`.
+///
+/// These seams exist ONLY here. Mutation-checked 2026-09-07: deleting the
+/// whole `tools.observe(...)` dispatch in `read_live_session`, and deleting
+/// the whole `PermissionTimedOut` return block in `run_acp_turn`, both left
+/// every other test in this crate green -- the callbacks and the permission
+/// teardown were covered by nothing.
+async fn run_fake_agent_with_callbacks(
+    tempdir: &Path,
+    mut env: HashMap<String, String>,
+    on_tool_event: Option<fabro_acp::AcpToolEventCallback>,
+    on_permission_request: Option<fabro_acp::AcpPermissionResolver>,
+) -> Result<AcpRunResult, AcpError> {
+    let script_path = tempdir.join("fake_acp_agent.py");
+    write(&script_path, fake_acp_agent_script())
+        .await
+        .expect("write fake ACP agent");
+    let raw_command = format!("python3 {}", shell_quote(&script_path.to_string_lossy()));
+    let command = AcpProcessSpec::from_command_attr(&raw_command).expect("parse ACP command");
+    let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(tempdir.to_path_buf()));
+    env.entry("LC_ALL".to_string())
+        .or_insert_with(|| "C".to_string());
+
+    run_acp_turn(AcpRunRequest {
+        on_tool_event,
+        on_permission_request,
+        command,
+        prompt: "hello".to_string(),
+        cwd: tempdir.to_string_lossy().into_owned(),
+        timeout_ms: Some(ACP_TEST_TIMEOUT_MS),
+        env,
+        sandbox,
+        cancel_token: CancellationToken::new(),
+        on_activity: None,
+        live_control: None,
+    })
+    .await
+}
+
+/// The tool-call ledger reaches `on_tool_event` for a REAL adapter stream.
+///
+/// The unit tests exercise `ToolCallLedger::observe` directly; nothing proved
+/// the observed events are dispatched to the callback from inside
+/// `read_live_session`. Deleting that dispatch is invisible to every other
+/// test in this crate, so this is the test that holds the wiring.
+#[tokio::test]
+async fn tool_events_from_a_live_session_reach_the_callback() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let events: Arc<std::sync::Mutex<Vec<AcpToolEvent>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+
+    let result = run_fake_agent_with_callbacks(
+        tempdir.path(),
+        HashMap::from([("ACP_MODE".to_string(), "tool_calls".to_string())]),
+        Some(Arc::new(move |event: AcpToolEvent| {
+            sink.lock().expect("tool event sink poisoned").push(event);
+        })),
+        None,
+    )
+    .await
+    .expect("tool-call turn should succeed");
+    assert_eq!(result.stop_reason, StopReason::EndTurn);
+
+    let observed = events.lock().expect("tool event sink poisoned").clone();
+    assert!(
+        observed.len() >= 3,
+        "expected a start and a completion for tool-a plus tool-b, got {observed:?}"
+    );
+
+    let started_a = observed.iter().any(|event| {
+        matches!(event, AcpToolEvent::Started { tool_call_id, title, kind }
+            if tool_call_id == "tool-a" && title == "Bash: cargo test" && kind == "execute")
+    });
+    assert!(
+        started_a,
+        "tool-a must report a Started event: {observed:?}"
+    );
+
+    let completed_a = observed.iter().any(|event| {
+        matches!(event, AcpToolEvent::Completed { tool_call_id, ok, .. }
+            if tool_call_id == "tool-a" && *ok)
+    });
+    assert!(
+        completed_a,
+        "tool-a must report a successful Completed event: {observed:?}"
+    );
+
+    let failed_b = observed.iter().any(|event| {
+        matches!(event, AcpToolEvent::Completed { tool_call_id, ok, .. }
+            if tool_call_id == "tool-b" && !*ok)
+    });
+    assert!(
+        failed_b,
+        "tool-b arrives already failed and must report a failed Completed event: {observed:?}"
+    );
+}
+
+/// A resolver that times out ends the TURN as `PermissionTimedOut`.
+///
+/// This is the runtime half of the ordering the branch calls load-bearing:
+/// the handler writes the timeout slot before tearing the session down, and
+/// `run_acp_turn` reads that slot before it reads the run outcome. A `!Send`
+/// regression is a compile error, but this ordering is not -- deleting the
+/// entire return block leaves the rest of the suite green.
+#[tokio::test]
+async fn an_unanswered_permission_ends_the_turn_as_permission_timed_out() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let asked = Arc::new(AtomicBool::new(false));
+    let asked_for_resolver = Arc::clone(&asked);
+
+    let error = run_fake_agent_with_callbacks(
+        tempdir.path(),
+        HashMap::from([
+            ("ACP_MODE".to_string(), "permission".to_string()),
+            (
+                "ACP_PERMISSION".to_string(),
+                tempdir
+                    .path()
+                    .join("permission.json")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        ]),
+        None,
+        Some(Arc::new(move |_question| {
+            asked_for_resolver.store(true, Ordering::SeqCst);
+            Box::pin(async move { AcpPermissionAnswer::TimedOut })
+        })),
+    )
+    .await
+    .expect_err("an unanswered permission must end the turn");
+
+    assert!(
+        asked.load(Ordering::SeqCst),
+        "the resolver must actually be consulted"
+    );
+    assert!(
+        matches!(error, AcpError::PermissionTimedOut { ref tool_call_id, .. } if tool_call_id == "tool-1"),
+        "expected PermissionTimedOut naming tool-1, got {error:?}"
+    );
 }
 
 async fn process_is_running(pid: &str) -> bool {

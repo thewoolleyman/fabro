@@ -53,6 +53,18 @@ pub type AcpToolEventCallback = Arc<dyn Fn(AcpToolEvent) + Send + Sync>;
 /// Upper bound on the tool title carried in an [`AcpToolEvent`].
 pub const TOOL_TITLE_MAX_BYTES: usize = 200;
 
+/// Upper bound on the tool calls the ledger tracks as OPEN at once.
+///
+/// An entry is removed only when a terminal status arrives, so calls the
+/// adapter opens and abandons accumulate for the life of the turn. A turn is
+/// bounded and each entry is small, so this is a guarantee rather than a
+/// live leak -- but an adapter that never terminates its calls should not be
+/// able to grow this without limit. Past the cap a new call is still
+/// REPORTED (the `Started` event is emitted) and simply not tracked, so it
+/// closes later through the same zero-elapsed fallback used for any call the
+/// ledger never saw open.
+pub const TOOL_LEDGER_MAX_OPEN: usize = 1024;
+
 /// One option the adapter offered on a `session/request_permission`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcpPermissionOption {
@@ -125,7 +137,15 @@ fn permission_question(request: &RequestPermissionRequest) -> AcpPermissionQuest
             .iter()
             .map(|option| AcpPermissionOption {
                 option_id: option.option_id.to_string(),
-                name:      option.name.clone(),
+                // Bounded like the title beside it: this name is adapter-
+                // controlled and travels into `interview.started` run events
+                // as the option label, so an unbounded one would put an
+                // arbitrary adapter string into the run store.
+                name:      {
+                    let mut name = option.name.clone();
+                    trim_to_head(&mut name, TOOL_TITLE_MAX_BYTES);
+                    name
+                },
                 kind:      permission_kind_name(option.kind),
             })
             .collect(),
@@ -302,17 +322,25 @@ impl ToolCallLedger {
                         });
                     }
                     None => {
-                        self.open
-                            .entry(tool_call_id)
-                            .and_modify(|open| {
-                                open.title.clone_from(&title);
-                                open.kind.clone_from(&kind);
-                            })
-                            .or_insert(OpenToolCall {
-                                title,
-                                kind,
-                                started: now,
-                            });
+                        // Refuse to grow past the cap, but only for calls that
+                        // are NEW: an update to a call already tracked must
+                        // still land, or a full ledger would freeze existing
+                        // entries at stale titles.
+                        if self.open.contains_key(&tool_call_id)
+                            || self.open.len() < TOOL_LEDGER_MAX_OPEN
+                        {
+                            self.open
+                                .entry(tool_call_id)
+                                .and_modify(|open| {
+                                    open.title.clone_from(&title);
+                                    open.kind.clone_from(&kind);
+                                })
+                                .or_insert(OpenToolCall {
+                                    title,
+                                    kind,
+                                    started: now,
+                                });
+                        }
                     }
                 }
                 events

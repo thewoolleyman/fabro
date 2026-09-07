@@ -55,6 +55,40 @@ impl SandboxSpec {
         }
     }
 
+    /// Whether this spec will actually clone the run's origin repository.
+    ///
+    /// A sandbox that creates an empty workspace -- `skip_clone`, or no
+    /// usable `clone_origin_url` -- never reads origin, so nothing about the
+    /// state of origin can affect it. Callers that guard on "origin must
+    /// carry the source HEAD" MUST consult this rather than assuming every
+    /// non-local spec clones, or they refuse runs that had no stake in the
+    /// push. The decision is delegated to `decide_clone`, so this predicate
+    /// and the sandbox itself cannot drift apart.
+    #[must_use]
+    pub fn clones_from_origin(&self) -> bool {
+        match self {
+            Self::Local { .. } => false,
+            #[cfg(feature = "docker")]
+            Self::Docker {
+                config,
+                clone_origin_url,
+                ..
+            } => {
+                clone_source::repo_cloned_for_record(config.skip_clone, clone_origin_url.as_deref())
+                    .unwrap_or(false)
+            }
+            #[cfg(feature = "daytona")]
+            Self::Daytona {
+                config,
+                clone_origin_url,
+                ..
+            } => {
+                clone_source::repo_cloned_for_record(config.skip_clone, clone_origin_url.as_deref())
+                    .unwrap_or(false)
+            }
+        }
+    }
+
     pub fn provider_name(&self) -> &'static str {
         match self.provider() {
             SandboxProviderKind::Local => "local",
