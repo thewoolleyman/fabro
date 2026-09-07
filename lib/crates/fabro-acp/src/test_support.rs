@@ -215,6 +215,39 @@ for line in sys.stdin:
             permission_response = json.loads(sys.stdin.readline())
             with open(os.environ["ACP_PERMISSION"], "w", encoding="utf-8") as permission:
                 permission.write(json.dumps(permission_response.get("result", {}), separators=(",", ":")))
+        if mode == "permission_concurrent":
+            # Ask for permission, then IMMEDIATELY send a session/update WITHOUT
+            # waiting for the answer. The client must process this update while
+            # its permission handler is still parked on the human -- which only
+            # happens if the handler responds from a spawned task and does not
+            # block the connection's dispatch loop.
+            send({
+                "jsonrpc": "2.0",
+                "id": "permission-1",
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": session_id,
+                    "toolCall": {"toolCallId": "tool-1"},
+                    "options": [
+                        {"optionId": "reject", "name": "Reject", "kind": "reject_once"},
+                        {"optionId": "always", "name": "Allow always", "kind": "allow_always"}
+                    ]
+                }
+            })
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "concurrent "}
+                    }
+                }
+            })
+            permission_response = json.loads(sys.stdin.readline())
+            with open(os.environ["ACP_PERMISSION"], "w", encoding="utf-8") as permission:
+                permission.write(json.dumps(permission_response.get("result", {}), separators=(",", ":")))
         if mode == "interrupt_steer":
             if prompt_count == 1:
                 send({
