@@ -21,3 +21,6 @@ __pycache__
 .claude/scheduled_tasks.lock
 .mcp.json
 docs/internal/agent
+
+# rustc internal-compiler-error dumps (nightly toolchain crashes)
+rustc-ice-*.txt

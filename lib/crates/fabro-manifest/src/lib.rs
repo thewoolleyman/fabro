@@ -28,7 +28,8 @@ use fabro_types::{
     DirtyStatus, GitContext, ManifestPath, PreRunPushOutcome, RunId, WorkflowSettings,
 };
 use fabro_workflow::git::{
-    GitSyncStatus, branch_needs_push, head_sha, push_branch_noninteractive, sync_status,
+    GitSyncStatus, branch_needs_push, head_sha, push_branch_noninteractive, remote_branch_sha,
+    sync_status,
 };
 use fabro_workflow::static_reference::{
     AttributeScope, ReferenceKind, reference_kind_for_attribute,
@@ -823,6 +824,22 @@ fn build_manifest_push_outcome(
 
     if !branch_needs_push(repo_path, "origin", branch) {
         return PreRunPushOutcome::NotAttempted;
+    }
+
+    // bd-ib-cewr.4: `branch_needs_push` compares only LOCAL refs — the local
+    // remote-tracking ref goes stale the moment origin advances without a
+    // fetch, so a clean primary checkout sitting exactly at origin's tip is
+    // wrongly told it must push. Before pushing, confirm with ORIGIN directly:
+    // if origin already advertises the source HEAD, the sandbox clone will
+    // carry it and no push is needed. This is decisive at a primary checkout
+    // whose commit-refuse hook rejects every push — without it the needless
+    // push Fails and staging is refused, failing every dispatch in 0 s. Only
+    // when origin genuinely lacks HEAD do we fall through to the push below
+    // (which Succeeds, or — if refused — Fails and staging is refused).
+    if let Ok(head) = head_sha(repo_path) {
+        if remote_branch_sha(repo_path, "origin", branch).as_deref() == Some(head.as_str()) {
+            return PreRunPushOutcome::NotAttempted;
+        }
     }
 
     match push_branch_noninteractive(repo_path, "origin", branch) {
@@ -1716,6 +1733,135 @@ exit 1
         });
 
         assert_eq!(std::fs::read_to_string(helper_log).unwrap(), "0\n");
+    }
+
+    // bd-ib-cewr.4 regression guard: a clean primary checkout sits exactly at
+    // origin's tip, but its local remote-tracking ref is stale (here: deleted),
+    // so `branch_needs_push` alone would demand a push. Origin genuinely carries
+    // HEAD and would REFUSE any push (a rejecting pre-receive hook, standing in
+    // for the fleet's commit-refuse hook). The precondition must ask origin
+    // directly, attempt no push, and report NotAttempted — not Failed.
+    #[cfg(unix)]
+    #[test]
+    fn build_manifest_skips_push_when_origin_already_carries_head() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        // A real bare origin the workspace can ls-remote and push to.
+        let origin = temp.path().join("origin.git");
+        run_git(temp.path(), &["init", "--bare", "--quiet", origin.to_str().unwrap()]);
+
+        init_git_repo(&workspace, "feature", origin.to_str().unwrap());
+        // Seed origin with HEAD so it genuinely carries the source commit.
+        run_git(&workspace, &["push", "--quiet", "origin", "feature"]);
+        // Make the local remote-tracking ref stale (absent) so branch_needs_push
+        // alone would wrongly conclude a push is required.
+        run_git(&workspace, &["update-ref", "-d", "refs/remotes/origin/feature"]);
+        // Refuse EVERY push from this checkout via a client-side pre-push hook —
+        // exactly how the fleet's commit-refuse hook behaves at a primary
+        // checkout, firing on any push invocation (including an up-to-date one).
+        // The precondition must therefore never invoke a push at all.
+        let hook = workspace.join(".git").join("hooks").join("pre-push");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\necho 'refusing commit/push at primary checkout; use a worktree' >&2\nexit 1\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hook, permissions).unwrap();
+
+        let workflow_dir = workspace.join(".fabro/workflows/demo");
+        std::fs::create_dir_all(&workflow_dir).unwrap();
+        std::fs::write(workspace.join(".fabro/project.toml"), "_version = 1\n").unwrap();
+        std::fs::write(
+            workflow_dir.join("workflow.toml"),
+            "_version = 1\n\n[workflow]\ngraph = \"workflow.fabro\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workflow_dir.join("workflow.fabro"),
+            r"digraph Demo { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }",
+        )
+        .unwrap();
+
+        let built = build_run_manifest(ManifestBuildInput {
+            workflow: PathBuf::from(".fabro/workflows/demo/workflow.toml"),
+            cwd: workspace.clone(),
+            environment_defaults: test_environment_defaults(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let git = built
+            .manifest
+            .git
+            .expect("manifest git info should be detected");
+        assert_eq!(git.push_outcome, PreRunPushOutcome::NotAttempted);
+    }
+
+    // Over-skip guard (bd-ib-cewr.4): when origin's tip is AHEAD of the source
+    // HEAD, the sandbox clone would carry commits the operator's HEAD does not,
+    // so the precondition must NOT skip. It compares against origin's actual
+    // tip, sees the mismatch, and falls through to the push — which here is a
+    // non-fast-forward reject → Failed, exactly as before the fix.
+    #[cfg(unix)]
+    #[test]
+    fn build_manifest_pushes_when_origin_is_ahead_of_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let origin = temp.path().join("origin.git");
+        run_git(temp.path(), &["init", "--bare", "--quiet", origin.to_str().unwrap()]);
+
+        init_git_repo(&workspace, "feature", origin.to_str().unwrap());
+        // origin == HEAD (C1)
+        run_git(&workspace, &["push", "--quiet", "origin", "feature"]);
+        // Advance origin ahead: make C2, push it, then rewind the workspace to C1.
+        run_git(&workspace, &[
+            "-c", "user.name=test", "-c", "user.email=test@example.com",
+            "commit", "--allow-empty", "--quiet", "-m", "c2",
+        ]);
+        run_git(&workspace, &["push", "--quiet", "origin", "feature"]);
+        run_git(&workspace, &["reset", "--hard", "--quiet", "HEAD~1"]);
+        // Now: workspace HEAD == C1, origin tip == C2 (ahead), local tracking ref == C2.
+
+        let workflow_dir = workspace.join(".fabro/workflows/demo");
+        std::fs::create_dir_all(&workflow_dir).unwrap();
+        std::fs::write(workspace.join(".fabro/project.toml"), "_version = 1\n").unwrap();
+        std::fs::write(
+            workflow_dir.join("workflow.toml"),
+            "_version = 1\n\n[workflow]\ngraph = \"workflow.fabro\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workflow_dir.join("workflow.fabro"),
+            r"digraph Demo { start [shape=Mdiamond] exit [shape=Msquare] start -> exit }",
+        )
+        .unwrap();
+
+        let built = build_run_manifest(ManifestBuildInput {
+            workflow: PathBuf::from(".fabro/workflows/demo/workflow.toml"),
+            cwd: workspace.clone(),
+            environment_defaults: test_environment_defaults(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let git = built
+            .manifest
+            .git
+            .expect("manifest git info should be detected");
+        assert!(
+            matches!(git.push_outcome, PreRunPushOutcome::Failed { .. }),
+            "origin ahead of HEAD must not be skipped; got {:?}",
+            git.push_outcome
+        );
     }
 
     fn init_git_repo(path: &Path, branch: &str, origin_url: &str) {

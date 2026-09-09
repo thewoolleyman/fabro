@@ -273,6 +273,28 @@ pub fn branch_needs_push(repo: &Path, remote: &str, branch: &str) -> bool {
     }
 }
 
+/// Return the SHA `remote` currently advertises for `branch`, asked of the
+/// remote DIRECTLY via `git ls-remote` — not read from a local remote-tracking
+/// ref, which can be stale when the remote has advanced since the last fetch.
+///
+/// Returns `None` when the remote is unreachable, advertises no such branch, or
+/// the query errors; callers treat `None` as "could not confirm" and fall back
+/// to their prior behavior. `GIT_TERMINAL_PROMPT=0` keeps a credential-less
+/// remote from blocking on an interactive prompt, exactly as the push path does.
+pub fn remote_branch_sha(repo: &Path, remote: &str, branch: &str) -> Option<String> {
+    let output = git_cmd(repo)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["ls-remote", remote, &format!("refs/heads/{branch}")])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let sha = stdout.split_whitespace().next()?;
+    (!sha.is_empty()).then(|| sha.to_string())
+}
+
 /// Tri-state summary of the local repository's readiness for a workflow run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitSyncStatus {
