@@ -7,6 +7,7 @@ use fabro_slack::config::{
     resolve_credentials_status_with_lookup as resolve_slack_credentials_status_with_lookup,
 };
 use fabro_static::EnvVars;
+use fabro_types::capabilities::advertised_capabilities;
 use fabro_types::settings::InterpString;
 use fabro_types::settings::server::GithubIntegrationSettings;
 
@@ -94,7 +95,7 @@ async fn get_system_info(_auth: RequiredUser, State(state): State<Arc<AppState>>
             scheduler_slots_used: Some(to_i64(scheduler_slots_used)),
         }),
         sandbox_provider: Some(system_sandbox_provider(&manifest_run_settings)),
-        capabilities:     fabro_types::capabilities::advertised_capabilities(),
+        capabilities:     advertised_capabilities(),
     };
     (StatusCode::OK, Json(response)).into_response()
 }

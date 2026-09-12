@@ -25,6 +25,10 @@ fn expect_err(result: Result<CodergenResult, Error>) -> Error {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "synchronous git init in a synchronous test fixture helper"
+)]
 fn init_git(dir: &std::path::Path) {
     let output = std::process::Command::new("git")
         .args(["init", "-q"])
@@ -72,7 +76,7 @@ impl Harness {
         parts.join(" ")
     }
 
-    fn node(&self, primary: &str, chain: Option<serde_json::Value>) -> Node {
+    fn node(primary: &str, chain: Option<serde_json::Value>) -> Node {
         let mut node = Node::new("work");
         node.attrs
             .insert("backend".to_string(), AttrValue::String("acp".to_string()));
@@ -146,7 +150,7 @@ fn model_unsupported_signature() -> serde_json::Value {
     })
 }
 
-fn chain(candidates: Vec<serde_json::Value>) -> serde_json::Value {
+fn chain(candidates: &[serde_json::Value]) -> serde_json::Value {
     serde_json::json!({
         "schema_version": 1,
         "primary_generation": "p".repeat(32),
@@ -159,7 +163,7 @@ fn candidate(
     index: u32,
     key: &str,
     command: &str,
-    signatures: Vec<serde_json::Value>,
+    signatures: &[serde_json::Value],
 ) -> serde_json::Value {
     serde_json::json!({
         "candidate_index": index,
@@ -179,11 +183,11 @@ async fn eligible_primary_failure_advances_to_the_next_candidate_in_one_visit() 
     let h = Harness::new().await;
     let primary = h.command("diagnostic_exit", &[("ACP_EXIT_DIAGNOSTIC", REFUSAL)]);
     let fallback = h.command("write_file", &[]);
-    let node = h.node(
+    let node = Harness::node(
         &primary,
-        Some(chain(vec![
-            candidate(0, "codex", &primary, vec![model_unsupported_signature()]),
-            candidate(1, "anthropic", &fallback, vec![]),
+        Some(chain(&[
+            candidate(0, "codex", &primary, &[model_unsupported_signature()]),
+            candidate(1, "anthropic", &fallback, &[]),
         ])),
     );
     let result = h.run(&node).await.unwrap();
@@ -235,11 +239,11 @@ async fn non_eligible_primary_failure_terminates_with_its_own_identity_and_stays
         "HTTP 400 Bad Request",
     )]);
     let fallback = h.command("write_file", &[]);
-    let node = h.node(
+    let node = Harness::node(
         &primary,
-        Some(chain(vec![
-            candidate(0, "codex", &primary, vec![model_unsupported_signature()]),
-            candidate(1, "anthropic", &fallback, vec![]),
+        Some(chain(&[
+            candidate(0, "codex", &primary, &[model_unsupported_signature()]),
+            candidate(1, "anthropic", &fallback, &[]),
         ])),
     );
     let err = expect_err(h.run(&node).await);
@@ -261,11 +265,11 @@ async fn failure_after_a_transition_is_non_retryable_and_exhaustion_keeps_the_fi
     let h = Harness::new().await;
     let primary = h.command("diagnostic_exit", &[("ACP_EXIT_DIAGNOSTIC", REFUSAL)]);
     let second = h.command("diagnostic_exit", &[("ACP_EXIT_DIAGNOSTIC", REFUSAL)]);
-    let node = h.node(
+    let node = Harness::node(
         &primary,
-        Some(chain(vec![
-            candidate(0, "codex", &primary, vec![model_unsupported_signature()]),
-            candidate(1, "codex-b", &second, vec![model_unsupported_signature()]),
+        Some(chain(&[
+            candidate(0, "codex", &primary, &[model_unsupported_signature()]),
+            candidate(1, "codex-b", &second, &[model_unsupported_signature()]),
         ])),
     );
     let err = expect_err(h.run(&node).await);
@@ -305,11 +309,11 @@ async fn a_chain_with_every_candidate_preflight_skipped_terminates_the_run_befor
         "ACP_EXIT_DIAGNOSTIC",
         "must not run",
     )]);
-    let mut zero = candidate(0, "codex", &primary, vec![]);
+    let mut zero = candidate(0, "codex", &primary, &[]);
     zero["preflight_skipped"] = serde_json::json!({
         "cause": "quota", "scope": "availability-domain", "hold_key": "codex"
     });
-    let node = h.node(&primary, Some(chain(vec![zero])));
+    let node = Harness::node(&primary, Some(chain(&[zero])));
     let err = expect_err(h.run(&node).await);
     assert!(matches!(err, Error::TerminateRun { .. }), "{err:?}");
     assert_eq!(
@@ -333,11 +337,11 @@ async fn external_tool_before_an_eligible_failure_fails_closed_without_fallback(
         ("ACP_TOOL_KIND", "execute"),
     ]);
     let fallback = h.command("write_file", &[]);
-    let node = h.node(
+    let node = Harness::node(
         &primary,
-        Some(chain(vec![
-            candidate(0, "codex", &primary, vec![model_unsupported_signature()]),
-            candidate(1, "anthropic", &fallback, vec![]),
+        Some(chain(&[
+            candidate(0, "codex", &primary, &[model_unsupported_signature()]),
+            candidate(1, "anthropic", &fallback, &[]),
         ])),
     );
     let err = expect_err(h.run(&node).await);
@@ -374,16 +378,16 @@ async fn sandbox_local_tool_before_an_eligible_failure_hands_over_with_a_recover
         "ACP_PROMPT_RECORD",
         &record.to_string_lossy(),
     )]);
-    let node = h.node(
+    let node = Harness::node(
         &primary,
-        Some(chain(vec![
-            candidate(0, "codex", &primary, vec![model_unsupported_signature()]),
-            candidate(1, "anthropic", &fallback, vec![]),
+        Some(chain(&[
+            candidate(0, "codex", &primary, &[model_unsupported_signature()]),
+            candidate(1, "anthropic", &fallback, &[]),
         ])),
     );
     h.run(&node).await.unwrap();
     assert_eq!(h.failovers().len(), 1);
-    let recorded = std::fs::read_to_string(&record).unwrap();
+    let recorded = tokio::fs::read_to_string(&record).await.unwrap();
     assert!(
         recorded.contains("FABRO_ACP_FALLBACK_RECOVERY"),
         "successor must receive the delimited recovery preamble: {recorded}"
@@ -402,16 +406,13 @@ async fn preflight_skipped_primary_emits_one_preflight_transition_and_never_runs
         "must not run",
     )]);
     let fallback = h.command("write_file", &[]);
-    let mut zero = candidate(0, "codex", &primary, vec![]);
+    let mut zero = candidate(0, "codex", &primary, &[]);
     zero["preflight_skipped"] = serde_json::json!({
         "cause": "quota", "scope": "availability-domain", "hold_key": "codex"
     });
-    let node = h.node(
+    let node = Harness::node(
         &primary,
-        Some(chain(vec![
-            zero,
-            candidate(1, "anthropic", &fallback, vec![]),
-        ])),
+        Some(chain(&[zero, candidate(1, "anthropic", &fallback, &[])])),
     );
     h.run(&node).await.unwrap();
     assert_eq!(h.started_indexes(), vec![Some(1)]);
@@ -427,9 +428,9 @@ async fn preflight_skipped_primary_emits_one_preflight_transition_and_never_runs
 async fn malformed_chain_refuses_before_any_adapter_starts() {
     let h = Harness::new().await;
     let primary = h.command("write_file", &[]);
-    let node = h.node(
+    let node = Harness::node(
         &primary,
-        Some(chain(vec![candidate(0, "codex", "something-else", vec![])])),
+        Some(chain(&[candidate(0, "codex", "something-else", &[])])),
     );
     let err = expect_err(h.run(&node).await);
     assert!(matches!(err, Error::Validation(_)), "{err:?}");
@@ -443,7 +444,7 @@ async fn malformed_chain_refuses_before_any_adapter_starts() {
 async fn legacy_node_without_a_chain_carries_no_candidate_fields() {
     let h = Harness::new().await;
     let primary = h.command("write_file", &[]);
-    let node = h.node(&primary, None);
+    let node = Harness::node(&primary, None);
     let CodergenResult::Text { text, .. } = h.run(&node).await.unwrap() else {
         panic!("expected text result");
     };

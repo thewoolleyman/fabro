@@ -1844,7 +1844,7 @@ mod tests {
         json!({
             "schema_version": schema_version,
             "event_id": "evt-1",
-            "occurred_at_ms": 1789000000000_u64,
+            "occurred_at_ms": 1_789_000_000_000_u64,
             "visit": 1,
             "engine_attempt": 1,
             "transition": "reactive",
