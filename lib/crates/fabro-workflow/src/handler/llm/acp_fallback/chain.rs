@@ -444,6 +444,12 @@ fn validate_signature(signature: &AvailabilitySignature) -> Result<(), String> {
     }
 }
 
+/// One signature's static matcher identity: source, discriminator, literals
+/// and exit-code refinement.
+type SignatureMatcher = (SignatureSource, String, Vec<String>, Option<i64>);
+/// One signature's disposition: cause, scope and resolved hold key.
+type SignatureDisposition = (SignatureCause, SignatureScope, String);
+
 /// Refuse two STATICALLY identical matchers that disagree on disposition.
 /// Identical matcher and identical disposition is merely redundant and
 /// passes; a disposition difference can only ever produce the runtime
@@ -452,10 +458,7 @@ fn conflicting_signature_refusal(
     index: u32,
     signatures: &[AvailabilitySignature],
 ) -> Result<(), ChainError> {
-    let mut seen: Vec<(
-        (SignatureSource, String, Vec<String>, Option<i64>),
-        (SignatureCause, SignatureScope, String),
-    )> = Vec::new();
+    let mut seen: Vec<(SignatureMatcher, SignatureDisposition)> = Vec::new();
     let mut distinct: HashSet<String> = HashSet::new();
     for signature in signatures {
         let matcher = signature.matcher();
@@ -484,7 +487,7 @@ mod tests {
     const PRIMARY: &str =
         "ANTHROPIC_MODEL=claude-opus-5 npx -y @agentclientprotocol/claude-agent-acp";
 
-    fn chain_json(candidates: serde_json::Value) -> String {
+    fn chain_json(candidates: &serde_json::Value) -> String {
         serde_json::json!({
             "schema_version": 1,
             "primary_generation": "a".repeat(32),
@@ -506,7 +509,7 @@ mod tests {
 
     #[test]
     fn parses_a_two_candidate_chain_and_preserves_order() {
-        let raw = chain_json(serde_json::json!([
+        let raw = chain_json(&serde_json::json!([
             candidate(0, PRIMARY, "primary"),
             candidate(1, "OTHER=1 codex-acp", "fallback"),
         ]));
@@ -519,7 +522,7 @@ mod tests {
 
     #[test]
     fn refuses_primary_that_does_not_match_acp_command() {
-        let raw = chain_json(serde_json::json!([candidate(
+        let raw = chain_json(&serde_json::json!([candidate(
             0,
             "something-else",
             "primary"
@@ -532,7 +535,7 @@ mod tests {
 
     #[test]
     fn refuses_absent_command_and_present_config() {
-        let raw = chain_json(serde_json::json!([candidate(0, PRIMARY, "primary")]));
+        let raw = chain_json(&serde_json::json!([candidate(0, PRIMARY, "primary")]));
         assert_eq!(
             parse_chain(&raw, None, None),
             Err(ChainError::CommandAbsent)
@@ -546,7 +549,7 @@ mod tests {
     #[test]
     fn refuses_unknown_keys_and_wrong_schema_version() {
         let mut value: serde_json::Value =
-            serde_json::from_str(&chain_json(serde_json::json!([candidate(
+            serde_json::from_str(&chain_json(&serde_json::json!([candidate(
                 0, PRIMARY, "primary"
             )])))
             .unwrap();
@@ -555,7 +558,7 @@ mod tests {
         assert!(matches!(err, ChainError::Malformed(ref m) if m.contains("surprise")));
 
         let mut value: serde_json::Value =
-            serde_json::from_str(&chain_json(serde_json::json!([candidate(
+            serde_json::from_str(&chain_json(&serde_json::json!([candidate(
                 0, PRIMARY, "primary"
             )])))
             .unwrap();
@@ -568,7 +571,7 @@ mod tests {
 
     #[test]
     fn refuses_non_contiguous_indexes_and_duplicate_pairs() {
-        let raw = chain_json(serde_json::json!([
+        let raw = chain_json(&serde_json::json!([
             candidate(0, PRIMARY, "primary"),
             candidate(2, "x", "fallback"),
         ]));
@@ -579,7 +582,7 @@ mod tests {
                 found:    2,
             })
         );
-        let raw = chain_json(serde_json::json!([
+        let raw = chain_json(&serde_json::json!([
             candidate(0, PRIMARY, "same"),
             candidate(1, "x", "same"),
         ]));
@@ -593,7 +596,7 @@ mod tests {
     fn refuses_empty_identity_fields() {
         let mut c = candidate(0, PRIMARY, "primary");
         c["display_name"] = serde_json::json!("   ");
-        let raw = chain_json(serde_json::json!([c]));
+        let raw = chain_json(&serde_json::json!([c]));
         assert_eq!(
             parse_chain(&raw, Some(PRIMARY), None),
             Err(ChainError::EmptyField {
@@ -606,7 +609,7 @@ mod tests {
     fn with_signatures(signatures: serde_json::Value) -> String {
         let mut c = candidate(0, PRIMARY, "primary");
         c["availability_signatures"] = signatures;
-        chain_json(serde_json::json!([c]))
+        chain_json(&serde_json::json!([c]))
     }
 
     #[test]
@@ -684,7 +687,7 @@ mod tests {
         c1["preflight_skipped"] = serde_json::json!({
             "cause": "quota", "scope": "availability-domain", "hold_key": "codex"
         });
-        let mut value: serde_json::Value = serde_json::from_str(&chain_json(serde_json::json!([
+        let mut value: serde_json::Value = serde_json::from_str(&chain_json(&serde_json::json!([
             candidate(0, PRIMARY, "primary"),
             c1
         ])))

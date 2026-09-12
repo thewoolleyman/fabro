@@ -43,6 +43,7 @@ use super::acp_fallback::visit::{CandidateTerminal, LedgerEntry, VisitState};
 use super::activation_lease::{ActivationLease, ActivationLeaseOptions};
 use super::changed_files;
 use crate::context::Context;
+use crate::context::keys::acp_attempt_key;
 use crate::error::Error;
 use crate::event::{Emitter, Event, RunEventLogger, RunNoticeCode, RunNoticeLevel, StageScope};
 use crate::handler::NodeTimeoutPolicy;
@@ -457,13 +458,13 @@ impl AgentAcpBackend {
 
             let ledger: Arc<Mutex<Vec<LedgerEntry>>> = Arc::new(Mutex::new(Vec::new()));
             let activity = Arc::new(AtomicBool::new(false));
-            let on_permission_observed = self.ledger_permission_observer(
+            let on_permission_observed = Self::ledger_permission_observer(
                 shared,
                 index,
                 Arc::clone(&ledger),
                 durable.clone(),
             );
-            let on_tool_started = self.ledger_tool_started(shared, index, Arc::clone(&ledger));
+            let on_tool_started = Self::ledger_tool_started(shared, index, Arc::clone(&ledger));
 
             state.mark_launched(index);
             {
@@ -650,8 +651,8 @@ impl AgentAcpBackend {
     ) -> Error {
         let node = shared.node;
         let visit = shared.stage_scope.visit;
-        let (kind, last_candidate, cause, duration_ms) = match &last {
-            Some(last) => (
+        let (kind, last_candidate, cause, duration_ms) = if let Some(last) = &last {
+            (
                 TransitionKind::Reactive,
                 chain
                     .candidate(last.index)
@@ -661,32 +662,31 @@ impl AgentAcpBackend {
                     .candidates
                     .get(&last.index)
                     .map_or(0, |record| record.duration_ms),
-            ),
-            None => {
-                let skip = chain
-                    .candidates
-                    .iter()
-                    .find_map(|candidate| candidate.preflight_skipped.as_ref());
-                (
-                    TransitionKind::Preflight,
-                    chain.primary(),
-                    skip.map_or_else(
-                        || TransitionCause {
-                            cause:    "no_candidate".to_string(),
-                            scope:    SignatureScope::Candidate.to_string(),
-                            hold_key: chain.primary().availability_key.clone(),
-                            source:   "preflight".to_string(),
-                        },
-                        |skip| TransitionCause {
-                            cause:    skip.cause.to_string(),
-                            scope:    skip.scope.to_string(),
-                            hold_key: skip.hold_key.clone(),
-                            source:   "preflight".to_string(),
-                        },
-                    ),
-                    0,
-                )
-            }
+            )
+        } else {
+            let skip = chain
+                .candidates
+                .iter()
+                .find_map(|candidate| candidate.preflight_skipped.as_ref());
+            (
+                TransitionKind::Preflight,
+                chain.primary(),
+                skip.map_or_else(
+                    || TransitionCause {
+                        cause:    "no_candidate".to_string(),
+                        scope:    SignatureScope::Candidate.to_string(),
+                        hold_key: chain.primary().availability_key.clone(),
+                        source:   "preflight".to_string(),
+                    },
+                    |skip| TransitionCause {
+                        cause:    skip.cause.to_string(),
+                        scope:    skip.scope.to_string(),
+                        hold_key: skip.hold_key.clone(),
+                        source:   "preflight".to_string(),
+                    },
+                ),
+                0,
+            )
         };
         let record = TransitionRecord {
             kind,
@@ -716,7 +716,6 @@ impl AgentAcpBackend {
     /// `agent.acp.side_effect` entry per permission request and awaits the
     /// flush barrier BEFORE the permission is answered.
     fn ledger_permission_observer(
-        &self,
         shared: &TurnShared<'_>,
         index: u32,
         ledger: Arc<Mutex<Vec<LedgerEntry>>>,
@@ -762,7 +761,6 @@ impl AgentAcpBackend {
     /// entry is recorded (and emitted) so the gate sees it, but it cannot be
     /// awaited durably before the tool runs.
     fn ledger_tool_started(
-        &self,
         shared: &TurnShared<'_>,
         index: u32,
         ledger: Arc<Mutex<Vec<LedgerEntry>>>,
@@ -1698,7 +1696,7 @@ async fn flush_durable(logger: Option<&RunEventLogger>) {
 /// the lifecycle records on the context after each attempt.
 pub(crate) fn engine_attempt_from_context(context: &Context, node_id: &str) -> u32 {
     context
-        .get(&crate::context::keys::acp_attempt_key(node_id))
+        .get(&acp_attempt_key(node_id))
         .and_then(|value| value.as_u64())
         .and_then(|count| u32::try_from(count).ok())
         .map_or(1, |count| count.saturating_add(1))
@@ -1841,8 +1839,8 @@ fn exhaustion_error(
     state: &VisitState,
     last: Option<&LastFailure>,
 ) -> Error {
-    match last {
-        Some(last) => Error::handler_non_retryable(
+    if let Some(last) = last {
+        Error::handler_non_retryable(
             format!(
                 "ACP fallback chain exhausted for node {}: {} candidate(s) attempted [{}]; final typed cause {} ({}) from {}: {}",
                 state_node_label(chain, state),
@@ -1856,32 +1854,31 @@ fn exhaustion_error(
             exhaustion_category(last.failure.cause),
             last.error.exec_output_tail(),
             Some(anyhow::anyhow!("{}", last.error)),
-        ),
-        None => {
-            // Nothing was ever launchable: every candidate was preflight
-            // skipped. A reached conditional node terminates the RUN, typed,
-            // before any adapter, with the availability cause the skip
-            // recorded; it never traverses a continuation or failure edge.
-            let skip = chain
-                .candidates
-                .iter()
-                .find_map(|candidate| candidate.preflight_skipped.as_ref());
-            let (cause_text, category) = skip.map_or(
-                ("no candidate".to_string(), FailureCategory::Deterministic),
-                |skip| {
-                    (
-                        format!("{} ({})", skip.cause, skip.scope),
-                        exhaustion_category(skip.cause),
-                    )
-                },
-            );
-            Error::TerminateRun {
-                message:       format!(
-                    "ACP fallback chain for node {} has no launchable candidate: every candidate was skipped by preflight; typed availability cause {cause_text}",
-                    state_node_label(chain, state)
-                ),
-                failure_class: category,
-            }
+        )
+    } else {
+        // Nothing was ever launchable: every candidate was preflight
+        // skipped. A reached conditional node terminates the RUN, typed,
+        // before any adapter, with the availability cause the skip
+        // recorded; it never traverses a continuation or failure edge.
+        let skip = chain
+            .candidates
+            .iter()
+            .find_map(|candidate| candidate.preflight_skipped.as_ref());
+        let (cause_text, category) = skip.map_or(
+            ("no candidate".to_string(), FailureCategory::Deterministic),
+            |skip| {
+                (
+                    format!("{} ({})", skip.cause, skip.scope),
+                    exhaustion_category(skip.cause),
+                )
+            },
+        );
+        Error::TerminateRun {
+            message:       format!(
+                "ACP fallback chain for node {} has no launchable candidate: every candidate was skipped by preflight; typed availability cause {cause_text}",
+                state_node_label(chain, state)
+            ),
+            failure_class: category,
         }
     }
 }
