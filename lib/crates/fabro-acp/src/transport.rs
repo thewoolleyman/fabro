@@ -24,6 +24,7 @@ use crate::command::AcpProcessSpec;
 use crate::error::AcpProcessExit;
 
 const CLEAN_EXIT_PROTOCOL_GRACE: Duration = Duration::from_millis(500);
+const PROCESS_TERMINATION_DEADLINE: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub(crate) struct TransportState {
@@ -71,6 +72,11 @@ impl TransportState {
     pub(crate) async fn terminate(&self) -> SandboxResult<()> {
         if let Some(handle) = self.handle.lock().await.as_ref().cloned() {
             handle.terminate().await?;
+            timeout(PROCESS_TERMINATION_DEADLINE, handle.wait())
+                .await
+                .map_err(|_| {
+                    SandboxError::message("ACP process did not exit before the cleanup deadline")
+                })??;
         }
         Ok(())
     }

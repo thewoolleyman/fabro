@@ -37,6 +37,18 @@ pub enum AcpError {
     #[error("ACP turn was cancelled")]
     Cancelled,
 
+    #[error(
+        "ACP tool call {tool_call_id} ({title}) continued in background as task {task_id}; Fabro terminated the turn before the agent could start conflicting work"
+    )]
+    BackgroundedTool {
+        tool_call_id: String,
+        title:        String,
+        task_id:      String,
+    },
+
+    #[error("ACP process cleanup failed")]
+    Cleanup(#[source] fabro_sandbox::Error),
+
     #[error("ACP turn timed out")]
     TimedOut {
         exec_output_tail: Option<ExecOutputTail>,

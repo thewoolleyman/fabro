@@ -389,8 +389,7 @@ async fn permission_resolver_does_not_block_the_dispatch_loop() {
 
     let interleaved_seen = Arc::new(Notify::new());
     let seen_for_activity = interleaved_seen.clone();
-    let on_activity: Arc<dyn Fn() + Send + Sync> =
-        Arc::new(move || seen_for_activity.notify_one());
+    let on_activity: Arc<dyn Fn() + Send + Sync> = Arc::new(move || seen_for_activity.notify_one());
 
     let seen_for_resolver = interleaved_seen.clone();
     let on_permission_request: fabro_acp::AcpPermissionResolver = Arc::new(move |_question| {
@@ -441,21 +440,26 @@ async fn permission_resolver_does_not_block_the_dispatch_loop() {
         "interleaved update was not processed while the permission was parked: {}",
         result.text
     );
-    assert!(result.text.contains("hello from acp"), "text: {}", result.text);
+    assert!(
+        result.text.contains("hello from acp"),
+        "text: {}",
+        result.text
+    );
     let permission = read_to_string(permission_path)
         .await
         .expect("read permission record");
     assert!(permission.contains(r#""outcome":"selected""#));
 }
 
-/// Two permission requests must be able to be IN FLIGHT AT ONCE -- only possible
-/// because the handler is non-blocking. A two-party barrier proves it: each
-/// resolver blocks until BOTH have been entered before returning, so the run can
-/// only progress if the dispatch loop spawned the second handler while the first
-/// was parked. (If the handler blocked inline, only one resolver would ever run,
-/// the barrier would never release, and the turn would time out and fail here.)
-/// Then, with both timing out, the per-request slot must record a bounded, single
-/// `PermissionTimedOut` -- never lose it, never report a wrong terminal error.
+/// Two permission requests must be able to be IN FLIGHT AT ONCE -- only
+/// possible because the handler is non-blocking. A two-party barrier proves it:
+/// each resolver blocks until BOTH have been entered before returning, so the
+/// run can only progress if the dispatch loop spawned the second handler while
+/// the first was parked. (If the handler blocked inline, only one resolver
+/// would ever run, the barrier would never release, and the turn would time out
+/// and fail here.) Then, with both timing out, the per-request slot must record
+/// a bounded, single `PermissionTimedOut` -- never lose it, never report a
+/// wrong terminal error.
 #[tokio::test]
 async fn concurrent_permission_timeouts_report_one_bounded_permission_timed_out() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
@@ -933,6 +937,47 @@ async fn tool_events_from_a_live_session_reach_the_callback() {
     assert!(
         failed_b,
         "tool-b arrives already failed and must report a failed Completed event: {observed:?}"
+    );
+}
+
+#[tokio::test]
+async fn backgrounded_bash_result_fails_the_turn_after_terminating_the_agent() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let termination_record = tempdir.path().join("terminated.txt");
+
+    let error = run_fake_agent(
+        tempdir.path(),
+        HashMap::from([
+            ("ACP_MODE".to_string(), "backgrounded_tool".to_string()),
+            (
+                "ACP_LINGER_TERMINATED".to_string(),
+                termination_record.to_string_lossy().into_owned(),
+            ),
+        ]),
+        Some(ACP_TEST_TIMEOUT_MS),
+        CancellationToken::new(),
+    )
+    .await
+    .expect_err("a backgrounded Bash task has no truthful terminal ACP lifecycle");
+
+    assert!(
+        matches!(
+            error,
+            AcpError::BackgroundedTool {
+                ref tool_call_id,
+                ref title,
+                ref task_id,
+            } if tool_call_id == "tool-backgrounded"
+                && title == "Bash: git commit"
+                && task_id == "task-123"
+        ),
+        "{error:?}"
+    );
+    assert_eq!(
+        read_to_string(termination_record)
+            .await
+            .expect("agent should record SIGTERM before the turn returns"),
+        "terminated\n"
     );
 }
 

@@ -197,6 +197,38 @@ for line in sys.stdin:
                     }
                 }
             })
+        if mode == "backgrounded_tool":
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tool-backgrounded",
+                        "title": "Bash: git commit",
+                        "kind": "execute",
+                        "status": "in_progress"
+                    }
+                }
+            })
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "tool-backgrounded",
+                        "status": "completed",
+                        "rawOutput": (
+                            "Command running in background with ID: task-123. "
+                            "Output is being written to: /tmp/task-123.output."
+                        )
+                    }
+                }
+            })
+            time.sleep(60)
         if mode == "permission":
             send({
                 "jsonrpc": "2.0",
