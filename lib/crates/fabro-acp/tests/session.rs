@@ -44,6 +44,7 @@ async fn stdio_spawn_failure_returns_sandbox_error() {
     let result = run_acp_turn(AcpRunRequest {
         on_tool_event: None,
         on_permission_request: None,
+        on_permission_observed: None,
         command,
         prompt: "hello".to_string(),
         cwd: "/workspace".to_string(),
@@ -80,6 +81,7 @@ async fn clean_stdio_exit_after_final_response_completes_turn() {
     let result = run_acp_turn(AcpRunRequest {
         on_tool_event: None,
         on_permission_request: None,
+        on_permission_observed: None,
         command,
         prompt: "hello".to_string(),
         cwd: "/workspace".to_string(),
@@ -113,6 +115,7 @@ async fn session_lifecycle_initializes_sends_prompt_and_aggregates_text() {
     let result = run_acp_turn(AcpRunRequest {
         on_tool_event: None,
         on_permission_request: None,
+        on_permission_observed: None,
         command,
         prompt: "hello".to_string(),
         cwd: tempdir.path().to_string_lossy().into_owned(),
@@ -160,6 +163,7 @@ async fn steering_sends_followup_session_prompt_over_acp() {
     let result = run_acp_turn(AcpRunRequest {
         on_tool_event: None,
         on_permission_request: None,
+        on_permission_observed: None,
         command,
         prompt: "hello".to_string(),
         cwd: tempdir.path().to_string_lossy().into_owned(),
@@ -225,6 +229,7 @@ async fn interrupt_then_steer_sends_cancel_then_followup_session_prompt_over_acp
     let result = run_acp_turn(AcpRunRequest {
         on_tool_event: None,
         on_permission_request: None,
+        on_permission_observed: None,
         command,
         prompt: "hello".to_string(),
         cwd: tempdir.path().to_string_lossy().into_owned(),
@@ -302,6 +307,7 @@ async fn inline_interrupt_terminates_agent_that_ignores_cancel() {
     let err = run_acp_turn(AcpRunRequest {
         on_tool_event: None,
         on_permission_request: None,
+        on_permission_observed: None,
         command,
         prompt: "hello".to_string(),
         cwd: tempdir.path().to_string_lossy().into_owned(),
@@ -413,6 +419,7 @@ async fn permission_resolver_does_not_block_the_dispatch_loop() {
     let result = run_acp_turn(AcpRunRequest {
         on_tool_event: None,
         on_permission_request: Some(on_permission_request),
+        on_permission_observed: None,
         command,
         prompt: "hello".to_string(),
         cwd: tempdir.path().to_string_lossy().into_owned(),
@@ -486,6 +493,7 @@ async fn concurrent_permission_timeouts_report_one_bounded_permission_timed_out(
     let result = run_acp_turn(AcpRunRequest {
         on_tool_event: None,
         on_permission_request: Some(on_permission_request),
+        on_permission_observed: None,
         command,
         prompt: "hello".to_string(),
         cwd: tempdir.path().to_string_lossy().into_owned(),
@@ -828,6 +836,7 @@ async fn run_fake_agent_with_activity(
     run_acp_turn(AcpRunRequest {
         on_tool_event: None,
         on_permission_request: None,
+        on_permission_observed: None,
         command,
         prompt: "hello".to_string(),
         cwd: tempdir.to_string_lossy().into_owned(),
@@ -868,6 +877,7 @@ async fn run_fake_agent_with_callbacks(
     run_acp_turn(AcpRunRequest {
         on_tool_event,
         on_permission_request,
+        on_permission_observed: None,
         command,
         prompt: "hello".to_string(),
         cwd: tempdir.to_string_lossy().into_owned(),

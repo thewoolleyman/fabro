@@ -1234,11 +1234,15 @@ fn event_body_from_event(event: &Event) -> EventBody {
             visit,
             command,
             config_name,
+            candidate_index,
+            chain_deadline_epoch_ms,
             ..
         } => EventBody::AgentAcpStarted(fabro_types::AgentAcpStartedProps {
-            visit:       *visit,
-            command:     command.clone(),
+            visit: *visit,
+            command: command.clone(),
             config_name: config_name.clone(),
+            candidate_index: *candidate_index,
+            chain_deadline_epoch_ms: *chain_deadline_epoch_ms,
         }),
         Event::AgentAcpCompleted {
             stdout,
@@ -1278,6 +1282,9 @@ fn event_body_from_event(event: &Event) -> EventBody {
             update_count:     *update_count,
             last_activity_ms: *last_activity_ms,
         }),
+        Event::AgentAcpFailover { props, .. } => EventBody::AgentAcpFailover(props.clone()),
+        Event::AgentAcpSideEffect { props, .. } => EventBody::AgentAcpSideEffect(props.clone()),
+        Event::AgentAcpExhausted { props, .. } => EventBody::AgentAcpExhausted(props.clone()),
         Event::PullRequestCreated {
             pr_url,
             pr_number,
@@ -2233,10 +2240,12 @@ mod tests {
         let started = to_run_event_at(
             &fixtures::RUN_1,
             &Event::AgentAcpStarted {
-                node_id:     "code".to_string(),
-                visit:       2,
-                command:     "python fake_agent.py".to_string(),
-                config_name: Some("fake".to_string()),
+                node_id:                 "code".to_string(),
+                visit:                   2,
+                command:                 "python fake_agent.py".to_string(),
+                config_name:             Some("fake".to_string()),
+                candidate_index:         None,
+                chain_deadline_epoch_ms: None,
             },
             Utc::now(),
             Some(&scope),

@@ -13682,6 +13682,16 @@ components:
         sandbox_provider:
           type: string
           description: Effective sandbox provider for launched runs.
+        capabilities:
+          type: array
+          items:
+            type: string
+          description: >-
+            Engine capabilities this server advertises, so a client can refuse
+            to send grammar an older server would silently ignore. Additive:
+            absent on servers that predate the field. Known values:
+            `acp.fallback_chain.v1` (ordered ACP candidate failover within one
+            node visit).
 
     SystemRunCounts:
       description: Counts of known runs in the active server process.

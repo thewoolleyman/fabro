@@ -14,7 +14,7 @@ use fabro_model::{Catalog, ProviderId};
 use fabro_types::{ManifestPath, RunId};
 use tokio_util::sync::CancellationToken;
 
-use crate::event::Emitter;
+use crate::event::{Emitter, RunEventLogger};
 use crate::github_token_source::GitHubTokenSource;
 use crate::handler::HandlerRegistry;
 use crate::interview_runtime::RunInterviewBlocker;
@@ -226,25 +226,29 @@ impl RunServices {
 
 /// Services available only while executing workflow nodes.
 pub struct EngineServices {
-    pub run:              Arc<RunServices>,
-    pub registry:         Arc<HandlerRegistry>,
-    pub interviewer:      Arc<dyn Interviewer>,
+    pub run:                    Arc<RunServices>,
+    pub registry:               Arc<HandlerRegistry>,
+    pub interviewer:            Arc<dyn Interviewer>,
     /// Git state for the current run. Set via `set_git_state` at the start of
     /// `execute` and read by parallel/fan-in handlers.
-    pub(crate) git_state: std::sync::RwLock<Option<Arc<GitState>>>,
+    pub(crate) git_state:       std::sync::RwLock<Option<Arc<GitState>>>,
+    /// The store-backed run event logger, whose flush is the durability
+    /// barrier the ACP fallback chain awaits. Set by the run operation after
+    /// initialization; absent for runs and tests wired without one.
+    pub(crate) progress_logger: std::sync::RwLock<Option<RunEventLogger>>,
     /// Environment variables from `[sandbox.env]` config.
-    pub base_env:         HashMap<String, String>,
+    pub base_env:               HashMap<String, String>,
     /// GitHub token source used to inject `GITHUB_TOKEN` at the point of use.
-    pub github_token:     Option<Arc<GitHubTokenSource>>,
+    pub github_token:           Option<Arc<GitHubTokenSource>>,
     /// Typed values from `[run.inputs]`, available to prompt templates.
-    pub inputs:           HashMap<String, toml::Value>,
+    pub inputs:                 HashMap<String, toml::Value>,
     /// When true, handlers should skip real execution and return simulated
     /// results.
-    pub dry_run:          bool,
+    pub dry_run:                bool,
     /// Manifest path of the current workflow when running from a bundle.
-    pub workflow_path:    Option<ManifestPath>,
+    pub workflow_path:          Option<ManifestPath>,
     /// Bundled workflows available for child-workflow resolution.
-    pub workflow_bundle:  Option<Arc<WorkflowBundle>>,
+    pub workflow_bundle:        Option<Arc<WorkflowBundle>>,
 }
 
 impl EngineServices {
@@ -258,6 +262,23 @@ impl EngineServices {
             .read()
             .expect("git_state lock is never poisoned: no code panics while holding this lock")
             .clone()
+    }
+
+    /// The run's store-backed event logger, when one was attached.
+    pub fn progress_logger(&self) -> Option<RunEventLogger> {
+        self.progress_logger
+            .read()
+            .expect(
+                "progress_logger lock is never poisoned: no code panics while holding this lock",
+            )
+            .clone()
+    }
+
+    /// Attach the run's store-backed event logger.
+    pub fn set_progress_logger(&self, logger: Option<RunEventLogger>) {
+        *self.progress_logger.write().expect(
+            "progress_logger lock is never poisoned: no code panics while holding this lock",
+        ) = logger;
     }
 
     /// Set the git state for the current run.
@@ -344,6 +365,7 @@ impl EngineServices {
             registry:        Arc::new(HandlerRegistry::new(Box::new(start::StartHandler))),
             interviewer:     Arc::new(fabro_interview::AutoApproveInterviewer::engine()),
             git_state:       std::sync::RwLock::new(None),
+            progress_logger: std::sync::RwLock::new(None),
             base_env:        HashMap::new(),
             github_token:    None,
             inputs:          HashMap::new(),

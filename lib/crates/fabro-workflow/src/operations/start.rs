@@ -860,6 +860,9 @@ impl RunSession {
         };
         let mut initialized = Box::pin(pipeline::initialize(persisted, init_options)).await?;
         initialized.on_node = on_node;
+        initialized
+            .engine
+            .set_progress_logger(Some(store_progress_logger.clone()));
 
         let sandbox_for_cleanup = Arc::clone(&initialized.engine.run.sandbox);
         let stop_on_terminal = self.stop_on_terminal;

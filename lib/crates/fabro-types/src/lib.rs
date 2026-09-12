@@ -4,6 +4,7 @@ pub mod artifact;
 pub mod auth;
 pub mod billing;
 pub mod blob_ref;
+pub mod capabilities;
 pub mod checkpoint;
 pub mod command_output;
 pub mod conclusion;
@@ -98,11 +99,12 @@ pub use run::{
 };
 pub use run_blob_id::RunBlobId;
 pub use run_event::{
-    AgentMcpToolSummary, AgentMemoryFileProps, AgentSkillActivationSource, AgentSkillSummary,
-    AgentToolCategory, AgentToolSource, AgentToolSummary, AgentToolsAvailableProps, EventBody,
-    ExecOutputTail, InterviewOption, MetadataSnapshotFailureKind, MetadataSnapshotPhase, RunEvent,
-    RunNoticeCode, RunNoticeLevel, RunPairEndedReason, RunPairFailedReason, RunRunnableSource,
-    SessionCapability, TodoCreatedProps, TodoDeletedProps, TodoUpdatedProps,
+    AgentAcpExhaustedProps, AgentAcpFailoverProps, AgentAcpSideEffectProps, AgentMcpToolSummary,
+    AgentMemoryFileProps, AgentSkillActivationSource, AgentSkillSummary, AgentToolCategory,
+    AgentToolSource, AgentToolSummary, AgentToolsAvailableProps, EventBody, ExecOutputTail,
+    InterviewOption, MetadataSnapshotFailureKind, MetadataSnapshotPhase, RunEvent, RunNoticeCode,
+    RunNoticeLevel, RunPairEndedReason, RunPairFailedReason, RunRunnableSource, SessionCapability,
+    TodoCreatedProps, TodoDeletedProps, TodoUpdatedProps,
 };
 pub use run_failure::RunFailure;
 pub use run_id::{RunId, fixtures};

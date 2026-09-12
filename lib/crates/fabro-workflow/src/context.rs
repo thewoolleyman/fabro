@@ -51,6 +51,10 @@ pub mod keys {
     pub const THREAD_PREFIX: &str = "thread.";
     pub const RESPONSE_PREFIX: &str = "response.";
     pub const INTERNAL_RETRY_COUNT_PREFIX: &str = "internal.retry_count.";
+    /// The engine attempt the lifecycle recorded at the last attempt boundary
+    /// of a node, so a handler mid-attempt can name its own attempt number.
+    /// `0` once the node's attempts have ended.
+    pub const INTERNAL_ACP_ATTEMPT_PREFIX: &str = "internal.acp_attempt.";
 
     // --- Helper functions for dynamic keys ---
 
@@ -72,6 +76,11 @@ pub mod keys {
     #[must_use]
     pub fn retry_count_key(node_id: &str) -> String {
         format!("{INTERNAL_RETRY_COUNT_PREFIX}{node_id}")
+    }
+
+    #[must_use]
+    pub fn acp_attempt_key(node_id: &str) -> String {
+        format!("{INTERNAL_ACP_ATTEMPT_PREFIX}{node_id}")
     }
 
     /// Returns `true` for engine-internal keys that should not propagate from

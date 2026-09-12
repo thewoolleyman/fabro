@@ -236,6 +236,7 @@ async fn initialized(
                 registry:        Arc::new(registry),
                 interviewer:     Arc::new(AutoApproveInterviewer::engine()),
                 git_state:       std::sync::RwLock::new(None),
+                progress_logger: std::sync::RwLock::new(None),
                 base_env:        options.env,
                 github_token:    None,
                 inputs:          run_options.settings.run.inputs.clone(),
