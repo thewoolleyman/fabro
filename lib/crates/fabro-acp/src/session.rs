@@ -10,7 +10,7 @@ use agent_client_protocol::schema::{
     SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason, ToolCallStatus,
     ToolKind,
 };
-use agent_client_protocol::util::MatchDispatch;
+use agent_client_protocol::util::{MatchDispatch, internal_error};
 use agent_client_protocol::{ActiveSession, Agent, Client, Error as ProtocolError, SessionMessage};
 use fabro_sandbox::Sandbox;
 use fabro_types::{Principal, SteeringMessage};
@@ -175,6 +175,8 @@ fn permission_outcome_for_answer(
 }
 
 const CANCEL_GRACE_PERIOD: Duration = Duration::from_millis(500);
+const CLAUDE_BACKGROUND_TASK_PREFIX: &str = "Command running in background with ID: ";
+const CLAUDE_BACKGROUND_TASK_SUFFIX: &str = ". Output is being written to:";
 
 /// Upper bound on the agent text tail carried in [`AcpTurnProgress`].
 pub const PROGRESS_TEXT_TAIL_BYTES: usize = 4096;
@@ -280,6 +282,13 @@ struct OpenToolCall {
     started: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct BackgroundedTool {
+    tool_call_id: String,
+    title:        String,
+    task_id:      String,
+}
+
 /// Tracks the tool calls a turn has opened so a later `tool_call_update` can
 /// be reported against the title, kind and start time of the call it closes.
 #[derive(Default)]
@@ -288,6 +297,29 @@ struct ToolCallLedger {
 }
 
 impl ToolCallLedger {
+    fn backgrounded_tool(&self, update: &SessionUpdate) -> Option<BackgroundedTool> {
+        let SessionUpdate::ToolCallUpdate(update) = update else {
+            return None;
+        };
+        if update.fields.status != Some(ToolCallStatus::Completed) {
+            return None;
+        }
+        let task_id = claude_background_task_id(update.fields.raw_output.as_ref())?;
+        let tool_call_id = update.tool_call_id.to_string();
+        let mut title = self
+            .open
+            .get(&tool_call_id)
+            .map(|open| open.title.clone())
+            .or_else(|| update.fields.title.clone())
+            .unwrap_or_else(|| tool_call_id.clone());
+        trim_to_head(&mut title, TOOL_TITLE_MAX_BYTES);
+        Some(BackgroundedTool {
+            tool_call_id,
+            title,
+            task_id,
+        })
+    }
+
     /// Turn one `session/update` into the tool events it implies: a
     /// `ToolCall` opens a call (and closes it too when it already carries a
     /// terminal status); a `ToolCallUpdate` with a terminal status closes it.
@@ -389,6 +421,17 @@ impl ToolCallLedger {
             _ => Vec::new(),
         }
     }
+}
+
+fn claude_background_task_id(raw_output: Option<&serde_json::Value>) -> Option<String> {
+    let output = raw_output?.as_str()?;
+    let remainder = output.strip_prefix(CLAUDE_BACKGROUND_TASK_PREFIX)?;
+    let (task_id, _) = remainder.split_once(CLAUDE_BACKGROUND_TASK_SUFFIX)?;
+    (!task_id.is_empty()
+        && task_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+    .then(|| task_id.to_string())
 }
 
 fn elapsed_since(started: Instant, now: Instant) -> u64 {
@@ -572,6 +615,8 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
     let start = std::time::Instant::now();
     let state = TransportState::new();
     let progress = ProgressTracker::new(start);
+    let backgrounded_tool: Arc<Mutex<Option<BackgroundedTool>>> = Arc::new(Mutex::new(None));
+    let live_backgrounded_tool = Arc::clone(&backgrounded_tool);
     let live_progress = progress.clone();
     let read_cancel_token = cancel_token.clone();
     let run_cancel_token = cancel_token.clone();
@@ -681,6 +726,7 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
                         on_activity.as_ref(),
                         on_tool_event.as_ref(),
                         &live_progress,
+                        &live_backgrounded_tool,
                     )
                     .await
                 })
@@ -694,7 +740,7 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
                 if let Ok(result) = timeout(Duration::from_millis(timeout_ms), run).await {
                     Ok(result)
                 } else {
-                    state.terminate().await?;
+                    terminate_transport(&state).await?;
                     if run_cancel_token.is_cancelled() {
                         return Err(AcpError::Cancelled);
                     }
@@ -713,7 +759,7 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
             cancel_deadline_token.cancelled().await;
             sleep(Duration::from_millis(500)).await;
         } => {
-            state.terminate().await?;
+            terminate_transport(&state).await?;
             return Err(AcpError::Cancelled);
         }
     };
@@ -727,21 +773,33 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
         .expect("ACP permission timeout lock poisoned")
         .take();
     if let Some((tool_call_id, title)) = timed_out_permission {
-        state.terminate().await?;
+        terminate_transport(&state).await?;
         return Err(AcpError::PermissionTimedOut {
             tool_call_id,
             title,
+        });
+    }
+    let backgrounded_tool = backgrounded_tool
+        .lock()
+        .expect("ACP backgrounded tool lock poisoned")
+        .take();
+    if let Some(backgrounded_tool) = backgrounded_tool {
+        terminate_transport(&state).await?;
+        return Err(AcpError::BackgroundedTool {
+            tool_call_id: backgrounded_tool.tool_call_id,
+            title:        backgrounded_tool.title,
+            task_id:      backgrounded_tool.task_id,
         });
     }
     let outcome = outcome?;
     let (text, stop_reason) = match outcome {
         Ok(result) => result,
         Err(_) if run_cancel_token.is_cancelled() => {
-            state.terminate().await?;
+            terminate_transport(&state).await?;
             return Err(AcpError::Cancelled);
         }
         Err(error) => {
-            state.terminate().await?;
+            terminate_transport(&state).await?;
             if let Some(startup_error) = state.take_startup_error().await {
                 return Err(AcpError::Sandbox(startup_error));
             }
@@ -755,11 +813,11 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
     match stop_reason {
         StopReason::EndTurn | StopReason::Refusal => {}
         StopReason::Cancelled => {
-            state.terminate().await?;
+            terminate_transport(&state).await?;
             return Err(AcpError::Cancelled);
         }
         _ => {
-            state.terminate().await?;
+            terminate_transport(&state).await?;
             return Err(AcpError::StopReason {
                 stop_reason: render_stop_reason(&stop_reason),
                 text,
@@ -767,7 +825,7 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
         }
     }
 
-    state.terminate().await?;
+    terminate_transport(&state).await?;
     let stderr = state.stderr_tail().await;
     Ok(AcpRunResult {
         text,
@@ -775,6 +833,10 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
         stderr,
         duration_ms: elapsed_ms(start),
     })
+}
+
+async fn terminate_transport(state: &TransportState) -> Result<(), AcpError> {
+    state.terminate().await.map_err(AcpError::Cleanup)
 }
 
 fn map_protocol_error(error: ProtocolError) -> AcpError {
@@ -815,6 +877,7 @@ async fn read_live_session(
     on_activity: Option<&Arc<dyn Fn() + Send + Sync>>,
     on_tool_event: Option<&AcpToolEventCallback>,
     progress: &ProgressTracker,
+    backgrounded_tool: &Arc<Mutex<Option<BackgroundedTool>>>,
 ) -> Result<(String, StopReason), ProtocolError> {
     let mut text = String::new();
     let mut tools = ToolCallLedger::default();
@@ -886,6 +949,17 @@ async fn read_live_session(
                                     notification.update,
                                     SessionUpdate::ToolCall(_)
                                 ));
+                                if let Some(backgrounded) =
+                                    tools.backgrounded_tool(&notification.update)
+                                {
+                                    backgrounded_tool
+                                        .lock()
+                                        .expect("ACP backgrounded tool lock poisoned")
+                                        .get_or_insert(backgrounded);
+                                    return Err(internal_error(
+                                        "ACP adapter reported a backgrounded tool as completed",
+                                    ));
+                                }
                                 for event in tools.observe(&notification.update, Instant::now()) {
                                     if let Some(on_tool_event) = on_tool_event {
                                         on_tool_event(event);

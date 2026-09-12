@@ -957,6 +957,10 @@ fn acp_error_to_workflow(error: AcpError) -> Error {
         AcpError::StopReason { stop_reason, text } => {
             Error::handler(format!("ACP prompt stopped with {stop_reason}: {text}"))
         }
+        AcpError::Cleanup(source) => Error::Precondition(format!(
+            "ACP process cleanup failed; refusing automatic retry: {}",
+            fabro_sandbox::display_for_log(&source)
+        )),
         AcpError::Sandbox(source) => Error::handler_with_source("ACP turn failed", source),
         other => {
             let exec_output_tail = other.exec_output_tail();
@@ -2134,5 +2138,30 @@ mod tests {
             crate::outcome::FailureCategory::Deterministic
         );
         assert!(detail.message.contains("call-9") && detail.message.contains("human"));
+    }
+
+    #[test]
+    fn backgrounded_tool_retries_only_after_confirmed_cleanup() {
+        let retryable = acp_error_to_workflow(AcpError::BackgroundedTool {
+            tool_call_id: "call-10".to_string(),
+            title:        "Bash: git commit".to_string(),
+            task_id:      "task-123".to_string(),
+        });
+        assert!(retryable.is_retryable());
+        assert!(
+            retryable
+                .display_with_causes()
+                .contains("continued in background")
+        );
+
+        let cleanup_failure = acp_error_to_workflow(AcpError::Cleanup(
+            fabro_sandbox::Error::message("descendant still alive"),
+        ));
+        assert!(!cleanup_failure.is_retryable());
+        assert!(
+            cleanup_failure
+                .to_string()
+                .contains("refusing automatic retry")
+        );
     }
 }

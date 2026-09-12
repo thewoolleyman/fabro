@@ -851,9 +851,45 @@ fi; \
   while [ ! -e \"$stop_file\" ]; do sleep {stop_poll_sleep}; done; \
   while [ ! -s \"$pid_file\" ]; do sleep {stop_poll_sleep}; done; \
   child=$(cat \"$pid_file\"); \
-  kill -TERM \"-$child\" 2>/dev/null || kill -TERM \"$child\" 2>/dev/null || true; \
+  targets=\"$child\"; \
+  frontier=\"$child\"; \
+  kill -STOP \"$child\" 2>/dev/null || true; \
+  if command -v ps >/dev/null 2>&1; then \
+    while [ -n \"$frontier\" ]; do \
+      next=\"\"; \
+      for parent in $frontier; do \
+        children=$(ps -eo pid=,ppid= 2>/dev/null | while read -r pid ppid; do \
+          if [ \"$ppid\" = \"$parent\" ]; then printf '%s ' \"$pid\"; fi; \
+        done); \
+        for descendant in $children; do \
+          kill -STOP \"$descendant\" 2>/dev/null || true; \
+          targets=\"$targets $descendant\"; \
+          next=\"$next $descendant\"; \
+        done; \
+      done; \
+      frontier=\"$next\"; \
+    done; \
+  fi; \
+  kill -TERM \"-$child\" 2>/dev/null || true; \
+  for target in $targets; do \
+    kill -TERM \"$target\" 2>/dev/null || true; \
+    kill -CONT \"$target\" 2>/dev/null || true; \
+  done; \
   sleep {term_grace}; \
-  kill -KILL \"-$child\" 2>/dev/null || kill -KILL \"$child\" 2>/dev/null || true; \
+  kill -KILL \"-$child\" 2>/dev/null || true; \
+  for target in $targets; do kill -KILL \"$target\" 2>/dev/null || true; done; \
+  if command -v ps >/dev/null 2>&1; then \
+    while :; do \
+      live=\"\"; \
+      for target in $targets; do \
+        state=$(ps -o stat= -p \"$target\" 2>/dev/null || true); \
+        set -- $state; state=${{1:-}}; \
+        case \"$state\" in \"\"|Z*) ;; *) live=\"$live $target\" ;; esac; \
+      done; \
+      [ -z \"$live\" ] && break; \
+      sleep {stop_poll_sleep}; \
+    done; \
+  fi; \
 ) & watcher=$!; \
 if command -v setsid >/dev/null 2>&1; then \
   setsid /bin/bash -lc \"$user_command\" <&3 & \
@@ -865,8 +901,12 @@ exec 3<&-; \
 echo \"$child\" > \"$pid_file\"; \
 wait \"$child\"; \
 status=$?; \
-kill \"$watcher\" 2>/dev/null || true; \
-wait \"$watcher\" 2>/dev/null || true; \
+if [ -e \"$stop_file\" ]; then \
+  wait \"$watcher\" 2>/dev/null || true; \
+else \
+  kill \"$watcher\" 2>/dev/null || true; \
+  wait \"$watcher\" 2>/dev/null || true; \
+fi; \
 rm -f \"$stop_file\" \"$pid_file\"; \
 exit \"$status\"\
 ",
@@ -2195,6 +2235,67 @@ mod tests {
         assert!(
             matching_processes.is_empty(),
             "controlled shell command should not leave child processes: {matching_processes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn controlled_shell_command_kills_detached_descendants_before_returning() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let stop_file = tempdir.path().join("stop");
+        let pid_file = tempdir.path().join("pid");
+        let started_file = tempdir.path().join("detached-started");
+        let stop_file = stop_file.to_string_lossy().into_owned();
+        let pid_file = pid_file.to_string_lossy().into_owned();
+        let started_file = started_file.to_string_lossy().into_owned();
+        let marker = "fabro_controlled_shell_detached_descendant_sentinel";
+        let detached_command = format!(
+            "trap '' HUP TERM; touch {}; while :; do sleep 1; done # {marker}",
+            shell_quote(&started_file)
+        );
+        let command = docker_controlled_shell_command(
+            &format!(
+                "setsid /bin/bash -lc {} & wait",
+                shell_quote(&detached_command)
+            ),
+            &stop_file,
+            &pid_file,
+        );
+
+        let mut child = Command::new("/bin/bash")
+            .arg("-lc")
+            .arg(command)
+            .kill_on_drop(true)
+            .spawn()
+            .expect("controlled shell command should spawn");
+
+        time::timeout(Duration::from_secs(5), async {
+            while !fs::try_exists(&started_file)
+                .await
+                .expect("detached marker existence should be checked")
+            {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("detached descendant should start");
+        fs::write(&stop_file, b"")
+            .await
+            .expect("stop request should be written");
+
+        let output = time::timeout(Duration::from_secs(8), child.wait())
+            .await
+            .expect("controlled shell command should finish its stop sequence")
+            .expect("controlled shell command should run");
+        let matching_processes = processes_with_marker(marker).await;
+        kill_processes_with_marker(marker).await;
+
+        assert!(
+            !output.success(),
+            "stop request should terminate the command"
+        );
+        assert!(
+            matching_processes.is_empty(),
+            "controlled shell command returned with detached descendants alive: {matching_processes:?}"
         );
     }
 
