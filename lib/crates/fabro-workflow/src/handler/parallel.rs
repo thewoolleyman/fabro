@@ -378,6 +378,7 @@ impl Handler for ParallelHandler {
                     registry: Arc::clone(&registry),
                     interviewer,
                     git_state: std::sync::RwLock::new(None),
+                    progress_logger: std::sync::RwLock::new(None),
                     base_env: base_env.clone(),
                     github_token: github_token.clone(),
                     inputs: inputs.clone(),

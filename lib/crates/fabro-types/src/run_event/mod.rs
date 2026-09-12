@@ -350,6 +350,12 @@ pub enum EventBody {
     AgentAcpCancelled(AgentAcpCancelledProps),
     #[serde(rename = "agent.acp.timed_out")]
     AgentAcpTimedOut(AgentAcpTimedOutProps),
+    #[serde(rename = "agent.acp.failover")]
+    AgentAcpFailover(AgentAcpFailoverProps),
+    #[serde(rename = "agent.acp.side_effect")]
+    AgentAcpSideEffect(AgentAcpSideEffectProps),
+    #[serde(rename = "agent.acp.exhausted")]
+    AgentAcpExhausted(AgentAcpExhaustedProps),
     #[serde(rename = "pull_request.created")]
     PullRequestCreated(PullRequestCreatedProps),
     #[serde(rename = "pull_request.linked")]
@@ -564,6 +570,9 @@ impl EventBody {
             Self::AgentAcpCompleted(_) => "agent.acp.completed",
             Self::AgentAcpCancelled(_) => "agent.acp.cancelled",
             Self::AgentAcpTimedOut(_) => "agent.acp.timed_out",
+            Self::AgentAcpFailover(_) => "agent.acp.failover",
+            Self::AgentAcpSideEffect(_) => "agent.acp.side_effect",
+            Self::AgentAcpExhausted(_) => "agent.acp.exhausted",
             Self::PullRequestCreated(_) => "pull_request.created",
             Self::PullRequestLinked(_) => "pull_request.linked",
             Self::PullRequestUnlinked(_) => "pull_request.unlinked",
@@ -587,6 +596,38 @@ impl EventBody {
             }
             _ => Ok(default_properties()),
         }
+    }
+}
+
+/// The schema version of the versioned ACP events this build understands.
+pub const ACP_VERSIONED_EVENT_SCHEMA_VERSION: u32 = 1;
+
+/// Events whose body carries a `schema_version` and therefore tolerate a
+/// future version by round-tripping it as [`EventBody::Unknown`].
+const VERSIONED_EVENT_NAMES: &[&str] = &[
+    "agent.acp.failover",
+    "agent.acp.side_effect",
+    "agent.acp.exhausted",
+];
+
+fn is_versioned_event_name(event: &str) -> bool {
+    VERSIONED_EVENT_NAMES.contains(&event)
+}
+
+/// Whether a successfully parsed versioned body declares a schema version
+/// this build does not understand.
+fn versioned_body_is_foreign(body: &EventBody) -> bool {
+    match body {
+        EventBody::AgentAcpFailover(props) => {
+            props.schema_version != ACP_VERSIONED_EVENT_SCHEMA_VERSION
+        }
+        EventBody::AgentAcpSideEffect(props) => {
+            props.schema_version != ACP_VERSIONED_EVENT_SCHEMA_VERSION
+        }
+        EventBody::AgentAcpExhausted(props) => {
+            props.schema_version != ACP_VERSIONED_EVENT_SCHEMA_VERSION
+        }
+        _ => false,
     }
 }
 
@@ -736,6 +777,9 @@ fn is_known_event_name(event: &str) -> bool {
             | "agent.acp.completed"
             | "agent.acp.cancelled"
             | "agent.acp.timed_out"
+            | "agent.acp.failover"
+            | "agent.acp.side_effect"
+            | "agent.acp.exhausted"
             | "pull_request.created"
             | "pull_request.linked"
             | "pull_request.unlinked"
@@ -821,8 +865,19 @@ impl RunEvent {
             "properties": parts.properties,
         });
         let body: EventBody = match serde_json::from_value(body_payload) {
+            // A VERSIONED event whose body carries a schema version this build
+            // does not understand must round-trip byte-for-byte and surface as
+            // unobservable, never as a parse failure and never reinterpreted.
+            Ok(body) if versioned_body_is_foreign(&body) => EventBody::Unknown {
+                name:       parts.event.to_string(),
+                properties: parts.properties.clone(),
+            },
             Ok(body) => body,
-            Err(err) if is_known_event_name(parts.event) => return Err(err),
+            Err(err)
+                if is_known_event_name(parts.event) && !is_versioned_event_name(parts.event) =>
+            {
+                return Err(err);
+            }
             Err(_) => EventBody::Unknown {
                 name:       parts.event.to_string(),
                 properties: parts.properties.clone(),
@@ -1757,6 +1812,128 @@ mod tests {
                 other => panic!("expected Unknown body, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn native_agent_failover_event_round_trips_byte_compatibly() {
+        // A stored native API-agent failover event written before the ACP
+        // failover event existed must parse and re-serialize unchanged.
+        let value = json!({
+            "id": "evt_native_failover",
+            "ts": "2026-04-29T12:00:00.000Z",
+            "run_id": fixtures::RUN_1,
+            "node_id": "code",
+            "node_label": "code",
+            "event": "agent.failover",
+            "properties": {
+                "from_provider": "anthropic",
+                "from_model": "claude-opus-5",
+                "to_provider": "openai",
+                "to_model": "gpt-5.6",
+                "error": "provider overloaded"
+            }
+        });
+        let parsed = RunEvent::from_value(value.clone()).unwrap();
+        assert!(matches!(parsed.body, EventBody::Failover(_)));
+        let reserialized = parsed.to_value().unwrap();
+        assert_eq!(reserialized["event"], "agent.failover");
+        assert_eq!(reserialized["properties"], value["properties"]);
+    }
+
+    fn acp_failover_properties(schema_version: u64) -> serde_json::Value {
+        json!({
+            "schema_version": schema_version,
+            "event_id": "evt-1",
+            "occurred_at_ms": 1789000000000_u64,
+            "visit": 1,
+            "engine_attempt": 1,
+            "transition": "reactive",
+            "from_candidate_index": 0,
+            "to_candidate_index": 1,
+            "from_display_name": "primary",
+            "to_display_name": "fallback",
+            "from_candidate_key": "k0",
+            "from_availability_key": "anthropic",
+            "to_candidate_key": "k1",
+            "to_availability_key": "codex",
+            "from_duration_ms": 10,
+            "hold_key": "anthropic",
+            "cause": "model_unsupported",
+            "scope": "candidate",
+            "signature_source": "process.terminal_diagnostic",
+            "primary_generation": "p",
+            "full_chain": "f",
+            "attempted": [0],
+            "attempted_durations_ms": [10],
+            "skipped": []
+        })
+    }
+
+    #[test]
+    fn acp_failover_v1_parses_typed_and_round_trips() {
+        let value = json!({
+            "id": "evt_acp_failover",
+            "ts": "2026-04-29T12:00:00.000Z",
+            "run_id": fixtures::RUN_1,
+            "node_id": "pr",
+            "event": "agent.acp.failover",
+            "properties": acp_failover_properties(1)
+        });
+        let parsed = RunEvent::from_value(value.clone()).unwrap();
+        let EventBody::AgentAcpFailover(props) = &parsed.body else {
+            panic!("expected typed ACP failover body, got {:?}", parsed.body);
+        };
+        assert_eq!(props.to_candidate_index, 1);
+        assert_eq!(props.cause, "model_unsupported");
+        assert_eq!(
+            parsed.to_value().unwrap()["properties"],
+            value["properties"]
+        );
+    }
+
+    #[test]
+    fn acp_failover_unknown_schema_version_round_trips_as_unknown() {
+        // A future schema version, and a body this build cannot parse at
+        // all, must both surface as Unknown with byte-identical properties:
+        // never a parse failure, never reinterpreted as version 1.
+        let mut foreign = acp_failover_properties(2);
+        foreign["novel_field"] = json!({"nested": true});
+        let unparseable = json!({"schema_version": 1, "garbage": true});
+        for properties in [foreign, unparseable] {
+            let value = json!({
+                "id": "evt_acp_failover_foreign",
+                "ts": "2026-04-29T12:00:00.000Z",
+                "run_id": fixtures::RUN_1,
+                "node_id": "pr",
+                "event": "agent.acp.failover",
+                "properties": properties
+            });
+            let parsed = RunEvent::from_value(value.clone()).unwrap();
+            match &parsed.body {
+                EventBody::Unknown { name, properties } => {
+                    assert_eq!(name, "agent.acp.failover");
+                    assert_eq!(properties, &value["properties"]);
+                }
+                other => panic!("expected Unknown body, got {other:?}"),
+            }
+            assert_eq!(
+                parsed.to_value().unwrap()["properties"],
+                value["properties"]
+            );
+        }
+    }
+
+    #[test]
+    fn other_known_events_still_refuse_an_unparseable_body() {
+        let value = json!({
+            "id": "evt_bad_started",
+            "ts": "2026-04-29T12:00:00.000Z",
+            "run_id": fixtures::RUN_1,
+            "node_id": "work",
+            "event": "agent.acp.started",
+            "properties": {"visit": "not-a-number"}
+        });
+        assert!(RunEvent::from_value(value).is_err());
     }
 
     #[test]

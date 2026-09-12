@@ -2750,6 +2750,9 @@ reasoning = false
                 tool_hooks:         None,
                 cancel_token:       CancellationToken::new(),
                 agent_tool_runtime: fabro_agent::AgentToolRuntime::default(),
+                durable_events:     None,
+                run_store:          None,
+                publish_branch:     None,
             })
             .await
             .unwrap();

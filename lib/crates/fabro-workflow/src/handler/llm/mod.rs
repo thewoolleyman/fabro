@@ -1,4 +1,7 @@
 pub mod acp;
+#[cfg(test)]
+mod acp_chain_tests;
+pub mod acp_fallback;
 pub mod activation_lease;
 pub mod api;
 pub mod changed_files;

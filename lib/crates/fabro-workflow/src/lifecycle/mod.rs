@@ -305,6 +305,14 @@ impl RunLifecycle<WorkflowGraph> for WorkflowLifecycle {
         }
         self.artifact.after_attempt(ctx, state).await?;
         self.event.after_attempt(ctx, state).await?;
+        // Record the attempt boundary so a handler entered by the NEXT attempt
+        // can name its own engine attempt (the retry counter is written only
+        // after the node completes, which is too late for a mid-visit reader).
+        // Reset once the node's attempts end so a later visit starts at one.
+        state.context.set(
+            context::keys::acp_attempt_key(ctx.node.id()),
+            serde_json::json!(if ctx.will_retry { ctx.attempt } else { 0 }),
+        );
         Ok(())
     }
 

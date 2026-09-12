@@ -2080,9 +2080,11 @@ mod tests {
             .apply_event(&test_stage_event(
                 4,
                 EventBody::AgentAcpStarted(AgentAcpStartedProps {
-                    visit:       1,
-                    command:     "python fake_agent.py".to_string(),
-                    config_name: Some("fake".to_string()),
+                    visit:                   1,
+                    command:                 "python fake_agent.py".to_string(),
+                    config_name:             Some("fake".to_string()),
+                    candidate_index:         None,
+                    chain_deadline_epoch_ms: None,
                 }),
                 stage_id.clone(),
             ))
@@ -2102,9 +2104,11 @@ mod tests {
             .apply_event(&test_stage_event(
                 4,
                 EventBody::AgentAcpStarted(AgentAcpStartedProps {
-                    visit:       1,
-                    command:     "python fake_agent.py".to_string(),
-                    config_name: Some("fake".to_string()),
+                    visit:                   1,
+                    command:                 "python fake_agent.py".to_string(),
+                    config_name:             Some("fake".to_string()),
+                    candidate_index:         None,
+                    chain_deadline_epoch_ms: None,
                 }),
                 stage_id.clone(),
             ))

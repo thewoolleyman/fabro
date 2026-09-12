@@ -106,6 +106,15 @@ pub type AcpPermissionResolver = Arc<
         + Sync,
 >;
 
+/// Observes every `session/request_permission` BEFORE the answer is sent,
+/// under both the inline `auto` policy and the parked `ask` policy, and is
+/// awaited to completion first. This is the only pre-execution hook ACP
+/// offers: the adapter runs the tool only after the answer arrives, so work
+/// the observer finishes here (a durable side-effect ledger write, say) is
+/// durable before the tool can reach anything outside the sandbox.
+pub type AcpPermissionObserver =
+    Arc<dyn Fn(AcpPermissionQuestion) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 /// The serde name of a permission option kind (`allow_once`, ...).
 fn permission_kind_name(kind: PermissionOptionKind) -> String {
     serde_json::to_value(kind)
@@ -571,22 +580,25 @@ impl AcpLiveControl {
 }
 
 pub struct AcpRunRequest {
-    pub command:               AcpProcessSpec,
-    pub prompt:                String,
-    pub cwd:                   String,
-    pub timeout_ms:            Option<u64>,
-    pub env:                   HashMap<String, String>,
-    pub sandbox:               Arc<dyn Sandbox>,
-    pub cancel_token:          CancellationToken,
-    pub on_activity:           Option<Arc<dyn Fn() + Send + Sync>>,
+    pub command:                AcpProcessSpec,
+    pub prompt:                 String,
+    pub cwd:                    String,
+    pub timeout_ms:             Option<u64>,
+    pub env:                    HashMap<String, String>,
+    pub sandbox:                Arc<dyn Sandbox>,
+    pub cancel_token:           CancellationToken,
+    pub on_activity:            Option<Arc<dyn Fn() + Send + Sync>>,
     /// Receives one event per tool call the agent starts or finishes, so the
     /// run can surface per-tool progress without the adapter's payloads.
-    pub on_tool_event:         Option<AcpToolEventCallback>,
+    pub on_tool_event:          Option<AcpToolEventCallback>,
     /// Decides the adapter's `session/request_permission` requests. `None`
     /// keeps today's behaviour: the most permissive offered option is chosen
     /// inline, without parking. `Some` parks each request on the resolver.
-    pub on_permission_request: Option<AcpPermissionResolver>,
-    pub live_control:          Option<AcpLiveControl>,
+    pub on_permission_request:  Option<AcpPermissionResolver>,
+    /// Awaited for every permission request BEFORE it is answered, under
+    /// either policy. See [`AcpPermissionObserver`].
+    pub on_permission_observed: Option<AcpPermissionObserver>,
+    pub live_control:           Option<AcpLiveControl>,
 }
 
 #[derive(Debug)]
@@ -609,6 +621,7 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
         on_activity,
         on_tool_event,
         on_permission_request,
+        on_permission_observed,
         live_control,
     } = request;
     let live_control = live_control.unwrap_or_default();
@@ -656,6 +669,7 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
                 // task keeps the loop pumping. Each captured handle is cloned per
                 // call so this `Fn` handler can spawn on every request.
                 let resolver = on_permission_request.clone();
+                let observer = on_permission_observed.clone();
                 let cancel = permission_cancel_token.clone();
                 let timeout_slot = Arc::clone(&permission_timeout_for_handler);
                 let permission_state = permission_state.clone();
@@ -671,6 +685,12 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
                         // below is ignored if the transport is already gone.
                         () = task_shutdown.cancelled() => RequestPermissionOutcome::Cancelled,
                         outcome = async {
+                            // The observer runs BEFORE any answer under either
+                            // policy, and is awaited: the adapter cannot execute
+                            // the tool until the answer is sent.
+                            if let Some(observer) = observer.as_ref() {
+                                observer(permission_question(&request)).await;
+                            }
                             if cancel.is_cancelled() {
                                 RequestPermissionOutcome::Cancelled
                             } else if let Some(resolver) = resolver.as_ref() {

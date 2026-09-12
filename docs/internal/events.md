@@ -1732,6 +1732,125 @@ Emitted when an ACP turn exceeds its deadline. Carries the progress evidence the
 
 The failure message on the corresponding `stage.failed` summarises the same three counters.
 
+### `agent.acp.failover`
+
+Emitted once per candidate transition of an ACP node that carries an ordered
+fallback chain (`acp.fallback_chain`): either the executing candidate failed on
+a typed provider-availability condition and the SAME node visit advanced to the
+next candidate (`transition: "reactive"`), or the Dispatcher's preflight had
+already skipped the primary so the first candidate that actually executed was
+not candidate zero (`transition: "preflight"`). Distinct from the native
+API-agent `agent.failover`, which is unchanged.
+
+The body is versioned and redacted by construction: it carries identities,
+indexes, durations, the typed cause and the chain digests, and never a command,
+env value, credential, prompt, raw error or diagnostic text.
+
+```json
+{
+  "id": "...", "ts": "...", "run_id": "...",
+  "event": "agent.acp.failover",
+  "node_id": "pr", "node_label": "pr",
+  "properties": {
+    "schema_version": 1,
+    "event_id": "0f1a…",
+    "occurred_at_ms": 1789000000000,
+    "visit": 1,
+    "engine_attempt": 1,
+    "transition": "reactive",
+    "from_candidate_index": 0,
+    "to_candidate_index": 1,
+    "from_display_name": "built-in Codex ACP adapter",
+    "to_display_name": "built-in Anthropic ACP adapter",
+    "from_candidate_key": "builtin-codex-…",
+    "from_availability_key": "codex",
+    "to_candidate_key": "builtin-anthropic-…",
+    "to_availability_key": "anthropic",
+    "from_duration_ms": 4120,
+    "hold_key": "codex",
+    "cause": "model_unsupported",
+    "scope": "candidate",
+    "signature_source": "process.terminal_diagnostic",
+    "primary_generation": "…32 hex…",
+    "full_chain": "…32 hex…",
+    "attempted": [0],
+    "skipped": [],
+    "chain_deadline_epoch_ms": 1789001800000
+  }
+}
+```
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `schema_version` | number | Wire schema version of the body; `1` |
+| `event_id` | string | Stable per-transition id minted once at emission; consumers project by it |
+| `occurred_at_ms` | number | Epoch milliseconds at which the transition was decided |
+| `visit` | number | Node visit count (1-based) |
+| `engine_attempt` | number | Engine handler attempt within the visit (1-based); distinct from the candidate index |
+| `transition` | string | `reactive` or `preflight` |
+| `from_candidate_index` / `to_candidate_index` | number | Positions in the ordered chain |
+| `from_display_name` / `to_display_name` | string | Operator-facing candidate names |
+| `from_candidate_key` / `from_availability_key` / `to_candidate_key` / `to_availability_key` | string | Machine identities of the two candidates |
+| `from_duration_ms` | number | Milliseconds the failed candidate consumed; `0` for a preflight transition |
+| `hold_key` | string | The hold key the typed cause resolved to |
+| `cause` | string | One of the ratified availability causes (`model_unsupported`, `quota`, …) |
+| `scope` | string | `availability-domain` or `candidate` |
+| `signature_source` | string | The signature source that matched, or `preflight` |
+| `primary_generation` | string | Fingerprint of candidate zero alone |
+| `full_chain` | string | Digest of every candidate in order |
+| `attempted` | number[] | Candidate indexes attempted so far in this visit, including `from` |
+| `attempted_durations_ms` | number[] | Milliseconds each attempted candidate consumed, parallel to `attempted` |
+| `skipped` | number[] | Candidate indexes the preflight skipped for this visit |
+| `chain_deadline_epoch_ms` | number or null | The node's original wall-clock deadline shared by every candidate |
+
+### `agent.acp.exhausted`
+
+The typed terminal record of an ACP fallback chain that ran out of candidates,
+emitted once per exhausted visit before the node's non-retryable outcome is
+reported (or, when every candidate was preflight-skipped, before the run is
+terminated). It carries the FINAL candidate's identity and typed availability
+cause in structured fields, so a consumer projects the last hold without
+parsing prose. Same redaction posture as `agent.acp.failover`.
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `schema_version` | number | Wire schema version of the body; `1` |
+| `event_id` | string | Stable id minted once at emission |
+| `occurred_at_ms` | number | Epoch milliseconds |
+| `visit` | number | Node visit count (1-based) |
+| `engine_attempt` | number | Engine handler attempt within the visit (1-based) |
+| `terminal` | string | `reactive` (the final candidate failed on a typed condition) or `preflight` (every candidate was skipped before any adapter ran) |
+| `candidate_index` / `display_name` / `candidate_key` / `availability_key` | number, string | The final candidate |
+| `duration_ms` | number | Milliseconds the final candidate consumed; `0` for `preflight` |
+| `hold_key`, `cause`, `scope`, `signature_source` | string | The typed cause, as on `agent.acp.failover` |
+| `primary_generation`, `full_chain` | string | The chain digests |
+| `attempted`, `attempted_durations_ms`, `skipped` | number[] | The visit's attempted and skipped sets |
+| `chain_deadline_epoch_ms` | number or null | The visit's original deadline |
+
+### `agent.acp.side_effect`
+
+One entry of an ACP fallback candidate's side-effect ledger. Emitted for a
+node that carries `acp.fallback_chain`, once per tool the candidate is about to
+run: from the adapter's `session/request_permission` BEFORE the answer is sent
+(`observed_via: "permission"`), or from the tool-started notification as a
+backstop for an adapter that runs a tool without asking
+(`observed_via: "tool_started"`). The engine stores the entry before letting a
+permission-gated tool proceed, so a later fallback decision (or a resumed
+visit) can prove whether every completed operation of a failed candidate stayed
+sandbox-local. Redacted: the tool kind and a bounded title, never the tool's
+arguments or output.
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `schema_version` | number | Wire schema version of the body; `1` |
+| `visit` | number | Node visit count (1-based) |
+| `candidate_index` | number | Position in the ordered chain |
+| `tool_call_id` | string | The adapter's tool call id |
+| `tool_kind` | string | ACP tool kind (`read`, `edit`, `execute`, `fetch`, ...) |
+| `title` | string | Bounded tool title as reported by the adapter |
+| `classification` | string | `sandbox_local` (read, search, think, edit, delete, move, switch_mode) or `external_or_unknown` (execute, fetch, other, unknown) |
+| `observed_via` | string | `permission` or `tool_started` |
+
 ## Subgraph events
 
 ### `subgraph.started`

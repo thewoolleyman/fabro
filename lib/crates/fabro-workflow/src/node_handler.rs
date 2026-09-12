@@ -107,6 +107,9 @@ impl NodeHandler<WorkflowGraph> for WorkflowNodeHandler {
         match timed_result {
             Ok(Ok(wf_outcome)) => Ok(wf_outcome),
             Ok(Err(Error::Cancelled)) => Err(CoreError::Cancelled),
+            // A typed run-terminating condition: the engine's blocked error
+            // ends the run here rather than routing the node's edges.
+            Ok(Err(Error::TerminateRun { message, .. })) => Err(CoreError::blocked(message)),
             Ok(Err(fabro_err)) => {
                 let retryable = handler.should_retry(&fabro_err);
                 Err(CoreError::handler(HandlerErrorDetail {

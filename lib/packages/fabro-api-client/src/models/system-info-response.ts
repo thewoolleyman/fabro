@@ -66,4 +66,8 @@ export interface SystemInfoResponse {
      * Effective sandbox provider for launched runs.
      */
     'sandbox_provider'?: string;
+    /**
+     * Engine capabilities this server advertises, so a client can refuse to send grammar an older server would silently ignore. Additive: absent on servers that predate the field. Known values: `acp.fallback_chain.v1` (ordered ACP candidate failover within one node visit).
+     */
+    'capabilities'?: Array<string>;
 }

@@ -287,6 +287,13 @@ impl Node {
         self.str_attr("acp.config")
     }
 
+    /// The ordered candidate chain of an ACP node, as the JSON document the
+    /// `acp.fallback_chain` attribute carries. Absent for a legacy node.
+    #[must_use]
+    pub fn acp_fallback_chain_attr(&self) -> Option<&str> {
+        self.str_attr("acp.fallback_chain")
+    }
+
     /// How an ACP node answers the adapter's `session/request_permission`:
     /// `auto` (the default; the engine picks the most permissive option, as
     /// it always has) or `ask` (the request parks the node on a typed

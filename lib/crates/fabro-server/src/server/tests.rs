@@ -10840,6 +10840,11 @@ async fn worker_started_child_run_requires_approval_before_becoming_runnable() {
     let info_body = response_json!(response, StatusCode::OK).await;
     assert_eq!(info_body["runs"]["active"], 1);
     assert_eq!(info_body["runs"]["scheduler_slots_used"], 0);
+    assert_eq!(
+        info_body["capabilities"],
+        json!([fabro_types::capabilities::ACP_FALLBACK_CHAIN_CAPABILITY]),
+        "system info must advertise the ACP fallback chain capability explicitly"
+    );
 
     {
         let runs = state.runs.lock().expect("runs lock poisoned");
@@ -11859,10 +11864,12 @@ async fn steer_with_active_acp_session_forwards_to_worker() {
     let _temp_dir = insert_running_control_run(&state, run_id, Some(transport));
 
     let started = acp_event_for_stage(&run_id, &workflow_event::Event::AgentAcpStarted {
-        node_id:     "agent".to_string(),
-        visit:       1,
-        command:     "python fake_agent.py".to_string(),
-        config_name: None,
+        node_id:                 "agent".to_string(),
+        visit:                   1,
+        command:                 "python fake_agent.py".to_string(),
+        config_name:             None,
+        candidate_index:         None,
+        chain_deadline_epoch_ms: None,
     });
     update_live_run_from_event(&state, run_id, &started);
     let activated =
@@ -11962,10 +11969,12 @@ async fn active_acp_steerable_marker_clears_on_terminal_paths() {
         let (transport, _control_rx) = worker_transport_with_receiver(run_id).await;
         let _temp_dir = insert_running_control_run(&state, run_id, Some(transport));
         let started = acp_event_for_stage(&run_id, &workflow_event::Event::AgentAcpStarted {
-            node_id:     "agent".to_string(),
-            visit:       1,
-            command:     "python fake_agent.py".to_string(),
-            config_name: None,
+            node_id:                 "agent".to_string(),
+            visit:                   1,
+            command:                 "python fake_agent.py".to_string(),
+            config_name:             None,
+            candidate_index:         None,
+            chain_deadline_epoch_ms: None,
         });
         update_live_run_from_event(&state, run_id, &started);
         let activated =

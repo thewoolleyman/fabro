@@ -106,6 +106,33 @@ for line in sys.stdin:
         if mode == "early_exit":
             print("early boom", file=sys.stderr, flush=True)
             sys.exit(2)
+        if mode == "tool_then_exit":
+            # Report one tool call of the configured kind (default execute),
+            # then die with a scripted terminal diagnostic. Used to prove the
+            # side-effect gate fails closed after an external-or-unknown tool.
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tool-x",
+                        "title": os.environ.get("ACP_TOOL_TITLE", "Bash: git push"),
+                        "kind": os.environ.get("ACP_TOOL_KIND", "execute"),
+                        "status": "in_progress"
+                    }
+                }
+            })
+            time.sleep(0.2)
+            print(os.environ.get("ACP_EXIT_DIAGNOSTIC", "early boom"), file=sys.stderr, flush=True)
+            sys.exit(2)
+        if mode == "diagnostic_exit":
+            # Die at the first prompt with a scripted terminal diagnostic and
+            # exit status, before any session update: the pre-turn shape of a
+            # provider refusing the requested model.
+            print(os.environ.get("ACP_EXIT_DIAGNOSTIC", "early boom"), file=sys.stderr, flush=True)
+            sys.exit(int(os.environ.get("ACP_EXIT_CODE", "2")))
         if mode == "write_file":
             path = os.environ.get("ACP_WRITE_PATH", "hello.txt")
             parent = os.path.dirname(path)

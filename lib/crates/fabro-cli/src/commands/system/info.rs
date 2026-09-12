@@ -62,6 +62,9 @@ pub(super) async fn info_command(args: &SystemInfoArgs, base_ctx: &CommandContex
                 .unwrap_or_default()
         );
         println!("Uptime: {}s", response.uptime_secs.unwrap_or_default());
+        if !response.capabilities.is_empty() {
+            println!("Capabilities: {}", response.capabilities.join(", "));
+        }
     }
 
     Ok(())

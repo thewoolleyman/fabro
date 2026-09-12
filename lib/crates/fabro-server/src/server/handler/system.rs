@@ -94,6 +94,7 @@ async fn get_system_info(_auth: RequiredUser, State(state): State<Arc<AppState>>
             scheduler_slots_used: Some(to_i64(scheduler_slots_used)),
         }),
         sandbox_provider: Some(system_sandbox_provider(&manifest_run_settings)),
+        capabilities:     fabro_types::capabilities::advertised_capabilities(),
     };
     (StatusCode::OK, Json(response)).into_response()
 }

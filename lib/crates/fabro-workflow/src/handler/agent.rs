@@ -15,9 +15,10 @@ use super::structured_output::{
 use super::{EngineServices, Handler, NodeTimeoutPolicy};
 use crate::context::{Context, WorkflowContext, keys};
 use crate::error::Error;
-use crate::event::{Emitter, Event, StageScope};
+use crate::event::{Emitter, Event, RunEventLogger, StageScope};
 use crate::interview_runtime::WorkflowAgentQuestionRuntime;
 use crate::outcome::{BilledModelUsage, Outcome, OutcomeExt};
+use crate::runtime_store::RunStoreHandle;
 
 /// Result from a `CodergenBackend` invocation.
 #[allow(
@@ -47,6 +48,13 @@ pub struct CodergenRunRequest<'a> {
     pub tool_hooks:         Option<Arc<dyn fabro_agent::ToolHookCallback>>,
     pub cancel_token:       CancellationToken,
     pub agent_tool_runtime: fabro_agent::AgentToolRuntime,
+    /// The run's store-backed event logger: the durability barrier an ACP
+    /// fallback chain awaits before every launch and transition.
+    pub durable_events:     Option<RunEventLogger>,
+    /// The run's own event stream, for reconstructing a chain visit's state.
+    pub run_store:          Option<RunStoreHandle>,
+    /// The run's publish branch, for a publishing node's onset probe.
+    pub publish_branch:     Option<String>,
 }
 
 pub struct OneShotRequest<'a> {
@@ -296,6 +304,9 @@ impl Handler for AgentHandler {
                         tool_hooks,
                         cancel_token: services.run.cancel_token(),
                         agent_tool_runtime: agent_tool_runtime.clone(),
+                        durable_events: services.progress_logger(),
+                        run_store: Some(services.run.run_store.clone()),
+                        publish_branch: services.git_state().and_then(|git| git.run_branch.clone()),
                     })
                     .await;
                 match result {

@@ -287,6 +287,34 @@ pub enum Error {
         source:           Option<SharedError>,
     },
 
+    /// A handler failure that keeps its failure category but MUST NOT be
+    /// retried by the node's outer retry budget. Used by the ACP fallback
+    /// chain once a reactive transition has happened inside a node visit:
+    /// the contract makes the visit non-retryable from that point, and on
+    /// exhaustion, "a typed, non-retryable node outcome preserving the final
+    /// cause". `Precondition` is also non-retryable but forces the
+    /// `Structural` category, which would lose the cause.
+    /// A typed terminal condition that must end the RUN before any adapter
+    /// starts, without traversing the node's continuation or failure edges.
+    /// Used when a reached ACP node's fallback chain has no launchable
+    /// candidate at all (every candidate preflight-skipped): the contract
+    /// forbids routing such a node into janitor, non-convergence or a human
+    /// gate. Mapped by the node handler to the engine's run-blocking error.
+    #[error("{message}")]
+    TerminateRun {
+        message:       String,
+        failure_class: FailureCategory,
+    },
+
+    #[error("Handler error: {message}")]
+    HandlerNonRetryable {
+        message:          String,
+        failure_class:    FailureCategory,
+        exec_output_tail: Option<ExecOutputTail>,
+        #[source]
+        source:           Option<SharedError>,
+    },
+
     #[error("LLM error: {0}")]
     Llm(LlmError),
 
@@ -379,6 +407,50 @@ impl Error {
         Self::handler_with_source(message, source)
     }
 
+    /// The same failure, made non-retryable while keeping its category. A
+    /// `Handler` or `Engine` failure becomes `HandlerNonRetryable`; every other
+    /// variant is already non-retryable or is cancellation, and is returned as
+    /// is.
+    #[must_use]
+    pub fn into_non_retryable(self) -> Self {
+        match self {
+            Self::Handler {
+                message,
+                failure_class,
+                exec_output_tail,
+                source,
+            }
+            | Self::Engine {
+                message,
+                failure_class,
+                exec_output_tail,
+                source,
+            } => Self::HandlerNonRetryable {
+                message,
+                failure_class,
+                exec_output_tail,
+                source,
+            },
+            other => other,
+        }
+    }
+
+    /// A handler failure the outer retry budget MUST NOT retry, carrying an
+    /// explicit failure category rather than one classified from its text.
+    pub fn handler_non_retryable(
+        message: impl Into<String>,
+        failure_class: FailureCategory,
+        exec_output_tail: Option<ExecOutputTail>,
+        source: Option<anyhow::Error>,
+    ) -> Self {
+        Self::HandlerNonRetryable {
+            message: message.into(),
+            failure_class,
+            exec_output_tail,
+            source: source.map(SharedError::new),
+        }
+    }
+
     /// Smart constructor for Engine errors. Classifies the failure reason
     /// eagerly.
     pub fn engine(message: impl Into<String>) -> Self {
@@ -416,7 +488,9 @@ impl Error {
     #[must_use]
     pub fn causes(&self) -> Vec<String> {
         match self {
-            Self::Engine { source, .. } | Self::Handler { source, .. } => source
+            Self::Engine { source, .. }
+            | Self::Handler { source, .. }
+            | Self::HandlerNonRetryable { source, .. } => source
                 .as_ref()
                 .map_or_else(Vec::new, |source| collect_chain(source)),
             Self::Template { source, .. } => collect_chain(source),
@@ -452,6 +526,8 @@ impl Error {
             | Self::RunNotFound(_)
             | Self::Unsupported(_)
             | Self::OutputSchemaValidation(_)
+            | Self::HandlerNonRetryable { .. }
+            | Self::TerminateRun { .. }
             | Self::Cancelled => false,
         }
     }
@@ -472,9 +548,10 @@ impl Error {
             | Self::Unsupported(_)
             | Self::OutputSchemaValidation(_) => FailureCategory::Deterministic,
             Self::Precondition(_) | Self::RunNotFound(_) => FailureCategory::Structural,
-            Self::Handler { failure_class, .. } | Self::Engine { failure_class, .. } => {
-                *failure_class
-            }
+            Self::Handler { failure_class, .. }
+            | Self::HandlerNonRetryable { failure_class, .. }
+            | Self::TerminateRun { failure_class, .. }
+            | Self::Engine { failure_class, .. } => *failure_class,
         }
     }
 
@@ -491,7 +568,10 @@ impl Error {
     #[must_use]
     pub fn to_failure_detail(&self) -> FailureDetail {
         let message = match self {
-            Self::Engine { message, .. } | Self::Handler { message, .. } => message.clone(),
+            Self::Engine { message, .. }
+            | Self::Handler { message, .. }
+            | Self::HandlerNonRetryable { message, .. }
+            | Self::TerminateRun { message, .. } => message.clone(),
             _ => self.to_string(),
         };
         let explicit_exec_output_tail = match self {
@@ -499,6 +579,9 @@ impl Error {
                 exec_output_tail, ..
             }
             | Self::Handler {
+                exec_output_tail, ..
+            }
+            | Self::HandlerNonRetryable {
                 exec_output_tail, ..
             } => exec_output_tail.clone(),
             _ => None,

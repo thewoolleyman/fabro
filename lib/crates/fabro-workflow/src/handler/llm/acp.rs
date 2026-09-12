@@ -2,24 +2,26 @@
 
 use std::collections::HashMap;
 use std::env;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use fabro_acp::{
     AcpCommandError, AcpControlHandle, AcpError, AcpLiveControl, AcpPermissionAnswer,
-    AcpPermissionQuestion, AcpPermissionResolver, AcpProcessSpec, AcpRunRequest, AcpToolEvent,
-    AcpToolEventCallback, render_stop_reason,
+    AcpPermissionObserver, AcpPermissionQuestion, AcpPermissionResolver, AcpProcessSpec,
+    AcpRunRequest, AcpToolEvent, AcpToolEventCallback, render_stop_reason,
 };
 use fabro_agent::{
     AgentEvent, AgentQuestion, AgentQuestionAnswer, AgentQuestionAnswerStatus,
     AgentQuestionRuntime, RefreshOutcome, Sandbox, StaticEnvProvider, SteeringItem,
-    ToolEnvProvider,
+    ToolEnvProvider, shell_quote,
 };
 use fabro_graphviz::graph::Node;
 use fabro_static::EnvVars;
 use fabro_types::{
-    AgentBackend, Principal, SessionCapability, StageId, StageTiming, SteeringMessage,
+    AgentBackend, FailureCategory, Principal, SessionCapability, StageId, StageTiming,
+    SteeringMessage,
 };
 use fabro_util::time::elapsed_ms;
 use tokio::task::JoinHandle;
@@ -28,11 +30,23 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument as _, field};
 
 use super::super::agent::{CodergenBackend, CodergenResult, CodergenRunRequest, OneShotRequest};
+use super::acp_fallback::chain::{
+    AcpChainCandidate, AcpFallbackChain, SignatureCause, SignatureScope, parse_chain,
+};
+use super::acp_fallback::classify::{AvailabilityFailure, Verdict, classify};
+use super::acp_fallback::events::{
+    ObservedVia, TransitionCause, TransitionKind, TransitionRecord, exhausted_props,
+    failover_props, side_effect_props, tool_kind_is_sandbox_local,
+};
+use super::acp_fallback::signal::{DeclaredClass, FailureSignal};
+use super::acp_fallback::visit::{CandidateTerminal, LedgerEntry, VisitState};
 use super::activation_lease::{ActivationLease, ActivationLeaseOptions};
 use super::changed_files;
+use crate::context::Context;
 use crate::error::Error;
-use crate::event::{Emitter, Event, RunNoticeCode, RunNoticeLevel, StageScope};
+use crate::event::{Emitter, Event, RunEventLogger, RunNoticeCode, RunNoticeLevel, StageScope};
 use crate::handler::NodeTimeoutPolicy;
+use crate::runtime_store::RunStoreHandle;
 use crate::steering_hub::{ActiveControlHandle, SteeringHub};
 
 /// Default refresh-ahead interval — comfortably under the ~60-min GitHub App
@@ -197,9 +211,11 @@ impl AgentAcpBackend {
         self
     }
 
+    /// One node visit: a single adapter turn for a legacy node, or the bounded
+    /// candidate chain for a node carrying `acp.fallback_chain`.
     #[allow(
         clippy::too_many_arguments,
-        reason = "one ACP turn needs the node, its prompt, the run's emitter and scope, the sandbox, cancellation, and the question runtime"
+        reason = "one ACP turn needs the node, its prompt, the run's emitter and scope, the sandbox, cancellation, the question runtime and the durability seams"
     )]
     async fn run_turn(
         &self,
@@ -210,25 +226,20 @@ impl AgentAcpBackend {
         sandbox: &Arc<dyn Sandbox>,
         cancel_token: CancellationToken,
         question_runtime: Option<Arc<dyn AgentQuestionRuntime>>,
+        runtime: ChainRuntime,
     ) -> Result<CodergenResult, Error> {
-        let process_spec = resolve_acp_process_spec(node)?;
-        let permission_policy = resolve_acp_permission_policy(node)?;
-        let config_name = process_spec.name().map(str::to_string);
-        let launch_env = self.resolve_launch_env(emitter).await?;
-        let on_activity = {
-            let emitter = Arc::clone(emitter);
-            Arc::new(move || emitter.touch()) as Arc<dyn Fn() + Send + Sync>
+        // The chain is parsed and validated BEFORE any adapter starts, so a
+        // malformed chain is a deterministic validation refusal and never a run
+        // that fails halfway through the node.
+        let chain = match node.acp_fallback_chain_attr() {
+            None => None,
+            Some(raw) => Some(
+                parse_chain(raw, node.acp_command_attr(), node.acp_config_attr())
+                    .map_err(|err| Error::Validation(err.to_string()))?,
+            ),
         };
-        let command_display = process_spec.to_string();
-        emitter.emit_scoped(
-            &Event::AgentAcpStarted {
-                node_id:     node.id.clone(),
-                visit:       stage_scope.visit,
-                command:     command_display.clone(),
-                config_name: config_name.clone(),
-            },
-            stage_scope,
-        );
+        let permission_policy = resolve_acp_permission_policy(node)?;
+        let launch_env = self.resolve_launch_env(emitter).await?;
 
         // Under `acp.permission_policy="ask"` the adapter's permission requests
         // park on the workflow's question runtime (the same one the API-agent
@@ -264,6 +275,600 @@ impl AgentAcpBackend {
                 }) as AcpPermissionResolver)
             }
         };
+
+        let shared = TurnShared {
+            node,
+            emitter,
+            stage_scope,
+            sandbox,
+            cancel_token,
+            launch_env,
+            on_permission_request,
+        };
+        match chain {
+            None => {
+                let process_spec = resolve_acp_process_spec(node)?;
+                self.launch_turn(&shared, LaunchSpec {
+                    process_spec,
+                    prompt,
+                    timeout: node.timeout(),
+                    candidate: None,
+                    on_permission_observed: None,
+                    on_tool_started: None,
+                    activity: None,
+                })
+                .await
+                .map_err(LaunchFailure::into_workflow_error)
+            }
+            Some(chain) => self.run_chain(&shared, &chain, prompt, runtime).await,
+        }
+    }
+
+    /// The bounded chain visit: ordered candidates, one original deadline, the
+    /// same sandbox, durable state, and typed eligibility (see
+    /// `acp_fallback` and `docs/plans/2026-09-12-acp-fallback-chain.md`).
+    async fn run_chain(
+        &self,
+        shared: &TurnShared<'_>,
+        chain: &AcpFallbackChain,
+        prompt: String,
+        runtime: ChainRuntime,
+    ) -> Result<CodergenResult, Error> {
+        let node = shared.node;
+        let visit = shared.stage_scope.visit;
+        // The event stream is the one durable source: an outer retry or a
+        // resume after a crash re-enters here, and after the first reactive
+        // transition it must never launch an attempted or preflight-skipped
+        // candidate again.
+        let mut state = match &runtime.run_store {
+            Some(store) => {
+                let envelopes = store.list_events().await.map_err(|err| {
+                    Error::handler_with_anyhow(
+                        format!(
+                            "ACP fallback chain for node {} could not read the run's durable event stream to reconstruct visit {visit}",
+                            node.id
+                        ),
+                        err,
+                    )
+                })?;
+                let events: Vec<fabro_types::RunEvent> = envelopes
+                    .into_iter()
+                    .map(|envelope| envelope.event)
+                    .collect();
+                VisitState::reconstruct(visit, &node.id, chain, &events)
+            }
+            None => VisitState::new(visit, chain),
+        };
+        // A visit the durable record already shows exhausted has ended; it is
+        // reported again, typed and non-retryable, and launches nothing.
+        if let Some(exhausted) = &state.exhausted {
+            return Err(Error::handler_non_retryable(
+                format!(
+                    "ACP fallback chain for {} was already exhausted in this visit (durable record): final typed cause {} ({}) from {}",
+                    state_node_label(chain, &state),
+                    exhausted.cause,
+                    exhausted.scope,
+                    exhausted.display_name
+                ),
+                cause_from_str(&exhausted.cause)
+                    .map_or(FailureCategory::Deterministic, exhaustion_category),
+                None,
+                None,
+            ));
+        }
+        // Deadline: before the first reactive transition each engine attempt
+        // keeps the legacy posture and receives a full node timeout of its
+        // own; once a transition has happened the visit's ORIGINAL deadline
+        // binds every later candidate, across retry and resume alike.
+        if !state.transitioned || state.chain_deadline_epoch_ms.is_none() {
+            state.chain_deadline_epoch_ms = node
+                .timeout()
+                .map(|timeout| now_epoch_ms().saturating_add(crate::millis_u64(timeout)));
+        }
+        let durable = runtime.durable_events.clone();
+        let mut recovery_preamble: Option<String> = None;
+        let mut last_failure: Option<LastFailure> = None;
+
+        loop {
+            let Some(index) = state.next_launchable(chain) else {
+                return Err(self
+                    .exhaust(shared, chain, &state, &runtime, last_failure.take())
+                    .await);
+            };
+            let candidate = chain
+                .candidate(index)
+                .expect("next_launchable returns an index the chain holds");
+
+            // Launching a candidate other than one already attempted is a
+            // TRANSITION, whether it happens inside this attempt or on an
+            // outer retry or resume. Every attempted candidate must then be
+            // provably free of external side effects, and, for a publishing
+            // node, the remote must show no onset. Unknown evidence fails
+            // closed. (Re-launching the same candidate before any transition
+            // is the legacy retry and is not gated.)
+            let is_transition = state.attempted.iter().any(|attempted| *attempted != index);
+            if is_transition {
+                if let Some(blocked) = state
+                    .attempted
+                    .iter()
+                    .find(|attempted| !state.candidates[attempted].onset_proven_absent())
+                {
+                    return Err(gate_error(
+                        chain,
+                        &state,
+                        *blocked,
+                        "the side-effect ledger cannot prove every completed tool operation stayed sandbox-local",
+                        last_failure.as_ref(),
+                    ));
+                }
+                if let Some(refusal) = self
+                    .remote_onset_refusal(shared, chain, &state, &runtime, last_failure.as_ref())
+                    .await
+                {
+                    return Err(refusal);
+                }
+            }
+
+            // A preflight-skipped primary is an "actually executed preflight
+            // transition" the moment a later candidate runs: one event, once.
+            if index > 0 && state.attempted.is_empty() && state.event_ids.is_empty() {
+                let from = chain.primary();
+                if let Some(skip) = &from.preflight_skipped {
+                    let record = TransitionRecord {
+                        kind: TransitionKind::Preflight,
+                        event_id: uuid::Uuid::new_v4().to_string(),
+                        occurred_at_ms: now_epoch_ms(),
+                        visit,
+                        engine_attempt: runtime.engine_attempt,
+                        from_duration_ms: 0,
+                        cause: TransitionCause {
+                            cause:    skip.cause.to_string(),
+                            scope:    skip.scope.to_string(),
+                            hold_key: skip.hold_key.clone(),
+                            source:   "preflight".to_string(),
+                        },
+                        attempted: state.attempted.clone(),
+                        attempted_durations_ms: state.attempted_durations_ms(),
+                        skipped: state.skipped.clone(),
+                        chain_deadline_epoch_ms: state.chain_deadline_epoch_ms,
+                    };
+                    let props = failover_props(chain, from, candidate, &record);
+                    state.event_ids.push(props.event_id.clone());
+                    shared.emitter.emit_scoped(
+                        &Event::AgentAcpFailover {
+                            node_id: node.id.clone(),
+                            props,
+                        },
+                        shared.stage_scope,
+                    );
+                    flush_durable(durable.as_ref()).await;
+                }
+            }
+
+            let now = now_epoch_ms();
+            let timeout = match state.remaining(now) {
+                Some(remaining) if remaining.is_zero() => {
+                    return Err(deadline_error(chain, &state, last_failure.as_ref()));
+                }
+                other => other,
+            };
+            let process_spec = AcpProcessSpec::from_command_attr(&candidate.command)
+                .map_err(acp_process_error_to_workflow)?;
+
+            let ledger: Arc<Mutex<Vec<LedgerEntry>>> = Arc::new(Mutex::new(Vec::new()));
+            let activity = Arc::new(AtomicBool::new(false));
+            let on_permission_observed = self.ledger_permission_observer(
+                shared,
+                index,
+                Arc::clone(&ledger),
+                durable.clone(),
+            );
+            let on_tool_started = self.ledger_tool_started(shared, index, Arc::clone(&ledger));
+
+            state.mark_launched(index);
+            {
+                let record = state.record(index);
+                record.terminal = Some(CandidateTerminal::InFlight);
+                record.ledger.clear();
+                record.turn_started = false;
+                record.gate_passed = false;
+            }
+            let launched_at = std::time::Instant::now();
+            let attempt_prompt = match &recovery_preamble {
+                Some(preamble) => format!("{prompt}\n\n{preamble}"),
+                None => prompt.clone(),
+            };
+            let outcome = self
+                .launch_turn(shared, LaunchSpec {
+                    process_spec,
+                    prompt: attempt_prompt,
+                    timeout,
+                    candidate: Some(CandidateLaunch {
+                        index,
+                        chain_deadline_epoch_ms: state.chain_deadline_epoch_ms,
+                        durable: durable.clone(),
+                    }),
+                    on_permission_observed: Some(on_permission_observed),
+                    on_tool_started: Some(on_tool_started),
+                    activity: Some(Arc::clone(&activity)),
+                })
+                .await;
+            let duration_ms = crate::millis_u64(launched_at.elapsed());
+            let entries = ledger
+                .lock()
+                .expect("ACP fallback ledger lock poisoned")
+                .clone();
+            {
+                let record = state.record(index);
+                record.ledger.extend(entries);
+                record.turn_started = activity.load(Ordering::SeqCst);
+                record.duration_ms = duration_ms;
+            }
+
+            let error = match outcome {
+                Ok(result) => {
+                    state.record(index).terminal = Some(CandidateTerminal::Completed);
+                    return Ok(result);
+                }
+                Err(LaunchFailure::Engine(error)) => {
+                    state.record(index).terminal = Some(CandidateTerminal::Failed);
+                    return Err(terminal_error(&state, error));
+                }
+                Err(LaunchFailure::Acp(error)) => error,
+            };
+            state.record(index).terminal = Some(CandidateTerminal::Failed);
+            let signal = signal_from_acp_error(&error, activity.load(Ordering::SeqCst));
+            match classify(&signal, candidate) {
+                Verdict::NonEligible { reason, .. } => {
+                    tracing::info!(
+                        node_id = %node.id,
+                        candidate = index,
+                        reason = %reason,
+                        "ACP candidate failure is not an availability failure; terminating with its own identity"
+                    );
+                    return Err(terminal_error(&state, acp_error_to_workflow(error)));
+                }
+                Verdict::Eligible(failure) => {
+                    let this_failure = LastFailure {
+                        index,
+                        failure,
+                        display_name: candidate.display_name.clone(),
+                        error,
+                    };
+                    let Some(next_index) = state.next_launchable(chain) else {
+                        last_failure = Some(this_failure);
+                        continue;
+                    };
+                    if !state.candidates[&index].onset_proven_absent() {
+                        return Err(gate_error(
+                            chain,
+                            &state,
+                            index,
+                            "the side-effect ledger cannot prove every completed tool operation stayed sandbox-local",
+                            Some(&this_failure),
+                        ));
+                    }
+                    if let Some(refusal) = self
+                        .remote_onset_refusal(shared, chain, &state, &runtime, Some(&this_failure))
+                        .await
+                    {
+                        return Err(refusal);
+                    }
+                    state.record(index).gate_passed = true;
+                    let next = chain
+                        .candidate(next_index)
+                        .expect("next_launchable returns an index the chain holds");
+                    let record = TransitionRecord {
+                        kind: TransitionKind::Reactive,
+                        event_id: uuid::Uuid::new_v4().to_string(),
+                        occurred_at_ms: now_epoch_ms(),
+                        visit,
+                        engine_attempt: runtime.engine_attempt,
+                        from_duration_ms: duration_ms,
+                        cause: TransitionCause::from(&this_failure.failure),
+                        attempted: state.attempted.clone(),
+                        attempted_durations_ms: state.attempted_durations_ms(),
+                        skipped: state.skipped.clone(),
+                        chain_deadline_epoch_ms: state.chain_deadline_epoch_ms,
+                    };
+                    let props = failover_props(chain, candidate, next, &record);
+                    state.event_ids.push(props.event_id.clone());
+                    state.transitioned = true;
+                    tracing::info!(
+                        node_id = %node.id,
+                        from = index,
+                        to = next_index,
+                        cause = %this_failure.failure.cause,
+                        scope = %this_failure.failure.scope,
+                        "ACP candidate failed on a typed availability condition; advancing to the next candidate in the same node visit"
+                    );
+                    shared.emitter.emit_scoped(
+                        &Event::AgentAcpFailover {
+                            node_id: node.id.clone(),
+                            props,
+                        },
+                        shared.stage_scope,
+                    );
+                    flush_durable(durable.as_ref()).await;
+                    recovery_preamble = state.candidates[&index]
+                        .has_local_work()
+                        .then(|| recovery_preamble_text(candidate));
+                    last_failure = Some(this_failure);
+                }
+            }
+        }
+    }
+
+    /// The publishing node's remote onset probe, when the chain declares one:
+    /// `Some(error)` refuses the transition.
+    async fn remote_onset_refusal(
+        &self,
+        shared: &TurnShared<'_>,
+        chain: &AcpFallbackChain,
+        state: &VisitState,
+        runtime: &ChainRuntime,
+        last: Option<&LastFailure>,
+    ) -> Option<Error> {
+        chain.onset_probe?;
+        let blocked = last.map_or_else(
+            || state.attempted.last().copied().unwrap_or(0),
+            |last| last.index,
+        );
+        match probe_remote_onset(shared, runtime.publish_branch.as_deref()).await {
+            RemoteOnset::Absent => None,
+            RemoteOnset::Observed => Some(gate_error(
+                chain,
+                state,
+                blocked,
+                "the publish branch or its pull request is already present on the remote",
+                last,
+            )),
+            RemoteOnset::Unreadable(detail) => Some(gate_error(
+                chain,
+                state,
+                blocked,
+                &format!(
+                    "the remote could not be observed ({detail}), which counts as already past onset"
+                ),
+                last,
+            )),
+        }
+    }
+
+    /// The visit ran out of candidates: record the typed terminal durably as
+    /// `agent.acp.exhausted`, then report the outcome. With a final eligible
+    /// failure this is the node's non-retryable outcome preserving that
+    /// cause; with nothing ever launchable (every candidate preflight-skipped)
+    /// it terminates the RUN before any adapter, with the skip's typed cause.
+    async fn exhaust(
+        &self,
+        shared: &TurnShared<'_>,
+        chain: &AcpFallbackChain,
+        state: &VisitState,
+        runtime: &ChainRuntime,
+        last: Option<LastFailure>,
+    ) -> Error {
+        let node = shared.node;
+        let visit = shared.stage_scope.visit;
+        let (kind, last_candidate, cause, duration_ms) = match &last {
+            Some(last) => (
+                TransitionKind::Reactive,
+                chain
+                    .candidate(last.index)
+                    .unwrap_or_else(|| chain.primary()),
+                TransitionCause::from(&last.failure),
+                state
+                    .candidates
+                    .get(&last.index)
+                    .map_or(0, |record| record.duration_ms),
+            ),
+            None => {
+                let skip = chain
+                    .candidates
+                    .iter()
+                    .find_map(|candidate| candidate.preflight_skipped.as_ref());
+                (
+                    TransitionKind::Preflight,
+                    chain.primary(),
+                    skip.map_or_else(
+                        || TransitionCause {
+                            cause:    "no_candidate".to_string(),
+                            scope:    SignatureScope::Candidate.to_string(),
+                            hold_key: chain.primary().availability_key.clone(),
+                            source:   "preflight".to_string(),
+                        },
+                        |skip| TransitionCause {
+                            cause:    skip.cause.to_string(),
+                            scope:    skip.scope.to_string(),
+                            hold_key: skip.hold_key.clone(),
+                            source:   "preflight".to_string(),
+                        },
+                    ),
+                    0,
+                )
+            }
+        };
+        let record = TransitionRecord {
+            kind,
+            event_id: uuid::Uuid::new_v4().to_string(),
+            occurred_at_ms: now_epoch_ms(),
+            visit,
+            engine_attempt: runtime.engine_attempt,
+            from_duration_ms: duration_ms,
+            cause,
+            attempted: state.attempted.clone(),
+            attempted_durations_ms: state.attempted_durations_ms(),
+            skipped: state.skipped.clone(),
+            chain_deadline_epoch_ms: state.chain_deadline_epoch_ms,
+        };
+        shared.emitter.emit_scoped(
+            &Event::AgentAcpExhausted {
+                node_id: node.id.clone(),
+                props:   exhausted_props(chain, last_candidate, &record),
+            },
+            shared.stage_scope,
+        );
+        flush_durable(runtime.durable_events.as_ref()).await;
+        exhaustion_error(chain, state, last.as_ref())
+    }
+
+    /// The pre-execution side-effect ledger hook: emits one durable
+    /// `agent.acp.side_effect` entry per permission request and awaits the
+    /// flush barrier BEFORE the permission is answered.
+    fn ledger_permission_observer(
+        &self,
+        shared: &TurnShared<'_>,
+        index: u32,
+        ledger: Arc<Mutex<Vec<LedgerEntry>>>,
+        durable: Option<RunEventLogger>,
+    ) -> AcpPermissionObserver {
+        let emitter = Arc::clone(shared.emitter);
+        let stage_scope = shared.stage_scope.clone();
+        let node_id = shared.node.id.clone();
+        Arc::new(move |question: AcpPermissionQuestion| {
+            let entry = LedgerEntry {
+                tool_call_id:  question.tool_call_id.clone(),
+                tool_kind:     question.kind.clone(),
+                sandbox_local: tool_kind_is_sandbox_local(&question.kind),
+                observed_via:  ObservedVia::Permission.as_str().to_string(),
+            };
+            ledger
+                .lock()
+                .expect("ACP fallback ledger lock poisoned")
+                .push(entry);
+            emitter.emit_scoped(
+                &Event::AgentAcpSideEffect {
+                    node_id: node_id.clone(),
+                    props:   side_effect_props(
+                        stage_scope.visit,
+                        index,
+                        &question.tool_call_id,
+                        &question.kind,
+                        &question.title,
+                        ObservedVia::Permission,
+                    ),
+                },
+                &stage_scope,
+            );
+            let durable = durable.clone();
+            Box::pin(async move {
+                flush_durable(durable.as_ref()).await;
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        })
+    }
+
+    /// The backstop ledger hook for an adapter that starts a tool without
+    /// requesting permission. By then onset may already have happened; the
+    /// entry is recorded (and emitted) so the gate sees it, but it cannot be
+    /// awaited durably before the tool runs.
+    fn ledger_tool_started(
+        &self,
+        shared: &TurnShared<'_>,
+        index: u32,
+        ledger: Arc<Mutex<Vec<LedgerEntry>>>,
+    ) -> ToolStartedHook {
+        let emitter = Arc::clone(shared.emitter);
+        let stage_scope = shared.stage_scope.clone();
+        let node_id = shared.node.id.clone();
+        Arc::new(move |event: &AcpToolEvent| {
+            let AcpToolEvent::Started {
+                tool_call_id,
+                title,
+                kind,
+            } = event
+            else {
+                return;
+            };
+            let mut entries = ledger.lock().expect("ACP fallback ledger lock poisoned");
+            if entries
+                .iter()
+                .any(|entry| entry.tool_call_id == *tool_call_id)
+            {
+                return;
+            }
+            entries.push(LedgerEntry {
+                tool_call_id:  tool_call_id.clone(),
+                tool_kind:     kind.clone(),
+                sandbox_local: tool_kind_is_sandbox_local(kind),
+                observed_via:  ObservedVia::ToolStarted.as_str().to_string(),
+            });
+            drop(entries);
+            emitter.emit_scoped(
+                &Event::AgentAcpSideEffect {
+                    node_id: node_id.clone(),
+                    props:   side_effect_props(
+                        stage_scope.visit,
+                        index,
+                        tool_call_id,
+                        kind,
+                        title,
+                        ObservedVia::ToolStarted,
+                    ),
+                },
+                &stage_scope,
+            );
+        })
+    }
+
+    /// One adapter turn: launch, per-tool events, credential refresh, steering
+    /// activation, and the terminal ACP event. Returns the RAW `AcpError` so a
+    /// chain can classify it; the legacy path maps it with
+    /// `acp_error_to_workflow`.
+    async fn launch_turn(
+        &self,
+        shared: &TurnShared<'_>,
+        launch: LaunchSpec,
+    ) -> Result<CodergenResult, LaunchFailure> {
+        let node = shared.node;
+        let emitter = shared.emitter;
+        let stage_scope = shared.stage_scope;
+        let sandbox = shared.sandbox;
+        let cancel_token = shared.cancel_token.clone();
+        let LaunchSpec {
+            process_spec,
+            prompt,
+            timeout: launch_timeout,
+            candidate,
+            on_permission_observed,
+            on_tool_started,
+            activity,
+        } = launch;
+        let config_name = process_spec.name().map(str::to_string);
+        let on_activity = {
+            let emitter = Arc::clone(emitter);
+            let activity = activity.clone();
+            Arc::new(move || {
+                if let Some(flag) = &activity {
+                    flag.store(true, Ordering::SeqCst);
+                }
+                emitter.touch();
+            }) as Arc<dyn Fn() + Send + Sync>
+        };
+        let command_display = process_spec.to_string();
+        let (candidate_index, chain_deadline_epoch_ms, candidate_durable) = match &candidate {
+            Some(candidate) => (
+                Some(candidate.index),
+                candidate.chain_deadline_epoch_ms,
+                candidate.durable.clone(),
+            ),
+            None => (None, None, None),
+        };
+        emitter.emit_scoped(
+            &Event::AgentAcpStarted {
+                node_id: node.id.clone(),
+                visit: stage_scope.visit,
+                command: command_display.clone(),
+                config_name: config_name.clone(),
+                candidate_index,
+                chain_deadline_epoch_ms,
+            },
+            stage_scope,
+        );
+        // For a chain candidate the started event is the durable "attempted"
+        // marker, and it must be stored BEFORE the process launches so a crash
+        // during the attempt can never replay this candidate on resume.
+        flush_durable(candidate_durable.as_ref()).await;
+
         let control_handle = AcpControlHandle::new();
         let activation_session_id = format!("acp-{}", uuid::Uuid::new_v4());
         // Per-tool progress: every tool call the adapter reports becomes an
@@ -276,7 +881,14 @@ impl AgentAcpBackend {
             let stage_scope = stage_scope.clone();
             let node_id = node.id.clone();
             let session_id = activation_session_id.clone();
+            let activity = activity.clone();
             Arc::new(move |tool_event: AcpToolEvent| {
+                if let Some(flag) = &activity {
+                    flag.store(true, Ordering::SeqCst);
+                }
+                if let Some(hook) = &on_tool_started {
+                    hook(&tool_event);
+                }
                 let (tool_call_id, event) = tool_event_to_agent_event(tool_event);
                 emitter.emit_scoped(
                     &Event::Agent {
@@ -291,14 +903,16 @@ impl AgentAcpBackend {
                 );
             }) as AcpToolEventCallback
         };
-        let activation_lease = self.activate_control_session(
-            &control_handle,
-            &activation_session_id,
-            node,
-            stage_scope,
-            emitter,
-            config_name.as_deref(),
-        )?;
+        let activation_lease = self
+            .activate_control_session(
+                &control_handle,
+                &activation_session_id,
+                node,
+                stage_scope,
+                emitter,
+                config_name.as_deref(),
+            )
+            .map_err(LaunchFailure::Engine)?;
         let lease_for_completion = Arc::new(Mutex::new(activation_lease));
         let on_natural_completion = self.steering_hub.as_ref().map(|_| {
             let lease = Arc::clone(&lease_for_completion);
@@ -408,19 +1022,21 @@ impl AgentAcpBackend {
             command = %command_display,
             config_name = config_name.as_deref().unwrap_or_default(),
             visit = stage_scope.visit,
+            candidate_index = candidate_index.map_or(-1_i64, i64::from),
             stop_reason = field::Empty,
         );
         let result = match fabro_acp::run_acp_turn(AcpRunRequest {
             command: process_spec,
             prompt,
             cwd: sandbox.working_directory().to_string(),
-            timeout_ms: node.timeout().map(crate::millis_u64),
-            env: launch_env,
+            timeout_ms: launch_timeout.map(crate::millis_u64),
+            env: shared.launch_env.clone(),
             sandbox: Arc::clone(sandbox),
             cancel_token: cancel_token.child_token(),
             on_activity: Some(on_activity),
             on_tool_event: Some(on_tool_event),
-            on_permission_request,
+            on_permission_request: shared.on_permission_request.clone(),
+            on_permission_observed,
             live_control: Some(AcpLiveControl {
                 handle: control_handle.clone(),
                 on_natural_completion,
@@ -456,7 +1072,7 @@ impl AgentAcpBackend {
                     },
                     stage_scope,
                 );
-                return Err(Error::Cancelled);
+                return Err(LaunchFailure::Acp(AcpError::Cancelled));
             }
             Err(AcpError::TimedOut {
                 exec_output_tail,
@@ -487,7 +1103,7 @@ impl AgentAcpBackend {
                     },
                     stage_scope,
                 );
-                return Err(acp_error_to_workflow(AcpError::TimedOut {
+                return Err(LaunchFailure::Acp(AcpError::TimedOut {
                     exec_output_tail,
                     progress,
                 }));
@@ -504,7 +1120,7 @@ impl AgentAcpBackend {
                     },
                     stage_scope,
                 );
-                return Err(acp_error_to_workflow(AcpError::StopReason {
+                return Err(LaunchFailure::Acp(AcpError::StopReason {
                     stop_reason,
                     text,
                 }));
@@ -512,7 +1128,7 @@ impl AgentAcpBackend {
             // Generic transport/protocol failures carry no model stop reason, so
             // `stop_reason` stays empty on the span here (a Honeycomb query cannot
             // assume it is always non-null on a `run_turn` span).
-            Err(error) => return Err(acp_error_to_workflow(error)),
+            Err(error) => return Err(LaunchFailure::Acp(error)),
         };
         // Close the turn span at ACP-turn end. The lease release and git file-diff
         // scan below are post-turn workflow bookkeeping, not part of the turn, so
@@ -637,6 +1253,12 @@ impl CodergenBackend for AgentAcpBackend {
             ));
         }
         let stage_scope = StageScope::for_handler(request.context, &request.node.id);
+        let runtime = ChainRuntime {
+            durable_events: request.durable_events.clone(),
+            run_store:      request.run_store.clone(),
+            publish_branch: request.publish_branch.clone(),
+            engine_attempt: engine_attempt_from_context(request.context, &request.node.id),
+        };
         self.run_turn(
             request.node,
             request.prompt.to_string(),
@@ -645,6 +1267,7 @@ impl CodergenBackend for AgentAcpBackend {
             request.sandbox,
             request.cancel_token,
             request.agent_tool_runtime.question_runtime(),
+            runtime,
         )
         .await
     }
@@ -973,6 +1596,424 @@ fn acp_error_to_workflow(error: AcpError) -> Error {
     }
 }
 
+/// The durability and identity seams the agent handler hands a chain visit.
+/// Every field is optional so a backend constructed directly (unit tests, or a
+/// registry wired without a run) still runs a legacy single-adapter turn.
+#[derive(Clone, Default)]
+pub struct ChainRuntime {
+    /// The store-backed event logger whose `flush().await` is the durability
+    /// barrier every chain write awaits.
+    pub durable_events: Option<RunEventLogger>,
+    /// The run's own event stream, read on visit entry to reconstruct state.
+    pub run_store:      Option<RunStoreHandle>,
+    /// The run's publish branch, for the `pr` node's remote onset probe.
+    pub publish_branch: Option<String>,
+    /// Engine handler attempt within the visit (1-based).
+    pub engine_attempt: u32,
+}
+
+/// What every candidate launch of one visit shares.
+struct TurnShared<'a> {
+    node:                  &'a Node,
+    emitter:               &'a Arc<Emitter>,
+    stage_scope:           &'a StageScope,
+    sandbox:               &'a Arc<dyn Sandbox>,
+    cancel_token:          CancellationToken,
+    launch_env:            HashMap<String, String>,
+    on_permission_request: Option<AcpPermissionResolver>,
+}
+
+/// The chain identity of one launch.
+struct CandidateLaunch {
+    index:                   u32,
+    chain_deadline_epoch_ms: Option<u64>,
+    durable:                 Option<RunEventLogger>,
+}
+
+type ToolStartedHook = Arc<dyn Fn(&AcpToolEvent) + Send + Sync>;
+
+/// One launch of one adapter.
+struct LaunchSpec {
+    process_spec:           AcpProcessSpec,
+    prompt:                 String,
+    timeout:                Option<Duration>,
+    candidate:              Option<CandidateLaunch>,
+    on_permission_observed: Option<AcpPermissionObserver>,
+    on_tool_started:        Option<ToolStartedHook>,
+    activity:               Option<Arc<AtomicBool>>,
+}
+
+/// Why a launch did not produce a result: an engine-side failure (already a
+/// workflow error) or the adapter's own raw error, kept raw so a chain can
+/// classify it.
+enum LaunchFailure {
+    Engine(Error),
+    Acp(AcpError),
+}
+
+impl LaunchFailure {
+    fn into_workflow_error(self) -> Error {
+        match self {
+            Self::Engine(error) => error,
+            Self::Acp(error) => acp_error_to_workflow(error),
+        }
+    }
+}
+
+/// The last eligible failure a chain saw, kept for the exhaustion outcome.
+struct LastFailure {
+    index:        u32,
+    failure:      AvailabilityFailure,
+    display_name: String,
+    error:        AcpError,
+}
+
+/// The remote's answer to the publishing node's onset probe.
+enum RemoteOnset {
+    Absent,
+    Observed,
+    Unreadable(String),
+}
+
+fn now_epoch_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+/// The durability barrier: resolves once every event emitted so far is
+/// written to the run store. A missing logger (a backend with no run) is a
+/// no-op, which the unit tests declare.
+async fn flush_durable(logger: Option<&RunEventLogger>) {
+    if let Some(logger) = logger {
+        logger.flush().await;
+    }
+}
+
+/// Engine handler attempt within the current visit, from the retry counter
+/// the lifecycle records on the context after each attempt.
+pub(crate) fn engine_attempt_from_context(context: &Context, node_id: &str) -> u32 {
+    context
+        .get(&crate::context::keys::acp_attempt_key(node_id))
+        .and_then(|value| value.as_u64())
+        .and_then(|count| u32::try_from(count).ok())
+        .map_or(1, |count| count.saturating_add(1))
+}
+
+/// Reduce one raw adapter error to the three readable fields the classifier
+/// may see, plus the engine-declared class where the engine observed the
+/// mechanism. Nothing else (no run log, no agent text) reaches the signal.
+fn signal_from_acp_error(error: &AcpError, turn_started: bool) -> FailureSignal {
+    let original_identity = error.to_string();
+    match error {
+        AcpError::Cancelled => FailureSignal {
+            original_identity,
+            turn_started,
+            declared_class: Some(DeclaredClass::Cancellation),
+            ..FailureSignal::default()
+        },
+        AcpError::TimedOut { .. } => FailureSignal {
+            original_identity,
+            turn_started,
+            declared_class: Some(DeclaredClass::NodeDeadline),
+            ..FailureSignal::default()
+        },
+        AcpError::PermissionTimedOut { .. } => FailureSignal {
+            original_identity,
+            turn_started,
+            declared_class: Some(DeclaredClass::Other),
+            ..FailureSignal::default()
+        },
+        AcpError::BackgroundedTool { .. } => FailureSignal {
+            original_identity,
+            turn_started,
+            declared_class: Some(DeclaredClass::CodeTestReviewOrToolFailure),
+            ..FailureSignal::default()
+        },
+        AcpError::Command(_) => FailureSignal {
+            original_identity,
+            turn_started,
+            declared_class: Some(DeclaredClass::MalformedConfiguration),
+            ..FailureSignal::default()
+        },
+        AcpError::Sandbox(_) | AcpError::Cleanup(_) => FailureSignal {
+            original_identity,
+            turn_started,
+            declared_class: Some(DeclaredClass::UnattributedSandboxOrTransport),
+            ..FailureSignal::default()
+        },
+        // A model stop reason is the model finishing its turn its own way,
+        // never a provider availability condition: no readable field, so the
+        // classifier reports it unmatched with its own identity.
+        AcpError::StopReason { .. } => FailureSignal {
+            original_identity,
+            turn_started: true,
+            ..FailureSignal::default()
+        },
+        AcpError::ProcessExited(exit) => {
+            let mut diagnostic = String::new();
+            if let Some(tail) = &exit.exec_output_tail {
+                if let Some(stderr) = &tail.stderr {
+                    diagnostic.push_str(stderr);
+                }
+                if let Some(stdout) = &tail.stdout {
+                    if !diagnostic.is_empty() {
+                        diagnostic.push('\n');
+                    }
+                    diagnostic.push_str(stdout);
+                }
+            }
+            FailureSignal {
+                original_identity,
+                terminal_diagnostic: (!diagnostic.trim().is_empty()).then_some(diagnostic),
+                exit_code: exit.exit_code.map(i64::from),
+                turn_started,
+                ..FailureSignal::default()
+            }
+        }
+        AcpError::Protocol(protocol) => {
+            let machine_code = protocol.data.as_ref().and_then(|data| {
+                data.get("code")
+                    .or_else(|| data.get("type"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
+            let mut message = protocol.message.clone();
+            if let Some(data) = &protocol.data {
+                message.push(' ');
+                message.push_str(&data.to_string());
+            }
+            FailureSignal {
+                original_identity,
+                machine_code,
+                protocol_message: (!message.trim().is_empty()).then_some(message),
+                turn_started,
+                ..FailureSignal::default()
+            }
+        }
+    }
+}
+
+/// The failure category an exhausted chain reports, following the final
+/// typed cause: an allowance is a budget, a capacity or server condition is
+/// transient infrastructure, and a model that is gone is deterministic.
+fn exhaustion_category(cause: SignatureCause) -> FailureCategory {
+    match cause {
+        SignatureCause::Quota => FailureCategory::BudgetExhausted,
+        SignatureCause::RateLimit
+        | SignatureCause::ProviderCapacity
+        | SignatureCause::ProviderServerUnavailable => FailureCategory::TransientInfra,
+        SignatureCause::ModelNotEntitled
+        | SignatureCause::ModelNotFound
+        | SignatureCause::ModelUnavailable
+        | SignatureCause::ModelUnsupported => FailureCategory::Deterministic,
+    }
+}
+
+/// After the first reactive transition the node visit is non-retryable:
+/// neither an outer retry nor a resume may replay an attempted candidate.
+fn terminal_error(state: &VisitState, error: Error) -> Error {
+    if state.transitioned || state.attempted.len() > 1 {
+        error.into_non_retryable()
+    } else {
+        error
+    }
+}
+
+fn attempted_names(chain: &AcpFallbackChain, state: &VisitState) -> String {
+    state
+        .attempted
+        .iter()
+        .filter_map(|index| chain.candidate(*index))
+        .map(|candidate| format!("{} ({})", candidate.display_name, candidate.candidate_index))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The typed, non-retryable outcome of a chain with nothing left to try,
+/// preserving the final cause.
+fn exhaustion_error(
+    chain: &AcpFallbackChain,
+    state: &VisitState,
+    last: Option<&LastFailure>,
+) -> Error {
+    match last {
+        Some(last) => Error::handler_non_retryable(
+            format!(
+                "ACP fallback chain exhausted for node {}: {} candidate(s) attempted [{}]; final typed cause {} ({}) from {}: {}",
+                state_node_label(chain, state),
+                state.attempted.len(),
+                attempted_names(chain, state),
+                last.failure.cause,
+                last.failure.scope,
+                last.display_name,
+                last.error
+            ),
+            exhaustion_category(last.failure.cause),
+            last.error.exec_output_tail(),
+            Some(anyhow::anyhow!("{}", last.error)),
+        ),
+        None => {
+            // Nothing was ever launchable: every candidate was preflight
+            // skipped. A reached conditional node terminates the RUN, typed,
+            // before any adapter, with the availability cause the skip
+            // recorded; it never traverses a continuation or failure edge.
+            let skip = chain
+                .candidates
+                .iter()
+                .find_map(|candidate| candidate.preflight_skipped.as_ref());
+            let (cause_text, category) = skip.map_or(
+                ("no candidate".to_string(), FailureCategory::Deterministic),
+                |skip| {
+                    (
+                        format!("{} ({})", skip.cause, skip.scope),
+                        exhaustion_category(skip.cause),
+                    )
+                },
+            );
+            Error::TerminateRun {
+                message:       format!(
+                    "ACP fallback chain for node {} has no launchable candidate: every candidate was skipped by preflight; typed availability cause {cause_text}",
+                    state_node_label(chain, state)
+                ),
+                failure_class: category,
+            }
+        }
+    }
+}
+
+/// Parse a ratified cause name back into its enum, for a durable record.
+fn cause_from_str(cause: &str) -> Option<SignatureCause> {
+    serde_json::from_value(serde_json::Value::String(cause.to_string())).ok()
+}
+
+fn state_node_label(chain: &AcpFallbackChain, state: &VisitState) -> String {
+    format!(
+        "visit {} (primary {})",
+        state.visit,
+        chain.primary().display_name
+    )
+}
+
+/// The node's original deadline passed before the next candidate could
+/// start: the timeout identity, non-retryable once a transition happened.
+fn deadline_error(
+    chain: &AcpFallbackChain,
+    state: &VisitState,
+    last: Option<&LastFailure>,
+) -> Error {
+    let error = Error::handler(format!(
+        "ACP fallback chain node deadline exceeded for {} before the next candidate could start; attempted [{}]{}",
+        state_node_label(chain, state),
+        attempted_names(chain, state),
+        last.map_or(String::new(), |last| format!(
+            "; last failure: {}",
+            last.error
+        ))
+    ));
+    terminal_error(state, error)
+}
+
+/// The side-effect gate refused a transition: the failure keeps its original
+/// identity and the reason the gate closed is named.
+fn gate_error(
+    chain: &AcpFallbackChain,
+    state: &VisitState,
+    blocked: u32,
+    why: &str,
+    last: Option<&LastFailure>,
+) -> Error {
+    let blocked_name = chain.candidate(blocked).map_or_else(
+        || blocked.to_string(),
+        |candidate| candidate.display_name.clone(),
+    );
+    let identity = last.map_or_else(String::new, |last| {
+        format!("; original failure: {}", last.error)
+    });
+    let error = Error::handler_with_exec_output_tail(
+        format!(
+            "ACP fallback refused for {} after candidate {blocked_name}: {why}{identity}",
+            state_node_label(chain, state)
+        ),
+        last.and_then(|last| last.error.exec_output_tail()),
+    );
+    terminal_error(state, error)
+}
+
+/// The delimited recovery preamble a successor receives when its predecessor
+/// performed only sandbox-local work before failing.
+fn recovery_preamble_text(candidate: &AcpChainCandidate) -> String {
+    format!(
+        "<<<FABRO_ACP_FALLBACK_RECOVERY>>>\nA previous attempt at this task by \"{}\" (chain candidate {}) was interrupted by a provider availability failure after performing only sandbox-local file operations. Inspect the current working tree before continuing; do not assume any earlier step completed.\n<<<END_FABRO_ACP_FALLBACK_RECOVERY>>>",
+        candidate.display_name, candidate.candidate_index
+    )
+}
+
+const ONSET_PROBE_TIMEOUT_MS: u64 = 60_000;
+
+/// For a publishing node: does the remote already show the publish branch or
+/// its pull request? Anything that cannot be observed counts as past onset.
+async fn probe_remote_onset(shared: &TurnShared<'_>, branch: Option<&str>) -> RemoteOnset {
+    let Some(branch) = branch.filter(|branch| !branch.trim().is_empty()) else {
+        return RemoteOnset::Unreadable("no publish branch is known for this run".to_string());
+    };
+    let quoted = shell_quote(branch);
+    let cwd = shared.sandbox.working_directory().to_string();
+    let branch_probe = shared
+        .sandbox
+        .exec_command(
+            &format!("git ls-remote --exit-code --heads origin {quoted}"),
+            ONSET_PROBE_TIMEOUT_MS,
+            Some(&cwd),
+            Some(&shared.launch_env),
+            Some(shared.cancel_token.child_token()),
+        )
+        .await;
+    match branch_probe {
+        Ok(result) if result.exit_code == Some(0) => return RemoteOnset::Observed,
+        Ok(result) if result.exit_code == Some(2) => {}
+        Ok(result) => {
+            return RemoteOnset::Unreadable(format!(
+                "git ls-remote exited {:?} ({})",
+                result.exit_code, result.termination
+            ));
+        }
+        Err(err) => {
+            return RemoteOnset::Unreadable(format!("git ls-remote could not run: {err}"));
+        }
+    }
+    let pr_probe = shared
+        .sandbox
+        .exec_command(
+            &format!("gh pr list --head {quoted} --state all --json number --limit 1"),
+            ONSET_PROBE_TIMEOUT_MS,
+            Some(&cwd),
+            Some(&shared.launch_env),
+            Some(shared.cancel_token.child_token()),
+        )
+        .await;
+    match pr_probe {
+        Ok(result) if result.exit_code == Some(0) => {
+            match serde_json::from_str::<serde_json::Value>(result.stdout.trim()) {
+                Ok(serde_json::Value::Array(items)) if items.is_empty() => RemoteOnset::Absent,
+                Ok(serde_json::Value::Array(_)) => RemoteOnset::Observed,
+                _ => {
+                    RemoteOnset::Unreadable("gh pr list returned an unreadable answer".to_string())
+                }
+            }
+        }
+        Ok(result) => RemoteOnset::Unreadable(format!(
+            "gh pr list exited {:?} ({})",
+            result.exit_code, result.termination
+        )),
+        Err(err) => RemoteOnset::Unreadable(format!("gh pr list could not run: {err}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1097,6 +2138,9 @@ mod tests {
                 tool_hooks:         None,
                 cancel_token:       CancellationToken::new(),
                 agent_tool_runtime: fabro_agent::AgentToolRuntime::default(),
+                durable_events:     None,
+                run_store:          None,
+                publish_branch:     None,
             })
             .await
             .unwrap();
@@ -1145,6 +2189,9 @@ mod tests {
                 tool_hooks:         None,
                 cancel_token:       CancellationToken::new(),
                 agent_tool_runtime: fabro_agent::AgentToolRuntime::default(),
+                durable_events:     None,
+                run_store:          None,
+                publish_branch:     None,
             })
             .await;
 
@@ -1215,6 +2262,9 @@ mod tests {
                 tool_hooks:         None,
                 cancel_token:       CancellationToken::new(),
                 agent_tool_runtime: fabro_agent::AgentToolRuntime::default(),
+                durable_events:     None,
+                run_store:          None,
+                publish_branch:     None,
             })
             .await
             .unwrap();
@@ -1263,6 +2313,9 @@ mod tests {
                 tool_hooks:         None,
                 cancel_token:       CancellationToken::new(),
                 agent_tool_runtime: fabro_agent::AgentToolRuntime::default(),
+                durable_events:     None,
+                run_store:          None,
+                publish_branch:     None,
             })
             .await
             .unwrap();
@@ -1302,6 +2355,9 @@ mod tests {
                 tool_hooks:         None,
                 cancel_token:       CancellationToken::new(),
                 agent_tool_runtime: fabro_agent::AgentToolRuntime::default(),
+                durable_events:     None,
+                run_store:          None,
+                publish_branch:     None,
             })
             .await;
         assert!(result.is_err());
@@ -1352,6 +2408,9 @@ mod tests {
                 tool_hooks:         None,
                 cancel_token:       CancellationToken::new(),
                 agent_tool_runtime: fabro_agent::AgentToolRuntime::default(),
+                durable_events:     None,
+                run_store:          None,
+                publish_branch:     None,
             })
             .await;
         let Err(err) = result else {
@@ -1406,6 +2465,9 @@ mod tests {
                 tool_hooks:         None,
                 cancel_token:       CancellationToken::new(),
                 agent_tool_runtime: fabro_agent::AgentToolRuntime::default(),
+                durable_events:     None,
+                run_store:          None,
+                publish_branch:     None,
             })
             .await
             .unwrap();
@@ -1448,6 +2510,9 @@ mod tests {
                 tool_hooks:         None,
                 cancel_token:       CancellationToken::new(),
                 agent_tool_runtime: fabro_agent::AgentToolRuntime::default(),
+                durable_events:     None,
+                run_store:          None,
+                publish_branch:     None,
             })
             .await;
         let Err(err) = result else {
@@ -1501,6 +2566,9 @@ mod tests {
                 tool_hooks:         None,
                 cancel_token:       CancellationToken::new(),
                 agent_tool_runtime: fabro_agent::AgentToolRuntime::default(),
+                durable_events:     None,
+                run_store:          None,
+                publish_branch:     None,
             })
             .await;
         let Err(err) = result else {
@@ -1694,6 +2762,9 @@ mod tests {
                 tool_hooks:         None,
                 cancel_token:       CancellationToken::new(),
                 agent_tool_runtime: fabro_agent::AgentToolRuntime::default(),
+                durable_events:     None,
+                run_store:          None,
+                publish_branch:     None,
             })
             .await
             .unwrap();
@@ -1781,6 +2852,9 @@ mod tests {
                 tool_hooks:         None,
                 cancel_token:       CancellationToken::new(),
                 agent_tool_runtime: fabro_agent::AgentToolRuntime::default(),
+                durable_events:     None,
+                run_store:          None,
+                publish_branch:     None,
             })
             .await;
         assert!(

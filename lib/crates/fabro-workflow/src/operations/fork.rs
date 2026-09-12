@@ -333,9 +333,11 @@ mod tests {
     fn fork_replay_preserves_agent_acp_projection_events() {
         assert!(replay_event_for_fork_projection(
             &EventBody::AgentAcpStarted(fabro_types::run_event::AgentAcpStartedProps {
-                visit:       1,
-                command:     "python fake_agent.py".to_string(),
-                config_name: Some("fake".to_string()),
+                visit:                   1,
+                command:                 "python fake_agent.py".to_string(),
+                config_name:             Some("fake".to_string()),
+                candidate_index:         None,
+                chain_deadline_epoch_ms: None,
             })
         ));
         assert!(replay_event_for_fork_projection(

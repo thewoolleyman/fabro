@@ -693,11 +693,17 @@ pub enum Event {
         visit:   Option<u32>,
     },
     AgentAcpStarted {
-        node_id:     String,
-        visit:       u32,
-        command:     String,
+        node_id:                 String,
+        visit:                   u32,
+        command:                 String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        config_name: Option<String>,
+        config_name:             Option<String>,
+        /// Chain position when the node carries an ACP fallback chain.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        candidate_index:         Option<u32>,
+        /// The visit's original deadline shared by every chain candidate.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chain_deadline_epoch_ms: Option<u64>,
     },
     AgentAcpCompleted {
         node_id:     String,
@@ -720,6 +726,23 @@ pub enum Event {
         tool_call_count:  u64,
         update_count:     u64,
         last_activity_ms: Option<u64>,
+    },
+    /// One candidate-to-candidate transition of an ACP node's fallback chain.
+    /// The props are already the redacted wire body; see
+    /// `AgentAcpFailoverProps`.
+    AgentAcpFailover {
+        node_id: String,
+        props:   fabro_types::AgentAcpFailoverProps,
+    },
+    /// One durable side-effect ledger entry of an ACP fallback candidate.
+    AgentAcpSideEffect {
+        node_id: String,
+        props:   fabro_types::AgentAcpSideEffectProps,
+    },
+    /// The typed terminal record of an exhausted ACP fallback chain.
+    AgentAcpExhausted {
+        node_id: String,
+        props:   fabro_types::AgentAcpExhaustedProps,
     },
     PullRequestCreated {
         pr_url:      String,
@@ -1535,6 +1558,35 @@ impl Event {
                 ..
             } => {
                 debug!(node_id, duration_ms, "Agent ACP timed out");
+            }
+            Self::AgentAcpExhausted { node_id, props } => {
+                info!(
+                    node_id,
+                    candidate = props.candidate_index,
+                    cause = %props.cause,
+                    scope = %props.scope,
+                    "Agent ACP fallback chain exhausted"
+                );
+            }
+            Self::AgentAcpSideEffect { node_id, props } => {
+                debug!(
+                    node_id,
+                    candidate = props.candidate_index,
+                    tool_kind = %props.tool_kind,
+                    classification = %props.classification,
+                    "Agent ACP side-effect ledger entry"
+                );
+            }
+            Self::AgentAcpFailover { node_id, props } => {
+                info!(
+                    node_id,
+                    transition = %props.transition,
+                    from = props.from_candidate_index,
+                    to = props.to_candidate_index,
+                    cause = %props.cause,
+                    scope = %props.scope,
+                    "Agent ACP failover"
+                );
             }
             Self::PullRequestCreated {
                 pr_url,
