@@ -10842,8 +10842,11 @@ async fn worker_started_child_run_requires_approval_before_becoming_runnable() {
     assert_eq!(info_body["runs"]["scheduler_slots_used"], 0);
     assert_eq!(
         info_body["capabilities"],
-        json!([fabro_types::capabilities::ACP_FALLBACK_CHAIN_CAPABILITY]),
-        "system info must advertise the ACP fallback chain capability explicitly"
+        json!([
+            fabro_types::capabilities::ACP_FALLBACK_CHAIN_CAPABILITY,
+            fabro_types::capabilities::ACP_CANDIDATE_CONFIG_OPTIONS_CAPABILITY
+        ]),
+        "system info must advertise the ACP fallback chain and candidate config-option capabilities explicitly"
     );
 
     {
@@ -11870,6 +11873,8 @@ async fn steer_with_active_acp_session_forwards_to_worker() {
         config_name:             None,
         candidate_index:         None,
         chain_deadline_epoch_ms: None,
+        model:                   None,
+        effort:                  None,
     });
     update_live_run_from_event(&state, run_id, &started);
     let activated =
@@ -11975,6 +11980,8 @@ async fn active_acp_steerable_marker_clears_on_terminal_paths() {
             config_name:             None,
             candidate_index:         None,
             chain_deadline_epoch_ms: None,
+            model:                   None,
+            effort:                  None,
         });
         update_live_run_from_event(&state, run_id, &started);
         let activated =

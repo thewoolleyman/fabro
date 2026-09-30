@@ -454,3 +454,191 @@ async fn legacy_node_without_a_chain_carries_no_candidate_fields() {
     let map: HashMap<String, usize> = HashMap::new();
     assert!(map.is_empty());
 }
+
+/// The fake agent's `ACP_CONFIG_OPTIONS` advertisement: a model select with
+/// `m1` current and `m1`/`m2` offered, and an effort select with `low`
+/// current and `low`/`high` offered.
+fn advertised_model_and_effort() -> String {
+    serde_json::json!([
+        {"id": "model", "current": "m1", "values": ["m1", "m2"]},
+        {"id": "effort", "current": "low", "values": ["low", "high"]}
+    ])
+    .to_string()
+}
+
+fn candidate_with_options(
+    index: u32,
+    key: &str,
+    command: &str,
+    options: serde_json::Value,
+) -> serde_json::Value {
+    let mut value = candidate(index, key, command, &[]);
+    value["config_options"] = options;
+    value
+}
+
+impl Harness {
+    fn started_props(&self) -> Vec<fabro_types::run_event::AgentAcpStartedProps> {
+        self.events()
+            .into_iter()
+            .filter_map(|event| match event.body {
+                EventBody::AgentAcpStarted(props) => Some(props),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn config_options_are_set_before_the_first_prompt_and_confirmed_on_started() {
+    let h = Harness::new().await;
+    let set_record = h.tempdir.path().join("set-config.txt");
+    let prompt_record = h.tempdir.path().join("prompt.json");
+    let advertised = advertised_model_and_effort();
+    let primary = h.command("write_file", &[
+        ("ACP_CONFIG_OPTIONS", advertised.as_str()),
+        ("ACP_SET_CONFIG_RECORD", &set_record.to_string_lossy()),
+        ("ACP_PROMPT_RECORD", &prompt_record.to_string_lossy()),
+    ]);
+    let node = Harness::node(
+        &primary,
+        Some(chain(&[candidate_with_options(
+            0,
+            "codex",
+            &primary,
+            serde_json::json!({"model": "m2", "effort": "high"}),
+        )])),
+    );
+    let CodergenResult::Text { text, .. } = h.run(&node).await.unwrap() else {
+        panic!("expected text result");
+    };
+    assert_eq!(text, "hello from acp");
+    assert_eq!(
+        std::fs::read_to_string(&set_record).unwrap(),
+        "model=m2\neffort=high\n",
+        "every requested option is set through session/set_config_option, model first"
+    );
+    assert!(
+        prompt_record.exists(),
+        "the prompt runs once every option is confirmed"
+    );
+    let started = h.started_props();
+    assert_eq!(started.len(), 1, "one started event for the one candidate");
+    assert_eq!(started[0].candidate_index, Some(0));
+    assert_eq!(started[0].model.as_deref(), Some("m2"));
+    assert_eq!(started[0].effort.as_deref(), Some("high"));
+    assert!(h.failovers().is_empty());
+}
+
+#[tokio::test]
+async fn unadvertised_model_refuses_before_any_prompt_as_model_unsupported_without_fallback() {
+    let h = Harness::new().await;
+    let prompt_record = h.tempdir.path().join("prompt.json");
+    let advertised = advertised_model_and_effort();
+    let primary = h.command("write_file", &[
+        ("ACP_CONFIG_OPTIONS", advertised.as_str()),
+        ("ACP_PROMPT_RECORD", &prompt_record.to_string_lossy()),
+    ]);
+    let fallback = h.command("write_file", &[]);
+    let node = Harness::node(
+        &primary,
+        Some(chain(&[
+            candidate_with_options(0, "codex", &primary, serde_json::json!({"model": "m9"})),
+            candidate(1, "anthropic", &fallback, &[]),
+        ])),
+    );
+    let err = expect_err(h.run(&node).await);
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("model_unsupported (candidate)"),
+        "the refusal is typed model_unsupported at candidate scope: {rendered}"
+    );
+    assert!(
+        rendered.contains("model=m9"),
+        "the refusal names the option it refused: {rendered}"
+    );
+    assert!(
+        !matches!(err, Error::Validation(_)),
+        "a run-time advertisement mismatch is not a chain validation error: {err:?}"
+    );
+    assert!(
+        !prompt_record.exists(),
+        "no prompt may be sent to a candidate whose model was refused"
+    );
+    assert!(
+        h.failovers().is_empty(),
+        "a pre-turn refusal never triggers reactive fallback"
+    );
+    assert!(
+        h.started_indexes().is_empty(),
+        "a candidate refused before its prompt never records a started event"
+    );
+}
+
+#[tokio::test]
+async fn unadvertised_effort_refuses_before_any_prompt_as_malformed_configuration() {
+    let h = Harness::new().await;
+    let set_record = h.tempdir.path().join("set-config.txt");
+    let prompt_record = h.tempdir.path().join("prompt.json");
+    let advertised = serde_json::json!([
+        {"id": "model", "current": "m1", "values": ["m1", "m2"]}
+    ])
+    .to_string();
+    let primary = h.command("write_file", &[
+        ("ACP_CONFIG_OPTIONS", advertised.as_str()),
+        ("ACP_SET_CONFIG_RECORD", &set_record.to_string_lossy()),
+        ("ACP_PROMPT_RECORD", &prompt_record.to_string_lossy()),
+    ]);
+    let node = Harness::node(
+        &primary,
+        Some(chain(&[candidate_with_options(
+            0,
+            "codex",
+            &primary,
+            serde_json::json!({"model": "m2", "effort": "high"}),
+        )])),
+    );
+    let err = expect_err(h.run(&node).await);
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("malformed_configuration"),
+        "an unadvertised non-model option is a malformed configuration: {rendered}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&set_record).unwrap(),
+        "model=m2\n",
+        "the model was set before the effort was found unadvertised"
+    );
+    assert!(!prompt_record.exists(), "no prompt after a refusal");
+    assert!(h.failovers().is_empty());
+    assert!(h.started_indexes().is_empty());
+}
+
+#[tokio::test]
+async fn an_option_the_agent_acknowledges_but_never_applies_is_not_confirmed() {
+    let h = Harness::new().await;
+    let prompt_record = h.tempdir.path().join("prompt.json");
+    let advertised = advertised_model_and_effort();
+    let primary = h.command("write_file", &[
+        ("ACP_CONFIG_OPTIONS", advertised.as_str()),
+        ("ACP_CONFIG_IGNORE_SET", "model"),
+        ("ACP_PROMPT_RECORD", &prompt_record.to_string_lossy()),
+    ]);
+    let node = Harness::node(
+        &primary,
+        Some(chain(&[candidate_with_options(
+            0,
+            "codex",
+            &primary,
+            serde_json::json!({"model": "m2"}),
+        )])),
+    );
+    let err = expect_err(h.run(&node).await);
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("not_confirmed") && rendered.contains("model_unsupported (candidate)"),
+        "an unconfirmed model is refused as model_unsupported: {rendered}"
+    );
+    assert!(!prompt_record.exists(), "the prompt waits for confirmation");
+    assert!(h.started_indexes().is_empty());
+}

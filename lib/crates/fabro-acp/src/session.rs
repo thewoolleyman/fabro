@@ -5,10 +5,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agent_client_protocol::schema::{
-    CancelNotification, ContentBlock, ContentChunk, InitializeRequest, PermissionOptionKind,
-    ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason, ToolCallStatus,
-    ToolKind,
+    CancelNotification, ContentBlock, ContentChunk, InitializeRequest, NewSessionRequest,
+    PermissionOptionKind, ProtocolVersion, RequestPermissionOutcome, RequestPermissionRequest,
+    RequestPermissionResponse, SelectedPermissionOutcome, SessionConfigId, SessionConfigKind,
+    SessionConfigOption, SessionConfigSelectOptions, SessionConfigValueId, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, StopReason, ToolCallStatus, ToolKind,
 };
 use agent_client_protocol::util::{MatchDispatch, internal_error};
 use agent_client_protocol::{ActiveSession, Agent, Client, Error as ProtocolError, SessionMessage};
@@ -21,7 +22,7 @@ use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::command::AcpProcessSpec;
-use crate::error::AcpError;
+use crate::error::{AcpError, ConfigOptionRefusal};
 use crate::transport::{SandboxAcpTransport, TransportState};
 
 pub type AcpNaturalCompletionCallback = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -49,6 +50,88 @@ pub enum AcpToolEvent {
 }
 
 pub type AcpToolEventCallback = Arc<dyn Fn(AcpToolEvent) + Send + Sync>;
+
+/// Session config options a candidate asks the agent to set BEFORE its first
+/// prompt, in application order: `(option id, requested value id)`. Empty for
+/// a legacy adapter, which sends no `session/set_config_option` at all.
+pub type AcpConfigOptionRequests = Vec<(String, String)>;
+
+/// What the agent confirmed once every requested option was set: the same
+/// `(option id, value id)` pairs, read back from the agent's own
+/// `configOptions` after each `session/set_config_option` rather than echoed
+/// from the request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AcpSessionConfigured {
+    pub confirmed: Vec<(String, String)>,
+}
+
+/// Awaited once the session exists and every requested option is confirmed,
+/// and BEFORE the first prompt is sent: the seam that lets a caller record
+/// the confirmed configuration durably before the agent can do any work.
+pub type AcpSessionConfiguredHook =
+    Arc<dyn Fn(AcpSessionConfigured) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+/// Check one requested option against the agent's `configOptions`
+/// advertisement: the option id must be advertised, and the requested value
+/// must be among the values the option offers. Pure; the caller decides what
+/// a refusal means for the candidate.
+///
+/// # Errors
+///
+/// [`ConfigOptionRefusal::OptionNotAdvertised`] when no advertised option
+/// carries `option_id`; [`ConfigOptionRefusal::ValueNotOffered`] when the
+/// option exists but `requested` is not one of its offered values (a kind
+/// this build cannot enumerate offers nothing).
+pub fn check_config_option(
+    advertised: &[SessionConfigOption],
+    option_id: &str,
+    requested: &str,
+) -> Result<(), ConfigOptionRefusal> {
+    let Some(option) = advertised
+        .iter()
+        .find(|option| option.id.0.as_ref() == option_id)
+    else {
+        return Err(ConfigOptionRefusal::OptionNotAdvertised);
+    };
+    let offered = match &option.kind {
+        SessionConfigKind::Select(select) => match &select.options {
+            SessionConfigSelectOptions::Ungrouped(options) => options
+                .iter()
+                .any(|option| option.value.0.as_ref() == requested),
+            SessionConfigSelectOptions::Grouped(groups) => groups
+                .iter()
+                .flat_map(|group| group.options.iter())
+                .any(|option| option.value.0.as_ref() == requested),
+            _ => false,
+        },
+        _ => false,
+    };
+    if offered {
+        Ok(())
+    } else {
+        Err(ConfigOptionRefusal::ValueNotOffered)
+    }
+}
+
+/// The value the agent reports CURRENT for `option_id`, when it advertises
+/// the option with a kind whose current value this build can read.
+#[must_use]
+pub fn current_config_value(advertised: &[SessionConfigOption], option_id: &str) -> Option<String> {
+    let option = advertised
+        .iter()
+        .find(|option| option.id.0.as_ref() == option_id)?;
+    match &option.kind {
+        SessionConfigKind::Select(select) => Some(select.current_value.0.to_string()),
+        _ => None,
+    }
+}
+
+fn advertised_option_ids(advertised: &[SessionConfigOption]) -> Vec<String> {
+    advertised
+        .iter()
+        .map(|option| option.id.0.to_string())
+        .collect()
+}
 
 /// Upper bound on the tool title carried in an [`AcpToolEvent`].
 pub const TOOL_TITLE_MAX_BYTES: usize = 200;
@@ -599,6 +682,14 @@ pub struct AcpRunRequest {
     /// either policy. See [`AcpPermissionObserver`].
     pub on_permission_observed: Option<AcpPermissionObserver>,
     pub live_control:           Option<AcpLiveControl>,
+    /// Session config options to set through `session/set_config_option`
+    /// after `session/new` and before the first `session/prompt`, in order.
+    /// A refusal on any of them ends the turn as
+    /// [`AcpError::ConfigOptionRefused`] before the prompt is sent.
+    pub config_options:         AcpConfigOptionRequests,
+    /// Awaited between the last confirmation and the first prompt. See
+    /// [`AcpSessionConfiguredHook`].
+    pub on_session_configured:  Option<AcpSessionConfiguredHook>,
 }
 
 #[derive(Debug)]
@@ -623,6 +714,8 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
         on_permission_request,
         on_permission_observed,
         live_control,
+        config_options,
+        on_session_configured,
     } = request;
     let live_control = live_control.unwrap_or_default();
     let start = std::time::Instant::now();
@@ -644,6 +737,12 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
     // the first teardown ends the turn either way.
     let permission_timeout: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
     let permission_timeout_for_handler = Arc::clone(&permission_timeout);
+    // Set inside the connection task when a requested config option is refused
+    // before the first prompt. The connection closure can only return a
+    // protocol error, so the typed refusal travels through this slot and is
+    // reported ahead of the generic protocol mapping below.
+    let config_refusal: Arc<Mutex<Option<AcpError>>> = Arc::new(Mutex::new(None));
+    let config_refusal_for_session = Arc::clone(&config_refusal);
     let permission_state = state.clone();
     // Each permission is resolved on a detached task (see the handler note). This
     // token is cancelled when `run_acp_turn` returns (via the drop guard), so a
@@ -733,24 +832,71 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
                 .block_task()
                 .await?;
 
-            cx.build_session(&cwd)
+            // The session is created by hand rather than through
+            // `build_session`: `attach_session` keeps only the id, modes and
+            // meta of the `session/new` response, and the `configOptions`
+            // advertisement it drops is exactly what must be read here.
+            let response = cx
+                .send_request(NewSessionRequest::new(std::path::PathBuf::from(&cwd)))
                 .block_task()
-                .run_until(async |mut session| {
-                    session.send_prompt(prompt)?;
-                    read_live_session(
-                        &mut session,
-                        &read_cancel_token,
-                        &live_control.handle,
-                        live_control.on_natural_completion.as_ref(),
-                        live_control.on_steer_prompt.as_ref(),
-                        on_activity.as_ref(),
-                        on_tool_event.as_ref(),
-                        &live_progress,
-                        &live_backgrounded_tool,
-                    )
-                    .await
-                })
-                .await
+                .await?;
+            let session_id = response.session_id.clone();
+            let mut advertised = response.config_options.clone().unwrap_or_default();
+            let mut confirmed: Vec<(String, String)> = Vec::with_capacity(config_options.len());
+            for (option_id, requested) in &config_options {
+                let refuse = |reason: ConfigOptionRefusal, advertised: &[SessionConfigOption]| {
+                    *config_refusal_for_session
+                        .lock()
+                        .expect("ACP config refusal lock poisoned") =
+                        Some(AcpError::ConfigOptionRefused {
+                            option_id:  option_id.clone(),
+                            requested:  requested.clone(),
+                            reason,
+                            advertised: advertised_option_ids(advertised),
+                        });
+                    internal_error(format!(
+                        "session config option {option_id}={requested} refused before the first prompt: {reason}"
+                    ))
+                };
+                if let Err(reason) = check_config_option(&advertised, option_id, requested) {
+                    return Err(refuse(reason, &advertised));
+                }
+                let set = cx
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        session_id.clone(),
+                        SessionConfigId::new(option_id.as_str()),
+                        SessionConfigValueId::new(requested.as_str()),
+                    ))
+                    .block_task()
+                    .await?;
+                advertised = set.config_options;
+                match current_config_value(&advertised, option_id) {
+                    Some(current) if current == *requested => {
+                        confirmed.push((option_id.clone(), current));
+                    }
+                    _ => return Err(refuse(ConfigOptionRefusal::NotConfirmed, &advertised)),
+                }
+            }
+            // Every requested option is confirmed and the prompt has not been
+            // sent: the caller records the configuration durably here.
+            if let Some(hook) = &on_session_configured {
+                hook(AcpSessionConfigured { confirmed }).await;
+            }
+
+            let mut session = cx.attach_session(response, Vec::new())?;
+            session.send_prompt(prompt)?;
+            read_live_session(
+                &mut session,
+                &read_cancel_token,
+                &live_control.handle,
+                live_control.on_natural_completion.as_ref(),
+                live_control.on_steer_prompt.as_ref(),
+                on_activity.as_ref(),
+                on_tool_event.as_ref(),
+                &live_progress,
+                &live_backgrounded_tool,
+            )
+            .await
         });
 
     let cancel_deadline_token = cancel_token.clone();
@@ -820,6 +966,15 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
         }
         Err(error) => {
             terminate_transport(&state).await?;
+            // A pre-prompt config refusal is typed and takes precedence over
+            // the generic protocol error the closure had to return.
+            let refusal = config_refusal
+                .lock()
+                .expect("ACP config refusal lock poisoned")
+                .take();
+            if let Some(refusal) = refusal {
+                return Err(refusal);
+            }
             if let Some(startup_error) = state.take_startup_error().await {
                 return Err(AcpError::Sandbox(startup_error));
             }
@@ -1053,6 +1208,70 @@ mod tests {
 
         serde_json::from_value::<SessionNotification>(notification)
             .expect("Codex ACP usage_update notifications should be ignored, not fatal");
+    }
+}
+
+#[cfg(test)]
+mod config_option_tests {
+    use agent_client_protocol::schema::{SessionConfigOption, SessionConfigSelectOption};
+
+    use super::*;
+
+    fn value(id: &str) -> SessionConfigValueId {
+        SessionConfigValueId::new(id)
+    }
+
+    fn select(id: &str, current: &str, offered: &[&str]) -> SessionConfigOption {
+        SessionConfigOption::select(
+            SessionConfigId::new(id),
+            id,
+            value(current),
+            offered
+                .iter()
+                .map(|offered| SessionConfigSelectOption::new(value(offered), *offered))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn advertised() -> Vec<SessionConfigOption> {
+        vec![
+            select("model", "m1", &["m1", "m2"]),
+            select("effort", "low", &["low", "high"]),
+        ]
+    }
+
+    #[test]
+    fn offered_values_pass_and_the_current_value_is_readable() {
+        let options = advertised();
+        assert_eq!(check_config_option(&options, "model", "m2"), Ok(()));
+        assert_eq!(check_config_option(&options, "effort", "high"), Ok(()));
+        assert_eq!(
+            current_config_value(&options, "model").as_deref(),
+            Some("m1")
+        );
+        assert_eq!(
+            current_config_value(&options, "effort").as_deref(),
+            Some("low")
+        );
+    }
+
+    #[test]
+    fn unadvertised_ids_and_unoffered_values_are_typed_refusals() {
+        let options = advertised();
+        assert_eq!(
+            check_config_option(&options, "temperature", "0.2"),
+            Err(ConfigOptionRefusal::OptionNotAdvertised)
+        );
+        assert_eq!(
+            check_config_option(&options, "model", "m9"),
+            Err(ConfigOptionRefusal::ValueNotOffered)
+        );
+        assert_eq!(current_config_value(&options, "temperature"), None);
+        assert_eq!(
+            check_config_option(&[], "model", "m1"),
+            Err(ConfigOptionRefusal::OptionNotAdvertised),
+            "an agent advertising nothing offers nothing"
+        );
     }
 }
 

@@ -1236,6 +1236,8 @@ fn event_body_from_event(event: &Event) -> EventBody {
             config_name,
             candidate_index,
             chain_deadline_epoch_ms,
+            model,
+            effort,
             ..
         } => EventBody::AgentAcpStarted(fabro_types::AgentAcpStartedProps {
             visit: *visit,
@@ -1243,6 +1245,8 @@ fn event_body_from_event(event: &Event) -> EventBody {
             config_name: config_name.clone(),
             candidate_index: *candidate_index,
             chain_deadline_epoch_ms: *chain_deadline_epoch_ms,
+            model: model.clone(),
+            effort: effort.clone(),
         }),
         Event::AgentAcpCompleted {
             stdout,
@@ -2246,6 +2250,8 @@ mod tests {
                 config_name:             Some("fake".to_string()),
                 candidate_index:         None,
                 chain_deadline_epoch_ms: None,
+                model:                   Some("gpt-5.6".to_string()),
+                effort:                  Some("high".to_string()),
             },
             Utc::now(),
             Some(&scope),

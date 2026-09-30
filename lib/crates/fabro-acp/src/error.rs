@@ -23,6 +23,36 @@ impl std::fmt::Display for AcpProcessExit {
     }
 }
 
+/// Why a requested session config option was refused before the first prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigOptionRefusal {
+    /// The agent's `configOptions` carry no option with the requested id.
+    OptionNotAdvertised,
+    /// The option exists but the requested value is not among its offered
+    /// values.
+    ValueNotOffered,
+    /// `session/set_config_option` answered without reporting the requested
+    /// value current.
+    NotConfirmed,
+}
+
+impl ConfigOptionRefusal {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OptionNotAdvertised => "option_not_advertised",
+            Self::ValueNotOffered => "value_not_offered",
+            Self::NotConfirmed => "not_confirmed",
+        }
+    }
+}
+
+impl std::fmt::Display for ConfigOptionRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AcpError {
     #[error(transparent)]
@@ -71,6 +101,21 @@ pub enum AcpError {
         title:        String,
     },
 
+    /// A requested session config option could not be set BEFORE the first
+    /// prompt: the agent did not advertise the option id, did not offer the
+    /// requested value, or did not report it current after
+    /// `session/set_config_option`. The candidate has done no work, so this
+    /// is a typed pre-turn refusal with its own identity.
+    #[error(
+        "ACP session config option {option_id}={requested} refused before any prompt ({reason}); the agent advertised [{}]",
+        .advertised.join(", ")
+    )]
+    ConfigOptionRefused {
+        option_id:  String,
+        requested:  String,
+        reason:     ConfigOptionRefusal,
+        advertised: Vec<String>,
+    },
     #[error("ACP prompt stopped with {stop_reason}: {text}")]
     StopReason {
         stop_reason: String,

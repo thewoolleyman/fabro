@@ -1924,6 +1924,55 @@ mod tests {
     }
 
     #[test]
+    fn acp_started_round_trips_with_and_without_confirmed_model_and_effort() {
+        // A stored event from before the fields existed reads back with both
+        // absent, and re-serialises byte-identically (no `null` members).
+        let historical = json!({
+            "id": "evt_acp_started_old",
+            "ts": "2026-04-29T12:00:00.000Z",
+            "run_id": fixtures::RUN_1,
+            "node_id": "work",
+            "event": "agent.acp.started",
+            "properties": {"visit": 2, "command": "python fake_agent.py", "candidate_index": 0}
+        });
+        let parsed = RunEvent::from_value(historical.clone()).unwrap();
+        let EventBody::AgentAcpStarted(props) = &parsed.body else {
+            panic!("expected typed ACP started body, got {:?}", parsed.body);
+        };
+        assert_eq!(props.model, None);
+        assert_eq!(props.effort, None);
+        assert_eq!(
+            parsed.to_value().unwrap()["properties"],
+            historical["properties"]
+        );
+
+        let confirmed = json!({
+            "id": "evt_acp_started_new",
+            "ts": "2026-09-30T12:00:00.000Z",
+            "run_id": fixtures::RUN_1,
+            "node_id": "work",
+            "event": "agent.acp.started",
+            "properties": {
+                "visit": 1,
+                "command": "npx agent",
+                "candidate_index": 1,
+                "model": "gpt-5.6",
+                "effort": "high"
+            }
+        });
+        let parsed = RunEvent::from_value(confirmed.clone()).unwrap();
+        let EventBody::AgentAcpStarted(props) = &parsed.body else {
+            panic!("expected typed ACP started body, got {:?}", parsed.body);
+        };
+        assert_eq!(props.model.as_deref(), Some("gpt-5.6"));
+        assert_eq!(props.effort.as_deref(), Some("high"));
+        assert_eq!(
+            parsed.to_value().unwrap()["properties"],
+            confirmed["properties"]
+        );
+    }
+
+    #[test]
     fn other_known_events_still_refuse_an_unparseable_body() {
         let value = json!({
             "id": "evt_bad_started",

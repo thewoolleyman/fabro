@@ -338,6 +338,8 @@ mod tests {
                 config_name:             Some("fake".to_string()),
                 candidate_index:         None,
                 chain_deadline_epoch_ms: None,
+                model:                   None,
+                effort:                  None,
             })
         ));
         assert!(replay_event_for_fork_projection(

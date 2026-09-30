@@ -8,9 +8,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use fabro_acp::{
-    AcpCommandError, AcpControlHandle, AcpError, AcpLiveControl, AcpPermissionAnswer,
-    AcpPermissionObserver, AcpPermissionQuestion, AcpPermissionResolver, AcpProcessSpec,
-    AcpRunRequest, AcpToolEvent, AcpToolEventCallback, render_stop_reason,
+    AcpCommandError, AcpConfigOptionRequests, AcpControlHandle, AcpError, AcpLiveControl,
+    AcpPermissionAnswer, AcpPermissionObserver, AcpPermissionQuestion, AcpPermissionResolver,
+    AcpProcessSpec, AcpRunRequest, AcpSessionConfigured, AcpSessionConfiguredHook, AcpToolEvent,
+    AcpToolEventCallback, render_stop_reason,
 };
 use fabro_agent::{
     AgentEvent, AgentQuestion, AgentQuestionAnswer, AgentQuestionAnswerStatus,
@@ -297,6 +298,7 @@ impl AgentAcpBackend {
                     on_permission_observed: None,
                     on_tool_started: None,
                     activity: None,
+                    config_options: Vec::new(),
                 })
                 .await
                 .map_err(LaunchFailure::into_workflow_error)
@@ -492,6 +494,7 @@ impl AgentAcpBackend {
                     on_permission_observed: Some(on_permission_observed),
                     on_tool_started: Some(on_tool_started),
                     activity: Some(Arc::clone(&activity)),
+                    config_options: candidate.config_option_requests(),
                 })
                 .await;
             let duration_ms = crate::millis_u64(launched_at.elapsed());
@@ -830,6 +833,7 @@ impl AgentAcpBackend {
             on_permission_observed,
             on_tool_started,
             activity,
+            config_options,
         } = launch;
         let config_name = process_spec.name().map(str::to_string);
         let on_activity = {
@@ -851,21 +855,55 @@ impl AgentAcpBackend {
             ),
             None => (None, None, None),
         };
-        emitter.emit_scoped(
-            &Event::AgentAcpStarted {
-                node_id: node.id.clone(),
-                visit: stage_scope.visit,
-                command: command_display.clone(),
-                config_name: config_name.clone(),
-                candidate_index,
-                chain_deadline_epoch_ms,
-            },
-            stage_scope,
-        );
-        // For a chain candidate the started event is the durable "attempted"
-        // marker, and it must be stored BEFORE the process launches so a crash
-        // during the attempt can never replay this candidate on resume.
-        flush_durable(candidate_durable.as_ref()).await;
+        // The started event is the durable "attempted" marker and, since the
+        // in-protocol model and effort selection, the record of what the agent
+        // CONFIRMED it would run. It is therefore emitted from the ACP turn
+        // itself, once `session/new` has answered and every requested config
+        // option is confirmed, and it is flushed BEFORE the first prompt is
+        // sent: the prompt is the first moment the agent can do any work, so
+        // a crash after it can never replay this candidate on resume, while a
+        // crash during session setup legitimately re-launches a candidate
+        // that has done nothing. A pre-prompt refusal emits no started event
+        // at all; the candidate terminates with its own identity.
+        let on_session_configured: AcpSessionConfiguredHook = {
+            let emitter = Arc::clone(emitter);
+            let stage_scope = stage_scope.clone();
+            let node_id = node.id.clone();
+            let command_display = command_display.clone();
+            let config_name = config_name.clone();
+            let candidate_durable = candidate_durable.clone();
+            Arc::new(move |configured: AcpSessionConfigured| {
+                let emitter = Arc::clone(&emitter);
+                let stage_scope = stage_scope.clone();
+                let node_id = node_id.clone();
+                let command = command_display.clone();
+                let config_name = config_name.clone();
+                let candidate_durable = candidate_durable.clone();
+                Box::pin(async move {
+                    let confirmed = |option_id: &str| {
+                        configured
+                            .confirmed
+                            .iter()
+                            .find(|(id, _)| id == option_id)
+                            .map(|(_, value)| value.clone())
+                    };
+                    emitter.emit_scoped(
+                        &Event::AgentAcpStarted {
+                            node_id,
+                            visit: stage_scope.visit,
+                            command,
+                            config_name,
+                            candidate_index,
+                            chain_deadline_epoch_ms,
+                            model: confirmed("model"),
+                            effort: confirmed("effort"),
+                        },
+                        &stage_scope,
+                    );
+                    flush_durable(candidate_durable.as_ref()).await;
+                })
+            })
+        };
 
         let control_handle = AcpControlHandle::new();
         let activation_session_id = format!("acp-{}", uuid::Uuid::new_v4());
@@ -1040,6 +1078,8 @@ impl AgentAcpBackend {
                 on_natural_completion,
                 on_steer_prompt,
             }),
+            config_options,
+            on_session_configured: Some(on_session_configured),
         })
         .instrument(turn_span.clone())
         .await
@@ -1578,6 +1618,30 @@ fn acp_error_to_workflow(error: AcpError) -> Error {
         AcpError::StopReason { stop_reason, text } => {
             Error::handler(format!("ACP prompt stopped with {stop_reason}: {text}"))
         }
+        // Deterministic and non-retryable: the agent's advertisement will not
+        // change between attempts, and the candidate has done no work. The
+        // identity names the typed cause and scope the contract assigns.
+        AcpError::ConfigOptionRefused {
+            option_id,
+            requested,
+            reason,
+            advertised,
+        } => {
+            let cause = if option_id == "model" {
+                "model_unsupported"
+            } else {
+                "malformed_configuration"
+            };
+            Error::handler_non_retryable(
+                format!(
+                    "ACP candidate refused before any prompt: typed cause {cause} (candidate) — session config option {option_id}={requested} {reason}; the agent advertised [{}]",
+                    advertised.join(", ")
+                ),
+                FailureCategory::Deterministic,
+                None,
+                None,
+            )
+        }
         AcpError::Cleanup(source) => Error::Precondition(format!(
             "ACP process cleanup failed; refusing automatic retry: {}",
             fabro_sandbox::display_for_log(&source)
@@ -1639,6 +1703,8 @@ struct LaunchSpec {
     on_permission_observed: Option<AcpPermissionObserver>,
     on_tool_started:        Option<ToolStartedHook>,
     activity:               Option<Arc<AtomicBool>>,
+    /// In-protocol session config options to set before the first prompt.
+    config_options:         AcpConfigOptionRequests,
 }
 
 /// Why a launch did not produce a result: an engine-side failure (already a
@@ -1736,6 +1802,20 @@ fn signal_from_acp_error(error: &AcpError, turn_started: bool) -> FailureSignal 
             original_identity,
             turn_started,
             declared_class: Some(DeclaredClass::MalformedConfiguration),
+            ..FailureSignal::default()
+        },
+        // A pre-prompt config-option refusal is typed by the OPTION it named:
+        // a model the agent cannot serve is `model_unsupported` at candidate
+        // scope, anything else is a malformed configuration. Both terminate
+        // with their own identity: no hold, no reactive fallback.
+        AcpError::ConfigOptionRefused { option_id, .. } => FailureSignal {
+            original_identity,
+            turn_started: false,
+            declared_class: Some(if option_id == "model" {
+                DeclaredClass::ModelUnsupported
+            } else {
+                DeclaredClass::MalformedConfiguration
+            }),
             ..FailureSignal::default()
         },
         AcpError::Sandbox(_) | AcpError::Cleanup(_) => FailureSignal {

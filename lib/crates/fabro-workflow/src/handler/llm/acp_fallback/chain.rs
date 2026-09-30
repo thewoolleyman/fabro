@@ -187,6 +187,37 @@ pub enum OnsetProbe {
     RemotePublishBranch,
 }
 
+/// The session config options a candidate asks its agent to set IN-PROTOCOL
+/// after `session/new` and before the first `session/prompt` (the spec's
+/// "In-protocol model and effort selection"). The grammar is closed: `model`
+/// and `effort` are the only option ids this build knows, so an unknown id
+/// refuses at chain validation instead of surfacing as a run-time refusal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateConfigOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model:  Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl CandidateConfigOptions {
+    /// The requested `(option id, value)` pairs in application order: the
+    /// model first, then the effort, so a model the agent cannot serve is
+    /// refused before an effort that model would have governed.
+    #[must_use]
+    pub fn requests(&self) -> Vec<(String, String)> {
+        let mut requests = Vec::with_capacity(2);
+        if let Some(model) = &self.model {
+            requests.push(("model".to_string(), model.clone()));
+        }
+        if let Some(effort) = &self.effort {
+            requests.push(("effort".to_string(), effort.clone()));
+        }
+        requests
+    }
+}
+
 /// One position in the node's ordered chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -202,6 +233,10 @@ pub struct AcpChainCandidate {
     pub availability_signatures: Vec<AvailabilitySignature>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preflight_skipped:       Option<PreflightSkip>,
+    /// Options to set in-protocol before this candidate's first prompt.
+    /// Absent for a candidate whose model is fixed by its command line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_options:          Option<CandidateConfigOptions>,
 }
 
 impl AcpChainCandidate {
@@ -215,6 +250,16 @@ impl AcpChainCandidate {
     #[must_use]
     pub fn is_preflight_skipped(&self) -> bool {
         self.preflight_skipped.is_some()
+    }
+
+    /// The in-protocol option requests for this candidate, in order; empty
+    /// when it carries none.
+    #[must_use]
+    pub fn config_option_requests(&self) -> Vec<(String, String)> {
+        self.config_options
+            .as_ref()
+            .map(CandidateConfigOptions::requests)
+            .unwrap_or_default()
     }
 }
 
@@ -297,6 +342,14 @@ pub enum ChainError {
         "acp.fallback_chain.candidates[{index}].preflight_skipped.hold_key must be non-empty text"
     )]
     EmptySkipHoldKey { index: u32 },
+    #[error(
+        "acp.fallback_chain.candidates[{index}].config_options must request at least one of model or effort"
+    )]
+    EmptyConfigOptions { index: u32 },
+    #[error(
+        "acp.fallback_chain.candidates[{index}].config_options.{option} must be non-empty text"
+    )]
+    EmptyConfigOptionValue { index: u32, option: &'static str },
 }
 
 /// Parse and validate the attribute against the node's other ACP attributes.
@@ -377,6 +430,19 @@ fn validate_candidate(candidate: &AcpChainCandidate) -> Result<(), ChainError> {
     if let Some(skip) = &candidate.preflight_skipped {
         if skip.hold_key.trim().is_empty() {
             return Err(ChainError::EmptySkipHoldKey { index });
+        }
+    }
+    if let Some(options) = &candidate.config_options {
+        if options.model.is_none() && options.effort.is_none() {
+            return Err(ChainError::EmptyConfigOptions { index });
+        }
+        for (option, value) in [("model", &options.model), ("effort", &options.effort)] {
+            if value
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                return Err(ChainError::EmptyConfigOptionValue { index, option });
+            }
         }
     }
     for (position, signature) in candidate.availability_signatures.iter().enumerate() {
@@ -699,5 +765,71 @@ mod tests {
         let reparsed: AcpFallbackChain =
             serde_json::from_str(&serde_json::to_string(&chain).unwrap()).unwrap();
         assert_eq!(reparsed, chain);
+    }
+
+    #[test]
+    fn config_options_parse_in_model_then_effort_order() {
+        let mut zero = candidate(0, "python3 agent.py", "codex");
+        zero["config_options"] = serde_json::json!({"model": "gpt-5.6", "effort": "high"});
+        let one = candidate(1, "python3 other.py", "anthropic");
+        let chain = parse_chain(
+            &chain_json(&serde_json::json!([zero, one])),
+            Some("python3 agent.py"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(chain.candidates[0].config_option_requests(), vec![
+            ("model".to_string(), "gpt-5.6".to_string()),
+            ("effort".to_string(), "high".to_string()),
+        ]);
+        assert!(chain.candidates[1].config_options.is_none());
+        assert!(chain.candidates[1].config_option_requests().is_empty());
+        let only_effort = CandidateConfigOptions {
+            model:  None,
+            effort: Some("low".to_string()),
+        };
+        assert_eq!(only_effort.requests(), vec![(
+            "effort".to_string(),
+            "low".to_string()
+        )]);
+    }
+
+    #[test]
+    fn config_options_refuse_unknown_ids_empty_objects_and_empty_values() {
+        let mut unknown = candidate(0, "python3 agent.py", "codex");
+        unknown["config_options"] = serde_json::json!({"model": "gpt-5.6", "temperature": "0.2"});
+        let err = parse_chain(
+            &chain_json(&serde_json::json!([unknown])),
+            Some("python3 agent.py"),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ChainError::Malformed(ref detail) if detail.contains("temperature")),
+            "an unknown option id must refuse at validation naming the id, got {err}"
+        );
+
+        let mut empty = candidate(0, "python3 agent.py", "codex");
+        empty["config_options"] = serde_json::json!({});
+        let err = parse_chain(
+            &chain_json(&serde_json::json!([empty])),
+            Some("python3 agent.py"),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err, ChainError::EmptyConfigOptions { index: 0 });
+
+        let mut blank = candidate(0, "python3 agent.py", "codex");
+        blank["config_options"] = serde_json::json!({"model": "gpt-5.6", "effort": "  "});
+        let err = parse_chain(
+            &chain_json(&serde_json::json!([blank])),
+            Some("python3 agent.py"),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err, ChainError::EmptyConfigOptionValue {
+            index:  0,
+            option: "effort",
+        });
     }
 }

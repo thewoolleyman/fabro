@@ -362,6 +362,8 @@ mod tests {
             config_name: None,
             candidate_index: Some(index),
             chain_deadline_epoch_ms: deadline,
+            model: None,
+            effort: None,
         })
     }
 
