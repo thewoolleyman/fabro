@@ -195,10 +195,28 @@ pub enum OnsetProbe {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateConfigOptions {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_text",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub model:  Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_text",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub effort: Option<String>,
+}
+
+/// A present key must carry text: an explicit JSON `null` is refused rather
+/// than read as "absent", so the non-empty-text rule cannot be sidestepped
+/// by spelling the absence out.
+fn present_text<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
 }
 
 impl CandidateConfigOptions {
@@ -818,6 +836,19 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, ChainError::EmptyConfigOptions { index: 0 });
+
+        let mut null = candidate(0, "python3 agent.py", "codex");
+        null["config_options"] = serde_json::json!({"model": null, "effort": "high"});
+        let err = parse_chain(
+            &chain_json(&serde_json::json!([null])),
+            Some("python3 agent.py"),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ChainError::Malformed(ref detail) if detail.contains("model")),
+            "an explicit null is not absence and must refuse naming the option, got {err}"
+        );
 
         let mut blank = candidate(0, "python3 agent.py", "codex");
         blank["config_options"] = serde_json::json!({"model": "gpt-5.6", "effort": "  "});

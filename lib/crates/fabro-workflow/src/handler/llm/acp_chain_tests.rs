@@ -521,7 +521,7 @@ async fn config_options_are_set_before_the_first_prompt_and_confirmed_on_started
     };
     assert_eq!(text, "hello from acp");
     assert_eq!(
-        std::fs::read_to_string(&set_record).unwrap(),
+        tokio::fs::read_to_string(&set_record).await.unwrap(),
         "model=m2\neffort=high\n",
         "every requested option is set through session/set_config_option, model first"
     );
@@ -625,7 +625,7 @@ async fn unadvertised_effort_refuses_before_any_prompt_as_malformed_configuratio
         "an unadvertised non-model option is a malformed configuration: {rendered}"
     );
     assert_eq!(
-        std::fs::read_to_string(&set_record).unwrap(),
+        tokio::fs::read_to_string(&set_record).await.unwrap(),
         "model=m2\n",
         "the model was set before the effort was found unadvertised"
     );
