@@ -18,8 +18,9 @@ events cannot see which model the agent actually confirmed.
 - **Grammar.** `acp.fallback_chain.candidates[i]` MAY carry
   `config_options: {"model": <value>, "effort": <value>}`; both keys are
   optional, at least one is required, values are non-empty text, and any
-  other key refuses at chain validation (`deny_unknown_fields`). The chain
-  is validated before any adapter starts, as before.
+  other key refuses at chain validation (`deny_unknown_fields`), and an
+  explicit JSON `null` is refused rather than read as absence (found in
+  review). The chain is validated before any adapter starts, as before.
 - **Handler order.** For a candidate with `config_options`, after
   `session/new` answers and before the first `session/prompt`, the handler
   reads the agent's advertised `configOptions`, then for each requested

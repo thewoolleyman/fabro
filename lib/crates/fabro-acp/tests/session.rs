@@ -1403,3 +1403,85 @@ async fn a_set_the_agent_answers_with_an_error_is_a_typed_refusal_not_a_protocol
         "no prompt may follow a refused set"
     );
 }
+
+#[tokio::test]
+async fn an_agent_that_resets_the_model_while_setting_effort_is_not_confirmed() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let script_path = tempdir.path().join("fake_acp_agent.py");
+    let prompt_record = tempdir.path().join("prompt.json");
+    let set_record = tempdir.path().join("set-config.txt");
+    write(&script_path, fake_acp_agent_script())
+        .await
+        .expect("write fake ACP agent");
+
+    let raw_command = format!("python3 {}", shell_quote(&script_path.to_string_lossy()));
+    let command = AcpProcessSpec::from_command_attr(&raw_command).expect("parse ACP command");
+    let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(tempdir.path().to_path_buf()));
+
+    let result = run_acp_turn(AcpRunRequest {
+        on_tool_event: None,
+        on_permission_request: None,
+        on_permission_observed: None,
+        command,
+        prompt: "hello".to_string(),
+        cwd: tempdir.path().to_string_lossy().into_owned(),
+        timeout_ms: Some(ACP_TEST_TIMEOUT_MS),
+        env: HashMap::from([
+            (
+                "ACP_PROMPT_RECORD".to_string(),
+                prompt_record.to_string_lossy().into_owned(),
+            ),
+            (
+                "ACP_SET_CONFIG_RECORD".to_string(),
+                set_record.to_string_lossy().into_owned(),
+            ),
+            (
+                "ACP_CONFIG_RESET_MODEL_ON".to_string(),
+                "effort".to_string(),
+            ),
+            (
+                "ACP_CONFIG_OPTIONS".to_string(),
+                serde_json::json!([
+                    {"id": "model", "current": "m1", "values": ["m1", "m2"]},
+                    {"id": "effort", "current": "low", "values": ["low", "high"]}
+                ])
+                .to_string(),
+            ),
+        ]),
+        sandbox,
+        cancel_token: CancellationToken::new(),
+        on_activity: None,
+        live_control: None,
+        config_options: vec![
+            ("model".to_string(), "m2".to_string()),
+            ("effort".to_string(), "high".to_string()),
+        ],
+        on_session_configured: None,
+    })
+    .await;
+
+    let Err(error) = result else {
+        panic!("a model the agent reset after the effort was set is not confirmed");
+    };
+    match &error {
+        AcpError::ConfigOptionRefused {
+            option_id, reason, ..
+        } => {
+            assert_eq!(
+                option_id, "model",
+                "the option that is no longer current is named"
+            );
+            assert_eq!(*reason, ConfigOptionRefusal::NotConfirmed);
+        }
+        other => panic!("expected a typed config-option refusal, got {other:?}"),
+    }
+    assert_eq!(
+        read_to_string(set_record).await.expect("read set record"),
+        "model=m2\neffort=high\n",
+        "both sets were sent; the final advertisement is what failed confirmation"
+    );
+    assert!(
+        !prompt_record.exists(),
+        "no prompt may follow an unconfirmed final state"
+    );
+}

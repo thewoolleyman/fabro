@@ -132,6 +132,13 @@ for line in sys.stdin:
             # never applies: the answer reports the OLD value as current.
             if os.environ.get("ACP_CONFIG_IGNORE_SET") != config_id:
                 option["current"] = value
+            # ACP_CONFIG_RESET_MODEL_ON names an option whose set resets the
+            # model to its first offered value, the way an agent might when a
+            # later option changes what the earlier one can be.
+            if os.environ.get("ACP_CONFIG_RESET_MODEL_ON") == config_id:
+                for entry in config_options:
+                    if entry["id"] == "model":
+                        entry["current"] = entry["values"][0]
             respond(message, {"configOptions": render_config_options()})
     elif method == "session/prompt":
         prompt_count += 1
