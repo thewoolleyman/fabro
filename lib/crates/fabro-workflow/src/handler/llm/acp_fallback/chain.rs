@@ -837,17 +837,17 @@ mod tests {
         .unwrap_err();
         assert_eq!(err, ChainError::EmptyConfigOptions { index: 0 });
 
-        let mut null = candidate(0, "python3 agent.py", "codex");
-        null["config_options"] = serde_json::json!({"model": null, "effort": "high"});
+        let mut explicit_null = candidate(0, "python3 agent.py", "codex");
+        explicit_null["config_options"] = serde_json::json!({"model": null, "effort": "high"});
         let err = parse_chain(
-            &chain_json(&serde_json::json!([null])),
+            &chain_json(&serde_json::json!([explicit_null])),
             Some("python3 agent.py"),
             None,
         )
         .unwrap_err();
         assert!(
-            matches!(err, ChainError::Malformed(ref detail) if detail.contains("model")),
-            "an explicit null is not absence and must refuse naming the option, got {err}"
+            matches!(err, ChainError::Malformed(ref detail) if detail.contains("null") && detail.contains("expected a string")),
+            "an explicit null is not absence and must refuse as a non-text value, got {err}"
         );
 
         let mut blank = candidate(0, "python3 agent.py", "codex");

@@ -865,7 +865,7 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
                 // like the others: it must never reach the classifier as a
                 // provider-evidenced protocol error that a signature could
                 // read as an availability failure and turn into a failover.
-                let set = match cx
+                let Ok(set) = cx
                     .send_request(SetSessionConfigOptionRequest::new(
                         session_id.clone(),
                         SessionConfigId::new(option_id.as_str()),
@@ -873,9 +873,8 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
                     ))
                     .block_task()
                     .await
-                {
-                    Ok(set) => set,
-                    Err(_) => return Err(refuse(ConfigOptionRefusal::SetRefused, &advertised)),
+                else {
+                    return Err(refuse(ConfigOptionRefusal::SetRefused, &advertised));
                 };
                 advertised = set.config_options;
                 match current_config_value(&advertised, option_id) {
