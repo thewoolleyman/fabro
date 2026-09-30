@@ -861,20 +861,51 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
                 if let Err(reason) = check_config_option(&advertised, option_id, requested) {
                     return Err(refuse(reason, &advertised));
                 }
-                let set = cx
+                // An error answer to the set is a refusal of THIS option, typed
+                // like the others: it must never reach the classifier as a
+                // provider-evidenced protocol error that a signature could
+                // read as an availability failure and turn into a failover.
+                let set = match cx
                     .send_request(SetSessionConfigOptionRequest::new(
                         session_id.clone(),
                         SessionConfigId::new(option_id.as_str()),
                         SessionConfigValueId::new(requested.as_str()),
                     ))
                     .block_task()
-                    .await?;
+                    .await
+                {
+                    Ok(set) => set,
+                    Err(_) => return Err(refuse(ConfigOptionRefusal::SetRefused, &advertised)),
+                };
                 advertised = set.config_options;
+                match current_config_value(&advertised, option_id) {
+                    Some(current) if current == *requested => {}
+                    _ => return Err(refuse(ConfigOptionRefusal::NotConfirmed, &advertised)),
+                }
+            }
+            // Confirmation is read from the agent's FINAL advertisement, not
+            // from each option's own answer: an agent that resets an earlier
+            // option when a later one changes would otherwise be prompted with
+            // a model the started event no longer describes.
+            for (option_id, requested) in &config_options {
                 match current_config_value(&advertised, option_id) {
                     Some(current) if current == *requested => {
                         confirmed.push((option_id.clone(), current));
                     }
-                    _ => return Err(refuse(ConfigOptionRefusal::NotConfirmed, &advertised)),
+                    _ => {
+                        *config_refusal_for_session
+                            .lock()
+                            .expect("ACP config refusal lock poisoned") =
+                            Some(AcpError::ConfigOptionRefused {
+                                option_id:  option_id.clone(),
+                                requested:  requested.clone(),
+                                reason:     ConfigOptionRefusal::NotConfirmed,
+                                advertised: advertised_option_ids(&advertised),
+                            });
+                        return Err(internal_error(format!(
+                            "session config option {option_id}={requested} was not current once every option was set"
+                        )));
+                    }
                 }
             }
             // Every requested option is confirmed and the prompt has not been
@@ -965,16 +996,18 @@ pub async fn run_acp_turn(request: AcpRunRequest) -> Result<AcpRunResult, AcpErr
             return Err(AcpError::Cancelled);
         }
         Err(error) => {
-            terminate_transport(&state).await?;
             // A pre-prompt config refusal is typed and takes precedence over
-            // the generic protocol error the closure had to return.
+            // the generic protocol error the closure had to return, and over
+            // a cleanup failure, which would otherwise hide it.
             let refusal = config_refusal
                 .lock()
                 .expect("ACP config refusal lock poisoned")
                 .take();
+            let cleanup = terminate_transport(&state).await;
             if let Some(refusal) = refusal {
                 return Err(refusal);
             }
+            cleanup?;
             if let Some(startup_error) = state.take_startup_error().await {
                 return Err(AcpError::Sandbox(startup_error));
             }

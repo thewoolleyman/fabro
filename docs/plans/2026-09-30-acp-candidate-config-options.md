@@ -48,6 +48,30 @@ events cannot see which model the agent actually confirmed.
 
 ## Design notes
 
+- **The "attempted before any side effect" barrier moves to the prompt.**
+  The S4 record's D7 ("candidate i is launched only after started is
+  stored") is restated as "no prompt is sent before started is stored".
+  A candidate that fails before its prompt (spawn, initialize, session/new,
+  a setup timeout, a config refusal) has done no work, so leaving no started
+  record for it is correct: reconstruct re-launches it only where the chain
+  contract already allows a legacy retry, and after a transition the chain
+  terminates non-retryably on any such failure. Consequences a reader must
+  expect: `AgentSessionActivated` now precedes `agent.acp.started` in the
+  stream, and a legacy node whose process fails before `session/new`
+  emits no started event at all.
+- **An error answer to `session/set_config_option` is a typed refusal.**
+  It is recorded as `set_refused` and never reaches the classifier: a
+  protocol error there carries provider evidence, so an availability
+  signature matching the agent's text would otherwise turn it into a
+  failover and a minted hold (found in review before merge).
+- **Confirmation reads the agent's final advertisement.** After every set,
+  each requested option is checked current in the LAST `configOptions`
+  list, so an agent that resets an earlier option when a later one changes
+  cannot be prompted with a model the started event no longer describes.
+- **Option ids are the spec's.** `model` and `effort` are the ids the
+  ratified contract names; an agent advertising effort under another id
+  refuses as `malformed_configuration`, which is the contract's answer.
+
 - `attach_session` in agent-client-protocol 0.11.1 drops `configOptions`
   from the `session/new` response, so `run_acp_turn` sends
   `NewSessionRequest` itself, negotiates on the raw response, and only then

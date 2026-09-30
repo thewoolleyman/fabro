@@ -1672,13 +1672,19 @@ Emitted by the ACP (Agent Client Protocol) handler around one agent turn in the 
 
 ### `agent.acp.started`
 
-Emitted when an ACP turn is launched.
+Emitted once the ACP session exists and every in-protocol config option the
+candidate requested is confirmed, immediately before the first prompt is sent
+(the durable "attempted" marker for a fallback-chain candidate).
 
 | Property | Type | Description |
 |----------|------|-------------|
 | `visit` | number | Node visit count (1-based) |
 | `command` | string | Adapter command that was launched |
 | `config_name` | string | Optional named ACP config the turn resolved |
+| `candidate_index` | number | Optional position in the node's ACP fallback chain |
+| `chain_deadline_epoch_ms` | number | Optional original wall-clock deadline shared by the chain |
+| `model` | string | Optional model the agent confirmed through `session/set_config_option` before the prompt |
+| `effort` | string | Optional effort confirmed the same way |
 
 ### `agent.acp.completed`
 

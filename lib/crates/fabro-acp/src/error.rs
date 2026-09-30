@@ -34,6 +34,8 @@ pub enum ConfigOptionRefusal {
     /// `session/set_config_option` answered without reporting the requested
     /// value current.
     NotConfirmed,
+    /// The agent answered `session/set_config_option` with a JSON-RPC error.
+    SetRefused,
 }
 
 impl ConfigOptionRefusal {
@@ -43,6 +45,7 @@ impl ConfigOptionRefusal {
             Self::OptionNotAdvertised => "option_not_advertised",
             Self::ValueNotOffered => "value_not_offered",
             Self::NotConfirmed => "not_confirmed",
+            Self::SetRefused => "set_refused",
         }
     }
 }
