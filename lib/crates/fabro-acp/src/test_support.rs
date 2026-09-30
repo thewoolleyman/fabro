@@ -119,7 +119,9 @@ for line in sys.stdin:
             with open(os.environ["ACP_SET_CONFIG_RECORD"], "a", encoding="utf-8") as record:
                 record.write(f"{config_id}={value}\n")
         option = next((entry for entry in config_options if entry["id"] == config_id), None)
-        if option is None or value not in option["values"]:
+        # ACP_CONFIG_REFUSE_SET names an advertised option the agent refuses
+        # to set with a JSON-RPC error even for an offered value.
+        if option is None or value not in option["values"] or os.environ.get("ACP_CONFIG_REFUSE_SET") == config_id:
             send({
                 "jsonrpc": "2.0",
                 "id": message["id"],

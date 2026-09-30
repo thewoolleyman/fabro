@@ -440,10 +440,11 @@ impl RunProjectionReducer for RunProjection {
                 };
                 stage.agent_tools.clone_from(&props.tools);
             }
-            // `AgentAcpStarted` is the start-of-process signal for an external
-            // ACP agent. `provider_used` is intentionally sourced from the
-            // subsequent `AgentSessionActivated` event, which carries the
-            // canonical provider/model. ACP runs without a steering hub never
+            // `AgentAcpStarted` is the pre-prompt "attempted" signal for an
+            // external ACP agent (emitted once its session is configured, so
+            // it follows `AgentSessionActivated` in the stream). `provider_used`
+            // is intentionally sourced from the `AgentSessionActivated` event,
+            // which carries the canonical provider/model. ACP runs without a steering hub never
             // emit activation and so legitimately leave `provider_used`
             // unset — matching legacy ACP behavior.
             EventBody::CommandStarted(props) => {

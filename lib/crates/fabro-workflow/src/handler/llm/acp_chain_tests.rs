@@ -478,6 +478,13 @@ fn candidate_with_options(
 }
 
 impl Harness {
+    fn exhausted_count(&self) -> usize {
+        self.events()
+            .into_iter()
+            .filter(|event| matches!(event.body, EventBody::AgentAcpExhausted(_)))
+            .count()
+    }
+
     fn started_props(&self) -> Vec<fabro_types::run_event::AgentAcpStartedProps> {
         self.events()
             .into_iter()
@@ -539,7 +546,11 @@ async fn unadvertised_model_refuses_before_any_prompt_as_model_unsupported_witho
         ("ACP_CONFIG_OPTIONS", advertised.as_str()),
         ("ACP_PROMPT_RECORD", &prompt_record.to_string_lossy()),
     ]);
-    let fallback = h.command("write_file", &[]);
+    let fallback_prompt_record = h.tempdir.path().join("fallback-prompt.json");
+    let fallback = h.command("write_file", &[(
+        "ACP_PROMPT_RECORD",
+        &fallback_prompt_record.to_string_lossy(),
+    )]);
     let node = Harness::node(
         &primary,
         Some(chain(&[
@@ -552,6 +563,15 @@ async fn unadvertised_model_refuses_before_any_prompt_as_model_unsupported_witho
     assert!(
         rendered.contains("model_unsupported (candidate)"),
         "the refusal is typed model_unsupported at candidate scope: {rendered}"
+    );
+    assert!(
+        !fallback_prompt_record.exists(),
+        "the fallback candidate never runs after a pre-turn refusal"
+    );
+    assert_eq!(
+        h.exhausted_count(),
+        0,
+        "a pre-turn refusal is not an exhaustion"
     );
     assert!(
         rendered.contains("model=m9"),
@@ -640,5 +660,54 @@ async fn an_option_the_agent_acknowledges_but_never_applies_is_not_confirmed() {
         "an unconfirmed model is refused as model_unsupported: {rendered}"
     );
     assert!(!prompt_record.exists(), "the prompt waits for confirmation");
+    assert!(h.started_indexes().is_empty());
+}
+
+#[tokio::test]
+async fn a_set_answered_with_an_error_refuses_typed_even_when_a_signature_would_match() {
+    // The agent advertises the requested model but answers the set with a
+    // JSON-RPC error. Without the typed refusal that error text would reach
+    // the classifier as provider evidence, and a matching signature would
+    // turn it into a failover onto the next candidate plus a minted hold.
+    let h = Harness::new().await;
+    let prompt_record = h.tempdir.path().join("prompt.json");
+    let fallback_prompt_record = h.tempdir.path().join("fallback-prompt.json");
+    let advertised = advertised_model_and_effort();
+    let primary = h.command("write_file", &[
+        ("ACP_CONFIG_OPTIONS", advertised.as_str()),
+        ("ACP_CONFIG_REFUSE_SET", "model"),
+        ("ACP_PROMPT_RECORD", &prompt_record.to_string_lossy()),
+    ]);
+    let fallback = h.command("write_file", &[(
+        "ACP_PROMPT_RECORD",
+        &fallback_prompt_record.to_string_lossy(),
+    )]);
+    let mut zero = candidate_with_options(0, "codex", &primary, serde_json::json!({"model": "m2"}));
+    zero["availability_signatures"] = serde_json::json!([{
+        "source": "protocol.message",
+        "cause": "model_unsupported",
+        "scope": "candidate",
+        "all_literals": ["unknown config option"]
+    }]);
+    let node = Harness::node(
+        &primary,
+        Some(chain(&[zero, candidate(1, "anthropic", &fallback, &[])])),
+    );
+    let err = expect_err(h.run(&node).await);
+    let rendered = err.to_string();
+    assert!(
+        rendered.contains("model_unsupported (candidate)") && rendered.contains("set_refused"),
+        "an error-answered set is the typed pre-turn refusal: {rendered}"
+    );
+    assert!(!prompt_record.exists(), "no prompt after a refused set");
+    assert!(
+        !fallback_prompt_record.exists(),
+        "no fallback candidate runs after a refused set"
+    );
+    assert!(
+        h.failovers().is_empty(),
+        "no failover event, so nothing to mint a hold from"
+    );
+    assert_eq!(h.exhausted_count(), 0);
     assert!(h.started_indexes().is_empty());
 }
