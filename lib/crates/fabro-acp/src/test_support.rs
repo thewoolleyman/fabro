@@ -31,6 +31,23 @@ import time
 methods = []
 session_id = "sess-1"
 prompt_count = 0
+# In-protocol config options the agent advertises on session/new and
+# accepts through session/set_config_option: a JSON list of
+# {"id", "current", "values": [...]} from ACP_CONFIG_OPTIONS.
+config_options = json.loads(os.environ.get("ACP_CONFIG_OPTIONS", "[]"))
+
+def render_config_options():
+    rendered = []
+    for option in config_options:
+        rendered.append({
+            "id": option["id"],
+            "name": option.get("name", option["id"]),
+            "category": option.get("category", "model" if option["id"] == "model" else "other"),
+            "type": "select",
+            "currentValue": option["current"],
+            "options": [{"value": value, "name": value} for value in option["values"]],
+        })
+    return rendered
 
 if os.environ.get("ACP_PID_RECORD"):
     with open(os.environ["ACP_PID_RECORD"], "w", encoding="utf-8") as record:
@@ -90,7 +107,30 @@ for line in sys.stdin:
         if os.environ.get("ACP_SESSION_NEW_PARAMS"):
             with open(os.environ["ACP_SESSION_NEW_PARAMS"], "w", encoding="utf-8") as record:
                 record.write(json.dumps(message.get("params", {}), separators=(",", ":")))
-        respond(message, {"sessionId": session_id})
+        result = {"sessionId": session_id}
+        if config_options:
+            result["configOptions"] = render_config_options()
+        respond(message, result)
+    elif method == "session/set_config_option":
+        params = message.get("params", {})
+        config_id = params.get("configId")
+        value = params.get("value")
+        if os.environ.get("ACP_SET_CONFIG_RECORD"):
+            with open(os.environ["ACP_SET_CONFIG_RECORD"], "a", encoding="utf-8") as record:
+                record.write(f"{config_id}={value}\n")
+        option = next((entry for entry in config_options if entry["id"] == config_id), None)
+        if option is None or value not in option["values"]:
+            send({
+                "jsonrpc": "2.0",
+                "id": message["id"],
+                "error": {"code": -32602, "message": "unknown config option or value"},
+            })
+        else:
+            # ACP_CONFIG_IGNORE_SET names an option the agent acknowledges but
+            # never applies: the answer reports the OLD value as current.
+            if os.environ.get("ACP_CONFIG_IGNORE_SET") != config_id:
+                option["current"] = value
+            respond(message, {"configOptions": render_config_options()})
     elif method == "session/prompt":
         prompt_count += 1
         if os.environ.get("ACP_PROMPT_RECORD"):

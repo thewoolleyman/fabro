@@ -704,6 +704,13 @@ pub enum Event {
         /// The visit's original deadline shared by every chain candidate.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         chain_deadline_epoch_ms: Option<u64>,
+        /// The model the agent confirmed in-protocol before the first prompt,
+        /// when the candidate requested one; additive and non-secret.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model:                   Option<String>,
+        /// The confirmed effort, on the same terms.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort:                  Option<String>,
     },
     AgentAcpCompleted {
         node_id:     String,

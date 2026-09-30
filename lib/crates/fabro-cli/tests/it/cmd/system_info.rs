@@ -49,8 +49,8 @@ fn system_info_json_reports_runtime_fields() {
     assert!(value["runs"]["total"].is_number());
     assert_eq!(
         value["capabilities"],
-        serde_json::json!(["acp.fallback_chain.v1"]),
-        "system info must list the ACP fallback chain capability so a client can refuse new grammar against an older server"
+        serde_json::json!(["acp.fallback_chain.v1", "acp.candidate_config_options.v1"]),
+        "system info must list the ACP fallback chain and candidate config-option capabilities so a client can refuse new grammar against an older server"
     );
 }
 

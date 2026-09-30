@@ -239,6 +239,16 @@ pub struct AgentAcpStartedProps {
     /// starting a fresh clock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_deadline_epoch_ms: Option<u64>,
+    /// The model the agent CONFIRMED through `session/set_config_option`
+    /// before the first prompt, when the candidate requested one in-protocol.
+    /// Additive and non-secret: a reader verifies which model actually ran
+    /// without reading the command. Absent for a candidate that requested
+    /// none and for every event stored before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model:                   Option<String>,
+    /// The confirmed effort, on the same terms as `model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort:                  Option<String>,
 }
 
 /// The typed terminal record of an ACP fallback chain that ran out of

@@ -7,7 +7,7 @@ use std::time::Duration;
 use agent_client_protocol::schema::StopReason;
 use fabro_acp::{
     AcpControlHandle, AcpError, AcpLiveControl, AcpPermissionAnswer, AcpProcessSpec, AcpRunRequest,
-    AcpRunResult, AcpToolEvent, run_acp_turn,
+    AcpRunResult, AcpSessionConfigured, AcpToolEvent, ConfigOptionRefusal, run_acp_turn,
 };
 use fabro_sandbox::test_support::{MockSandbox, MockStdioProcess};
 use fabro_sandbox::{LocalSandbox, Sandbox, shell_quote};
@@ -54,6 +54,8 @@ async fn stdio_spawn_failure_returns_sandbox_error() {
         cancel_token: CancellationToken::new(),
         on_activity: None,
         live_control: None,
+        config_options: Vec::new(),
+        on_session_configured: None,
     })
     .await;
     let Err(error) = result else {
@@ -91,6 +93,8 @@ async fn clean_stdio_exit_after_final_response_completes_turn() {
         cancel_token: CancellationToken::new(),
         on_activity: None,
         live_control: None,
+        config_options: Vec::new(),
+        on_session_configured: None,
     })
     .await
     .expect("clean ACP process exit should not preempt final protocol response");
@@ -128,6 +132,8 @@ async fn session_lifecycle_initializes_sends_prompt_and_aggregates_text() {
         cancel_token: CancellationToken::new(),
         on_activity: None,
         live_control: None,
+        config_options: Vec::new(),
+        on_session_configured: None,
     })
     .await
     .expect("run ACP turn");
@@ -188,6 +194,8 @@ async fn steering_sends_followup_session_prompt_over_acp() {
             }
         })),
         live_control: Some(AcpLiveControl::new(control_handle)),
+        config_options: Vec::new(),
+        on_session_configured: None,
     })
     .await
     .expect("run ACP turn with steering");
@@ -261,6 +269,8 @@ async fn interrupt_then_steer_sends_cancel_then_followup_session_prompt_over_acp
             }
         })),
         live_control: Some(AcpLiveControl::new(control_handle)),
+        config_options: Vec::new(),
+        on_session_configured: None,
     })
     .await
     .expect("run ACP turn with interrupt and steering");
@@ -332,6 +342,8 @@ async fn inline_interrupt_terminates_agent_that_ignores_cancel() {
             }
         })),
         live_control: Some(AcpLiveControl::new(control_handle)),
+        config_options: Vec::new(),
+        on_session_configured: None,
     })
     .await
     .expect_err("ignored inline interrupt should terminate as cancelled");
@@ -436,6 +448,8 @@ async fn permission_resolver_does_not_block_the_dispatch_loop() {
         cancel_token: CancellationToken::new(),
         on_activity: Some(on_activity),
         live_control: None,
+        config_options: Vec::new(),
+        on_session_configured: None,
     })
     .await
     .expect("run ACP turn");
@@ -506,6 +520,8 @@ async fn concurrent_permission_timeouts_report_one_bounded_permission_timed_out(
         cancel_token: CancellationToken::new(),
         on_activity: None,
         live_control: None,
+        config_options: Vec::new(),
+        on_session_configured: None,
     })
     .await;
 
@@ -846,6 +862,8 @@ async fn run_fake_agent_with_activity(
         cancel_token,
         on_activity,
         live_control: None,
+        config_options: Vec::new(),
+        on_session_configured: None,
     })
     .await
 }
@@ -887,6 +905,8 @@ async fn run_fake_agent_with_callbacks(
         cancel_token: CancellationToken::new(),
         on_activity: None,
         live_control: None,
+        config_options: Vec::new(),
+        on_session_configured: None,
     })
     .await
 }
@@ -1151,4 +1171,175 @@ async fn write_acp_message(stdout: &mut DuplexStream, message: serde_json::Value
         .await
         .expect("write mock ACP stdout");
     stdout.flush().await.expect("flush mock ACP stdout");
+}
+
+#[tokio::test]
+async fn config_options_are_negotiated_after_session_new_and_before_the_prompt() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let script_path = tempdir.path().join("fake_acp_agent.py");
+    let record_path = tempdir.path().join("methods.txt");
+    let set_record = tempdir.path().join("set-config.txt");
+    write(&script_path, fake_acp_agent_script())
+        .await
+        .expect("write fake ACP agent");
+
+    let raw_command = format!("python3 {}", shell_quote(&script_path.to_string_lossy()));
+    let command = AcpProcessSpec::from_command_attr(&raw_command).expect("parse ACP command");
+    let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(tempdir.path().to_path_buf()));
+    let configured: Arc<std::sync::Mutex<Option<AcpSessionConfigured>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let configured_sink = Arc::clone(&configured);
+    let hook_saw_no_prompt_yet = Arc::new(AtomicBool::new(false));
+    let hook_flag = Arc::clone(&hook_saw_no_prompt_yet);
+    let prompt_record = tempdir.path().join("prompt.json");
+    let prompt_record_for_hook = prompt_record.clone();
+
+    let result = run_acp_turn(AcpRunRequest {
+        on_tool_event: None,
+        on_permission_request: None,
+        on_permission_observed: None,
+        command,
+        prompt: "hello".to_string(),
+        cwd: tempdir.path().to_string_lossy().into_owned(),
+        timeout_ms: Some(ACP_TEST_TIMEOUT_MS),
+        env: HashMap::from([
+            (
+                "ACP_RECORD".to_string(),
+                record_path.to_string_lossy().into_owned(),
+            ),
+            (
+                "ACP_SET_CONFIG_RECORD".to_string(),
+                set_record.to_string_lossy().into_owned(),
+            ),
+            (
+                "ACP_PROMPT_RECORD".to_string(),
+                prompt_record.to_string_lossy().into_owned(),
+            ),
+            (
+                "ACP_CONFIG_OPTIONS".to_string(),
+                serde_json::json!([
+                    {"id": "model", "current": "m1", "values": ["m1", "m2"]},
+                    {"id": "effort", "current": "low", "values": ["low", "high"]}
+                ])
+                .to_string(),
+            ),
+        ]),
+        sandbox,
+        cancel_token: CancellationToken::new(),
+        on_activity: None,
+        live_control: None,
+        config_options: vec![
+            ("model".to_string(), "m2".to_string()),
+            ("effort".to_string(), "high".to_string()),
+        ],
+        on_session_configured: Some(Arc::new(move |session: AcpSessionConfigured| {
+            let sink = Arc::clone(&configured_sink);
+            let flag = Arc::clone(&hook_flag);
+            let prompt_record = prompt_record_for_hook.clone();
+            Box::pin(async move {
+                // The hook runs BEFORE the prompt: the agent has not recorded one.
+                flag.store(!prompt_record.exists(), Ordering::SeqCst);
+                *sink.lock().expect("configured lock") = Some(session);
+            })
+        })),
+    })
+    .await
+    .expect("run ACP turn");
+
+    assert_eq!(result.text, "hello from acp");
+    assert_eq!(
+        read_to_string(record_path)
+            .await
+            .expect("read method record"),
+        "initialize\nsession/new\nsession/set_config_option\nsession/set_config_option\nsession/prompt\n",
+        "options are set after session/new and before the prompt, in request order"
+    );
+    assert_eq!(
+        read_to_string(set_record).await.expect("read set record"),
+        "model=m2\neffort=high\n"
+    );
+    assert!(
+        hook_saw_no_prompt_yet.load(Ordering::SeqCst),
+        "the configured hook must run before the first prompt is sent"
+    );
+    assert_eq!(
+        configured.lock().expect("configured lock").clone(),
+        Some(AcpSessionConfigured {
+            confirmed: vec![
+                ("model".to_string(), "m2".to_string()),
+                ("effort".to_string(), "high".to_string()),
+            ],
+        })
+    );
+}
+
+#[tokio::test]
+async fn unadvertised_config_option_is_a_typed_pre_prompt_refusal() {
+    let tempdir = tempfile::tempdir().expect("create tempdir");
+    let script_path = tempdir.path().join("fake_acp_agent.py");
+    let prompt_record = tempdir.path().join("prompt.json");
+    write(&script_path, fake_acp_agent_script())
+        .await
+        .expect("write fake ACP agent");
+
+    let raw_command = format!("python3 {}", shell_quote(&script_path.to_string_lossy()));
+    let command = AcpProcessSpec::from_command_attr(&raw_command).expect("parse ACP command");
+    let sandbox: Arc<dyn Sandbox> = Arc::new(LocalSandbox::new(tempdir.path().to_path_buf()));
+    let hook_ran = Arc::new(AtomicBool::new(false));
+    let hook_flag = Arc::clone(&hook_ran);
+
+    let result = run_acp_turn(AcpRunRequest {
+        on_tool_event: None,
+        on_permission_request: None,
+        on_permission_observed: None,
+        command,
+        prompt: "hello".to_string(),
+        cwd: tempdir.path().to_string_lossy().into_owned(),
+        timeout_ms: Some(ACP_TEST_TIMEOUT_MS),
+        env: HashMap::from([
+            (
+                "ACP_PROMPT_RECORD".to_string(),
+                prompt_record.to_string_lossy().into_owned(),
+            ),
+            (
+                "ACP_CONFIG_OPTIONS".to_string(),
+                serde_json::json!([{"id": "model", "current": "m1", "values": ["m1"]}]).to_string(),
+            ),
+        ]),
+        sandbox,
+        cancel_token: CancellationToken::new(),
+        on_activity: None,
+        live_control: None,
+        config_options: vec![("model".to_string(), "m9".to_string())],
+        on_session_configured: Some(Arc::new(move |_: AcpSessionConfigured| {
+            let flag = Arc::clone(&hook_flag);
+            Box::pin(async move {
+                flag.store(true, Ordering::SeqCst);
+            })
+        })),
+    })
+    .await;
+
+    let Err(error) = result else {
+        panic!("an unadvertised model value must refuse the turn");
+    };
+    match &error {
+        AcpError::ConfigOptionRefused {
+            option_id,
+            requested,
+            reason,
+            advertised,
+        } => {
+            assert_eq!(option_id, "model");
+            assert_eq!(requested, "m9");
+            assert_eq!(*reason, ConfigOptionRefusal::ValueNotOffered);
+            assert_eq!(advertised, &vec!["model".to_string()]);
+        }
+        other => panic!("expected a typed config-option refusal, got {other:?}"),
+    }
+    assert!(!prompt_record.exists(), "no prompt may follow a refusal");
+    assert!(
+        !hook_ran.load(Ordering::SeqCst),
+        "the configured hook never runs for a refused session"
+    );
 }

@@ -242,6 +242,7 @@ mod tests {
             command:                 "codex-acp".to_string(),
             availability_signatures: signatures,
             preflight_skipped:       None,
+            config_options:          None,
         }
     }
 

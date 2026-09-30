@@ -44,6 +44,7 @@ pub enum NonEligibleReason {
     GenericHttp404,
     IdentityAbsent,
     MalformedConfiguration,
+    ModelUnsupported,
     NodeDeadline,
     NonConvergence,
     PreTurnWithoutProviderEvidence,
@@ -68,6 +69,7 @@ impl NonEligibleReason {
             Self::GenericHttp404 => "generic_http_404",
             Self::IdentityAbsent => "identity_absent",
             Self::MalformedConfiguration => "malformed_configuration",
+            Self::ModelUnsupported => "model_unsupported",
             Self::NodeDeadline => "node_deadline",
             Self::NonConvergence => "non_convergence",
             Self::PreTurnWithoutProviderEvidence => "pre_turn_without_provider_evidence",
@@ -95,6 +97,11 @@ pub enum DeclaredClass {
     NodeDeadline,
     StallExpiry,
     MalformedConfiguration,
+    /// The agent refused the requested model BEFORE any prompt through the
+    /// in-protocol config-option handshake: typed `model_unsupported` at
+    /// candidate scope, terminating with its own identity rather than as an
+    /// availability failure that would mint a hold or trigger fallback.
+    ModelUnsupported,
     UnattributedSandboxOrTransport,
     CodeTestReviewOrToolFailure,
     /// Something terminal the engine established that this vocabulary does
@@ -109,6 +116,7 @@ impl DeclaredClass {
             Self::NodeDeadline => NonEligibleReason::NodeDeadline,
             Self::StallExpiry => NonEligibleReason::StallExpiry,
             Self::MalformedConfiguration => NonEligibleReason::MalformedConfiguration,
+            Self::ModelUnsupported => NonEligibleReason::ModelUnsupported,
             Self::UnattributedSandboxOrTransport => {
                 NonEligibleReason::UnattributedSandboxOrTransport
             }
