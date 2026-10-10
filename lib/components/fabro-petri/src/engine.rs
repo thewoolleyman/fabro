@@ -257,10 +257,10 @@ pub async fn run(request: RunRequest) -> Result<RunOutcome, RunError> {
     // last, so it is outermost and sees each launch as the step built it,
     // before the credential layer adds the managed token. Parented on the
     // current span, the worker's `run` span.
-    let run_turns = request
-        .hooks
-        .is_some()
-        .then(|| RunTurns::for_current_run(request.run_id.as_str(), runtime.masker()));
+    let run_turns = request.hooks.is_some().then(|| {
+        RunTurns::for_current_run(request.run_id.as_str(), runtime.masker())
+            .with_correlation(request.runtime.correlation.clone())
+    });
     if let Some(run_turns) = &run_turns {
         let run_turns = Arc::clone(run_turns);
         runtime = runtime.executor_layer(move |executor| run_turns.executor(executor));

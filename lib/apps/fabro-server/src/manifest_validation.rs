@@ -64,6 +64,7 @@ fn offline_runtime(run: Option<&RunLayer>) -> RuntimeSpec {
         dry_run:           false,
         fabro_home:        None,
         run_tools:         None,
+        correlation:       Vec::new(),
     }
 }
 

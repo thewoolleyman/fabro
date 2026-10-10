@@ -96,7 +96,9 @@ use fabro_store::platform_records::{
     PlatformRecord, RunLifecycleKind, RunLifecycleRecord, RunNoticeRecord,
 };
 use fabro_types::settings::run::{ApprovalMode, RunMode};
-use fabro_types::{FailureReason, Principal, RunId, RunNoticeLevel, RunStatus, SuccessReason};
+use fabro_types::{
+    FailureReason, Principal, RunId, RunNoticeLevel, RunStatus, SuccessReason, trace_link,
+};
 use fabro_util::exit::{ErrorExt as _, ExitClass};
 use fabro_vault::Vault;
 use fabro_workflow::Error as WorkflowError;
@@ -685,5 +687,7 @@ async fn runtime_spec(
         dry_run: run_state.spec.settings.run.execution.mode == RunMode::DryRun,
         fabro_home,
         run_tools,
+        // The dispatch correlation labels, onto the run's `run_turn` spans.
+        correlation: trace_link::correlation_attributes(&run_state.spec.labels),
     })
 }
