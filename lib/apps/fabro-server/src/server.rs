@@ -138,6 +138,7 @@ use crate::github_webhooks::{
     WEBHOOK_ROUTE, WEBHOOK_SECRET_ENV, parse_event_metadata, verify_signature,
 };
 use crate::jwt_auth::{self, AuthMode};
+use crate::otel_propagation::current_traceparent;
 use crate::petri_runs::PetriRuns;
 use crate::principal_middleware::{
     AuthContextSlot, RequestAuth, RequestAuthContext, RequireRunBlob, RequireRunManagementTarget,
@@ -3907,6 +3908,7 @@ fn worker_launch_spec(
     run_dir: &std::path::Path,
     agent_fabro_tools_enabled: bool,
     github_app_private_key: Option<String>,
+    traceparent: Option<String>,
 ) -> anyhow::Result<WorkerLaunchSpec> {
     let current_exe = std::env::current_exe().context("reading current executable path")?;
     let executable =
@@ -3946,6 +3948,7 @@ fn worker_launch_spec(
         active_config_path: state.active_config_path().to_path_buf(),
         github_app_private_key,
         fabro_home: fabro_config::Home::from_env().root().to_path_buf(),
+        traceparent,
     })
 }
 
@@ -4278,6 +4281,11 @@ async fn execute_run_subprocess(state: Arc<AppState>, run_id: RunId) {
     };
     let state_for_build = Arc::clone(&state);
     let run_dir_for_build = run_dir.clone();
+    // Capture HERE, not inside the closure below: `execute_run` is
+    // instrumented with the `run` span, but `spawn_blocking` hands the closure
+    // to a pool thread that does not carry it, so capturing there would always
+    // yield `None` and silently leave the worker's trace disconnected.
+    let traceparent = current_traceparent();
     let start_result = spawn_blocking(move || {
         worker_launch_spec(
             state_for_build.as_ref(),
@@ -4286,6 +4294,7 @@ async fn execute_run_subprocess(state: Arc<AppState>, run_id: RunId) {
             &run_dir_for_build,
             agent_fabro_tools_enabled,
             github_app_private_key,
+            traceparent,
         )
     })
     .await
