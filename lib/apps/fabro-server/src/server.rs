@@ -138,7 +138,7 @@ use crate::github_webhooks::{
     WEBHOOK_ROUTE, WEBHOOK_SECRET_ENV, parse_event_metadata, verify_signature,
 };
 use crate::jwt_auth::{self, AuthMode};
-use crate::otel_propagation::current_traceparent;
+use crate::otel_propagation::{current_traceparent, link_run_span};
 use crate::petri_runs::PetriRuns;
 use crate::principal_middleware::{
     AuthContextSlot, RequestAuth, RequestAuthContext, RequireRunBlob, RequireRunManagementTarget,
@@ -4481,9 +4481,15 @@ pub fn spawn_scheduler(state: Arc<AppState>) {
                     break;
                 }
                 let state_clone = Arc::clone(&state);
-                tokio::spawn(
-                    execute_run(state_clone, id).instrument(tracing::info_span!("run", id = %id)),
-                );
+                tokio::spawn(async move {
+                    // Link the span before anything enters it: a parent set
+                    // after entry would not reach the spans created under it.
+                    let span = tracing::info_span!("run", id = %id);
+                    if let Ok(Some(projection)) = run_records::projection(&state_clone, id).await {
+                        link_run_span(&span, &id.to_string(), &projection.spec.labels);
+                    }
+                    execute_run(state_clone, id).instrument(span).await;
+                });
             }
         }
     });

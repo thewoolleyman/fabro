@@ -11045,3 +11045,83 @@ async fn spawn_blocking_does_not_carry_the_run_span() {
     .instrument(tracing::info_span!("run", id = "o2-site-control"))
     .await;
 }
+
+/// The DISPATCHER JOIN. A run created with the caller's `traceparent` label
+/// (what `fabro run` copies from its `TRACEPARENT`) starts its server `run`
+/// span on the caller's trace, so the traceparent handed to the worker
+/// carries the caller's trace id: Dispatcher span -> server run -> worker.
+#[tokio::test]
+async fn a_runs_traceparent_label_joins_the_worker_to_the_callers_trace() {
+    let _provider = install_global_otel_subscriber();
+    let caller = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+    let runtime = StdArc::new(RecordingWorkerRuntime::default());
+    let storage_dir = tempfile::tempdir().unwrap();
+    let source = format!(
+        r#"
+_version = 1
+
+[server.storage]
+root = "{}"
+
+[server.auth]
+methods = ["dev-token"]
+"#,
+        storage_dir.path().display()
+    );
+    write_test_server_record(storage_dir.path());
+    let state = TestAppStateBuilder::new()
+        .runtime_settings(
+            server_settings_from_toml(&source),
+            manifest_run_defaults_from_toml(&source),
+        )
+        .vault_entries([(EnvVars::OPENAI_API_KEY, "test-openai-api-key")])
+        .max_concurrent_runs(5)
+        .worker_runtime(StdArc::clone(&runtime) as StdArc<dyn WorkerRuntime>)
+        .build();
+    let app = test_app_with_scheduler(state);
+
+    let mut intent = test_intent(&app, MINIMAL_DOT).await;
+    intent["args"]["labels"] = json!({ "traceparent": caller, "work.item.id": "bd-ib-6vhgqg" });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(api("/runs"))
+                .header("content-type", "application/json")
+                .body(Body::from(intent.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let run_id = body_json(response.into_body()).await["id"]
+        .as_str()
+        .expect("the run is created")
+        .to_string();
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(api(&format!("/runs/{run_id}/start")))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let traceparent = await_first_started_traceparent(&runtime)
+        .await
+        .expect("the run span reaches the launch spec");
+    assert_well_formed_traceparent(&traceparent);
+    assert_eq!(
+        traceparent.split('-').nth(1),
+        Some("4bf92f3577b34da6a3ce929d0e0e4736"),
+        "the worker must continue the caller's trace, got {traceparent}"
+    );
+    assert_ne!(
+        traceparent.split('-').nth(2),
+        Some("00f067aa0ba902b7"),
+        "the worker's parent is the server run span, a child of the caller's"
+    );
+}
