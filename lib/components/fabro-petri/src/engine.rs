@@ -85,6 +85,7 @@ use crate::blobs::{Blobs, RunBlobs};
 use crate::controls::RunControls;
 use crate::hooks::{FabroHooks, HooksSpec};
 use crate::projection;
+use crate::run_turn::RunTurns;
 use crate::runtime::RuntimeSpec;
 use crate::secrets::SharedSecrets;
 
@@ -252,6 +253,18 @@ pub async fn run(request: RunRequest) -> Result<RunOutcome, RunError> {
         runtime =
             runtime.executor_layer(move |executor| credentials.executor(executor, masker.clone()));
     }
+    // The `run_turn` spans, with Fabro's hooks: their executor layer goes
+    // last, so it is outermost and sees each launch as the step built it,
+    // before the credential layer adds the managed token. Parented on the
+    // current span, the worker's `run` span.
+    let run_turns = request
+        .hooks
+        .is_some()
+        .then(|| RunTurns::for_current_run(request.run_id.as_str(), runtime.masker()));
+    if let Some(run_turns) = &run_turns {
+        let run_turns = Arc::clone(run_turns);
+        runtime = runtime.executor_layer(move |executor| run_turns.executor(executor));
+    }
     if let Some(blobs) = &request.blobs {
         runtime = runtime.capability(RunBlobs::output_store(Arc::clone(blobs)));
     }
@@ -263,7 +276,7 @@ pub async fn run(request: RunRequest) -> Result<RunOutcome, RunError> {
             .installed_hooks()
             .unwrap_or_else(|| Arc::new(NoHooks));
         let run_id = spec_run_id(&request.run_id);
-        Arc::new(FabroHooks::new(
+        let hooks = FabroHooks::new(
             spec,
             inner,
             run_id,
@@ -272,7 +285,11 @@ pub async fn run(request: RunRequest) -> Result<RunOutcome, RunError> {
             Arc::clone(&request.store),
             resumed,
             request.blobs.clone(),
-        ))
+        );
+        Arc::new(match &run_turns {
+            Some(run_turns) => hooks.with_run_turns(Arc::clone(run_turns)),
+            None => hooks,
+        })
     });
     if let Some(hooks) = &fabro_hooks {
         runtime = runtime.hooks(Arc::clone(hooks) as Arc<dyn ExecutionHooks>);

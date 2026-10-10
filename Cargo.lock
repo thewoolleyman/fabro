@@ -2544,9 +2544,12 @@ dependencies = [
  "fabro-util",
  "fabro-vault",
  "fabro-workflow",
+ "hex",
  "httpmock",
  "lithos-llm",
  "object_store",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "pebble-coding-agent",
  "percent-encoding",
  "petri-attractor-steps",
@@ -2562,6 +2565,7 @@ dependencies = [
  "sandbox-driver-host",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "smol_str",
  "sqlx",
  "tempfile",
@@ -2569,6 +2573,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-opentelemetry",
 ]
 
 [[package]]

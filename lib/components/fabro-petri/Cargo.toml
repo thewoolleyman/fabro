@@ -59,6 +59,12 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+# The `run_turn` span (`run_turn`): built through the OpenTelemetry API and
+# parented on the current `tracing` span; exported by fabro-cli's pipeline.
+opentelemetry.workspace = true
+tracing-opentelemetry.workspace = true
+sha2.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 fabro-github = { path = "../fabro-github", features = ["test-support"] }
@@ -77,3 +83,4 @@ petri_testkit.workspace = true
 tempfile = "3"
 lithos-llm = { workspace = true, features = ["runtime"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+opentelemetry_sdk.workspace = true

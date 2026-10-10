@@ -103,6 +103,7 @@ use petri_runtime::driver::lifecycle::{
     Prepared, Recorded, ResultOrigin, RunFinished, ScopeAcquired, ScopeAcquiredError,
     ScopeReleased, Transition, TransitionError, TransitionReport,
 };
+use petri_runtime::engine::Admission;
 use petri_runtime::executor::{EnvError, ExecEnv};
 use petri_runtime::ir::{
     ExecutionId, FailureInfo, FinalizationFailure, RunStatus, ScopeId, Status,
@@ -122,6 +123,7 @@ use crate::fork::{self, ForkError};
 use crate::platform_records::{PlatformRecordError, PlatformRecords};
 use crate::projection;
 use crate::recovery::{self, Plan, RecoveryError, RestoreTarget};
+use crate::run_turn::RunTurns;
 use crate::source::RunSource;
 use crate::workspace::{self, WorkspaceLookup, WorkspaceLookupError};
 
@@ -468,6 +470,8 @@ pub struct FabroHooks {
     /// is applied.
     restore:            OnceCell<Mutex<BTreeMap<String, Vec<RestoreTarget>>>>,
     store:              Arc<dyn RunStore>,
+    /// The run's `run_turn` spans, when the runtime observes its launches.
+    run_turns:          Option<Arc<RunTurns>>,
 }
 
 impl FabroHooks {
@@ -530,7 +534,17 @@ impl FabroHooks {
             resumed,
             restore: OnceCell::new(),
             store,
+            run_turns: None,
         }
+    }
+
+    /// Open and close the run's `run_turn` spans at each ACP agent attempt.
+    /// The same registry must be installed as the runtime's outermost
+    /// executor layer ([`RunTurns::executor`]), which observes the launches.
+    #[must_use]
+    pub fn with_run_turns(mut self, run_turns: Arc<RunTurns>) -> Self {
+        self.run_turns = Some(run_turns);
+        self
     }
 
     /// Hand the hooks the running coordinator, so a fatal checkpoint can
@@ -1494,7 +1508,14 @@ impl ExecutionHooks for FabroHooks {
         context: &HookContext,
         request: AdmitAttempt,
     ) -> AttemptDecision {
-        self.inner.before_attempt(context, request).await
+        let view = Arc::clone(&request.view);
+        let decision = self.inner.before_attempt(context, request).await;
+        if let Some(run_turns) = &self.run_turns {
+            if matches!(decision.admission, Admission::Admit) {
+                run_turns.open(context, &view);
+            }
+        }
+        decision
     }
 
     async fn prepare_result(
@@ -1511,6 +1532,12 @@ impl ExecutionHooks for FabroHooks {
         };
         let original = request.outcome.status.clone();
         let origin = request.origin;
+        // Every attempt's turn closes here, before anything below can return:
+        // `prepare_result` runs once per attempt, `after_record` once per
+        // firing.
+        if let Some(run_turns) = &self.run_turns {
+            run_turns.close(context, &request.view, &request.outcome);
+        }
         let mut prepared = self.inner.prepare_result(context, request).await?;
         let effective = prepared.adjustment.status.clone().unwrap_or(original);
         if matches!(effective, Status::Cancelled) {
@@ -1667,6 +1694,9 @@ impl ExecutionHooks for FabroHooks {
     }
 
     async fn run_finished(&self, context: &HookContext, finished: RunFinished) -> Vec<Note> {
+        if let Some(run_turns) = &self.run_turns {
+            run_turns.finish();
+        }
         // The diff and publication already ran in finalize_run, before Petri
         // committed the outcome.
         self.inner.run_finished(context, finished).await
@@ -1690,6 +1720,9 @@ impl ExecutionHooks for FabroHooks {
         context: &HookContext,
         acquired: ScopeAcquired,
     ) -> Result<(), ScopeAcquiredError> {
+        if let Some(run_turns) = &self.run_turns {
+            run_turns.bind_env(context.execution.raw(), &acquired.env);
+        }
         self.inner.scope_acquired(context, acquired.clone()).await?;
         let workspace = acquired.workspace.as_str().to_owned();
         self.scopes.insert(
