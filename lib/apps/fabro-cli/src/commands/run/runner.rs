@@ -45,7 +45,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::petri_worker::{self, PetriControls, PetriWorker};
 use crate::args::RunWorkerMode;
-use crate::server_client;
+use crate::{otel, server_client};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WorkerTitlePhase {
@@ -87,6 +87,13 @@ pub(crate) async fn execute(
         };
         anyhow::bail!("Precondition failed: run already finished {how} — nothing to resume");
     }
+    // The worker's `run` span (current here) carries the run id and the
+    // dispatch correlation labels; its parent came from TRACEPARENT.
+    otel::label_run_span(
+        &tracing::Span::current(),
+        &run_id.to_string(),
+        &run_state.spec.labels,
+    );
     Box::pin(petri_worker::execute(PetriWorker {
         run_id,
         target,

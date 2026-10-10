@@ -41,9 +41,11 @@
     reason = "OTLP setup runs before the tracing subscriber is initialized, so stderr is the only diagnostic sink when the exporter fails to build"
 )]
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use fabro_static::EnvVars;
+use fabro_types::trace_link;
 use opentelemetry::global;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::{Protocol, SpanExporter, WithExportConfig as _};
@@ -205,9 +207,21 @@ fn parent_context_from_traceparent(raw: Option<&str>) -> Option<opentelemetry::C
     use opentelemetry_sdk::propagation::TraceContextPropagator;
 
     let value = raw.map(str::trim).filter(|trimmed| !trimmed.is_empty())?;
-    let carrier = std::collections::HashMap::from([("traceparent".to_string(), value.to_string())]);
+    let carrier = HashMap::from([("traceparent".to_string(), value.to_string())]);
     let cx = TraceContextPropagator::new().extract(&carrier);
     cx.span().span_context().is_valid().then_some(cx)
+}
+
+/// Put `fabro.run_id` and the run's dispatch correlation labels
+/// ([`trace_link::CORRELATION_LABELS`], and only those) on a run span. A
+/// no-op when export is off.
+pub(crate) fn label_run_span(span: &tracing::Span, run_id: &str, labels: &HashMap<String, String>) {
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+    span.set_attribute("fabro.run_id", run_id.to_owned());
+    for (name, value) in trace_link::correlation_attributes(labels) {
+        span.set_attribute(name, value);
+    }
 }
 
 /// Best-effort final flush and shutdown of the OTLP provider so the current

@@ -235,11 +235,13 @@ struct State {
 /// One run's `run_turn` spans: the registry the executor layer and Fabro's
 /// hooks share.
 pub struct RunTurns {
-    tracer: BoxedTracer,
-    parent: Context,
-    run_id: String,
-    masker: Masker,
-    state:  Mutex<State>,
+    tracer:      BoxedTracer,
+    parent:      Context,
+    run_id:      String,
+    masker:      Masker,
+    /// The run's dispatch correlation attributes, on every turn.
+    correlation: Vec<KeyValue>,
+    state:       Mutex<State>,
 }
 
 impl RunTurns {
@@ -256,8 +258,23 @@ impl RunTurns {
             parent,
             run_id: run_id.into(),
             masker,
+            correlation: Vec::new(),
             state: Mutex::default(),
         })
+    }
+
+    /// Put `correlation` (the run's dispatch correlation attributes, from
+    /// `fabro_types::trace_link::correlation_attributes`) on every turn. Call
+    /// before the registry is shared: a shared registry is left unchanged.
+    #[must_use]
+    pub fn with_correlation(mut self: Arc<Self>, correlation: Vec<(String, String)>) -> Arc<Self> {
+        if let Some(turns) = Arc::get_mut(&mut self) {
+            turns.correlation = correlation
+                .into_iter()
+                .map(|(name, value)| KeyValue::new(name, value))
+                .collect();
+        }
+        self
     }
 
     /// Spans through the global tracer (the OTLP pipeline when export is on,
@@ -329,12 +346,17 @@ impl RunTurns {
             .span_builder(SPAN_NAME)
             .with_kind(SpanKind::Internal)
             .with_start_time(SystemTime::now())
-            .with_attributes(vec![
-                KeyValue::new("fabro.run_id", self.run_id.clone()),
-                KeyValue::new("fabro.node", at.node.clone()),
-                KeyValue::new("fabro.firing", i64::try_from(at.firing).unwrap_or(i64::MAX)),
-                KeyValue::new("fabro.attempt", i64::from(at.attempt)),
-            ]);
+            .with_attributes(
+                vec![
+                    KeyValue::new("fabro.run_id", self.run_id.clone()),
+                    KeyValue::new("fabro.node", at.node.clone()),
+                    KeyValue::new("fabro.firing", i64::try_from(at.firing).unwrap_or(i64::MAX)),
+                    KeyValue::new("fabro.attempt", i64::from(at.attempt)),
+                ]
+                .into_iter()
+                .chain(self.correlation.iter().cloned())
+                .collect::<Vec<_>>(),
+            );
         let span = self.tracer.build_with_context(builder, &self.parent);
         let previous = {
             let mut state = sync::lock(&self.state);
@@ -711,6 +733,7 @@ impl ProcessHandle for TelemetryProcess {
 mod tests {
     use std::sync::Mutex as StdMutex;
 
+    use fabro_types::trace_link::correlation_attributes;
     use opentelemetry::Value as OtelValue;
     use opentelemetry::trace::noop::NoopTracer;
     use opentelemetry::trace::{SpanId, TraceContextExt as _, TracerProvider as _};
@@ -964,6 +987,37 @@ mod tests {
             !span.attributes.iter().any(|kv| kv.value.as_str() == "acp"),
             "the literal env value `acp` must not appear as an attribute"
         );
+    }
+
+    #[tokio::test]
+    async fn a_turn_carries_the_runs_dispatch_correlation() {
+        let (_provider, recorded, tracer) = recording();
+        let turns = RunTurns::new(tracer, Context::new(), "01RUN", masker()).with_correlation(
+            correlation_attributes(&HashMap::from([
+                ("work.item.id".to_owned(), "bd-ib-6vhgqg".to_owned()),
+                (
+                    "livespec.dispatch.id".to_owned(),
+                    "0f1e2d3c4b5a69788796a5b4c3d2e1f0".to_owned(),
+                ),
+                ("livespec.dispatch.factory".to_owned(), "hp".to_owned()),
+                ("team".to_owned(), "platform".to_owned()),
+            ])),
+        );
+        turns.open_at(&at(1));
+        turns.close_at(1, 7, 1, &Outcome::success(Value::Null));
+
+        let span = &recorded.spans()[0];
+        assert_eq!(text(span, "fabro.run_id").as_deref(), Some("01RUN"));
+        assert_eq!(text(span, "work.item.id").as_deref(), Some("bd-ib-6vhgqg"));
+        assert_eq!(
+            text(span, "livespec.dispatch.id").as_deref(),
+            Some("0f1e2d3c4b5a69788796a5b4c3d2e1f0")
+        );
+        assert_eq!(
+            text(span, "livespec.dispatch.factory").as_deref(),
+            Some("hp")
+        );
+        assert_eq!(attribute(span, "team"), None);
     }
 
     #[tokio::test]

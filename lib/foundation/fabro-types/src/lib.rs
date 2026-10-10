@@ -58,6 +58,7 @@ pub mod system_integrations;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod timing;
+pub mod trace_link;
 pub mod transcript;
 pub mod usage;
 pub mod usage_rollup;
