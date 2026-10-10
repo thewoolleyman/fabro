@@ -67,6 +67,10 @@ pub struct RuntimeSpec {
     /// token's `agent:run_tools` scope); `None` gives the sessions Pebble's
     /// tools alone. See [`crate::host_tools`].
     pub run_tools:         Option<FabroRunToolServices>,
+    /// The run's dispatch correlation attributes
+    /// (`fabro_types::trace_link::correlation_attributes` of its labels), put
+    /// on every `run_turn` span. Empty for a run that carries none.
+    pub correlation:       Vec<(String, String)>,
 }
 
 impl RuntimeSpec {
