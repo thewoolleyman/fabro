@@ -114,6 +114,10 @@ async fn an_acp_agent_attempt_emits_one_run_turn_span() {
         runtime,
         no_questions(Arc::new(Silent)),
     );
+    request.runtime.correlation = vec![
+        ("work.item.id".to_owned(), "bd-ib-e2e".to_owned()),
+        ("livespec.dispatch.factory".to_owned(), "hp".to_owned()),
+    ];
     request.hooks = Some(HooksSpec {
         records:         Arc::new(MemoryPlatformRecords::new()),
         git:             RunGitSettings {
@@ -149,6 +153,14 @@ async fn an_acp_agent_attempt_emits_one_run_turn_span() {
     assert_eq!(attribute(span, "fabro.node").as_deref(), Some("work"));
     assert_eq!(attribute(span, "fabro.attempt").as_deref(), Some("1"));
     assert_eq!(attribute(span, "run_turn.status").as_deref(), Some("ok"));
+    assert_eq!(
+        attribute(span, "work.item.id").as_deref(),
+        Some("bd-ib-e2e")
+    );
+    assert_eq!(
+        attribute(span, "livespec.dispatch.factory").as_deref(),
+        Some("hp")
+    );
     let command = attribute(span, "run_turn.command").expect("the launch was seen");
     assert!(command.starts_with("python3 "), "{command}");
     assert!(command.ends_with("--mode plain"), "{command}");
