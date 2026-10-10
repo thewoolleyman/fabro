@@ -6,9 +6,11 @@ use fabro_config::{
     CliLayer, CliOutputLayer, RunGoalLayer, RunLayer, parse_input_overrides, parse_labels,
 };
 use fabro_manifest::{RunOverrideInput, build_run_overrides};
+use fabro_static::EnvVars;
 use fabro_types::RunIntentArgs;
 use fabro_types::settings::cli::OutputVerbosity;
 use fabro_types::settings::interp::InterpString;
+use fabro_types::trace_link::{TRACEPARENT_LABEL, is_traceparent};
 use tokio::fs;
 
 use crate::args::{PreflightArgs, RunArgs};
@@ -99,6 +101,22 @@ async fn intent_goal_from_args(
     }
 }
 
+/// The caller's W3C `traceparent` (its `TRACEPARENT` env var) carried on the
+/// run as the `traceparent` label, so the server's `run` span joins the
+/// caller's trace. An explicit `--label traceparent=...` wins; an unset or
+/// malformed value adds nothing.
+fn with_caller_traceparent(
+    mut labels: HashMap<String, String>,
+    caller: Option<&str>,
+) -> HashMap<String, String> {
+    if let Some(value) = caller.map(str::trim).filter(|value| is_traceparent(value)) {
+        labels
+            .entry(TRACEPARENT_LABEL.to_owned())
+            .or_insert_with(|| value.to_owned());
+    }
+    labels
+}
+
 pub(super) async fn prepare_intent_overrides(
     args: &RunArgs,
     cwd: &Path,
@@ -114,7 +132,10 @@ pub(super) async fn prepare_intent_overrides(
             Ok((key.clone(), value))
         })
         .collect::<Result<HashMap<_, _>>>()?;
-    let labels = parse_labels(&args.label);
+    let labels = with_caller_traceparent(
+        parse_labels(&args.label),
+        crate::process_env_var(EnvVars::TRACEPARENT).as_deref(),
+    );
     let dry_run = sparse_flag(args.dry_run);
     let auto_approve = sparse_flag(args.auto_approve);
     let preserve_sandbox = sparse_flag(args.preserve_sandbox);
@@ -186,6 +207,32 @@ mod tests {
             parent:               None,
             preserve_sandbox:     false,
             detach:               false,
+        }
+    }
+
+    #[test]
+    fn the_callers_traceparent_rides_the_run_as_a_label() {
+        let caller = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+        let labels = with_caller_traceparent(HashMap::new(), Some(caller));
+        assert_eq!(
+            labels.get(TRACEPARENT_LABEL).map(String::as_str),
+            Some(caller)
+        );
+
+        let explicit = "00-11111111111111111111111111111111-2222222222222222-01";
+        let labels = with_caller_traceparent(
+            HashMap::from([(TRACEPARENT_LABEL.to_owned(), explicit.to_owned())]),
+            Some(caller),
+        );
+        assert_eq!(
+            labels.get(TRACEPARENT_LABEL).map(String::as_str),
+            Some(explicit),
+            "an explicit label wins"
+        );
+
+        for junk in [None, Some(""), Some("not-a-traceparent")] {
+            assert!(with_caller_traceparent(HashMap::new(), junk).is_empty());
         }
     }
 

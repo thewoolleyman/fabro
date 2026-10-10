@@ -17,10 +17,38 @@
 //! only, never a credential — so unlike `OTEL_EXPORTER_OTLP_HEADERS` it is safe
 //! to hand to the sandboxed worker.
 
+use std::collections::HashMap;
+
+use fabro_types::trace_link;
 use opentelemetry::Context;
 use opentelemetry::propagation::TextMapPropagator as _;
+use opentelemetry::trace::TraceContextExt as _;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+/// Tie a run's server-side `run` span, before it is entered, to what launched
+/// the run: its parent is the caller's span when the run carries a valid
+/// `traceparent` label (`fabro run` copies its `TRACEPARENT` there), and it
+/// carries `fabro.run_id` plus the run's correlation labels
+/// ([`trace_link::CORRELATION_LABELS`], and only those). Without a label the
+/// span stays a root. A no-op when export is off.
+pub(crate) fn link_run_span(span: &tracing::Span, run_id: &str, labels: &HashMap<String, String>) {
+    if let Some(parent) = trace_link::traceparent(labels).and_then(context_from_traceparent) {
+        span.set_parent(parent);
+    }
+    span.set_attribute("fabro.run_id", run_id.to_owned());
+    for (name, value) in trace_link::correlation_attributes(labels) {
+        span.set_attribute(name, value);
+    }
+}
+
+/// Parse a W3C `traceparent` into a parent context, or `None` when it holds
+/// no valid span context.
+fn context_from_traceparent(value: &str) -> Option<Context> {
+    let carrier = HashMap::from([("traceparent".to_string(), value.to_string())]);
+    let cx = TraceContextPropagator::new().extract(&carrier);
+    cx.span().span_context().is_valid().then_some(cx)
+}
 
 /// The W3C `traceparent` for the currently-entered `tracing` span, or `None`
 /// when there is no valid OpenTelemetry context to propagate (OTLP export
@@ -145,6 +173,132 @@ mod tests {
             assert_ne!(parts[1], "0".repeat(32), "trace id must be valid");
             assert_ne!(parts[2], "0".repeat(16), "span id must be valid");
         });
+    }
+
+    const CALLER: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+    #[derive(Clone, Debug, Default)]
+    struct Recorded(std::sync::Arc<std::sync::Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>);
+
+    impl opentelemetry_sdk::trace::SpanExporter for Recorded {
+        async fn export(
+            &self,
+            batch: Vec<opentelemetry_sdk::trace::SpanData>,
+        ) -> opentelemetry_sdk::error::OTelSdkResult {
+            self.0.lock().unwrap().extend(batch);
+            Ok(())
+        }
+    }
+
+    /// Run `body` under a real layer exporting to a recorder; return what it
+    /// exported once every span closed.
+    fn exported(body: impl FnOnce()) -> Vec<opentelemetry_sdk::trace::SpanData> {
+        use opentelemetry::trace::TracerProvider as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let recorded = Recorded::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(recorded.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+        tracing::subscriber::with_default(subscriber, body);
+        let spans = recorded.0.lock().unwrap().clone();
+        spans
+    }
+
+    fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    /// The caller's `traceparent` label parents the run span, and the worker
+    /// traceparent captured under it carries the caller's trace id, so the
+    /// whole chain joins the caller's trace.
+    #[test]
+    fn a_traceparent_label_parents_the_run_span_on_the_callers_trace() {
+        let mut captured = None;
+        let spans = exported(|| {
+            let span = tracing::info_span!("run", id = "r1");
+            link_run_span(&span, "r1", &labels(&[("traceparent", CALLER)]));
+            let _guard = span.enter();
+            captured = current_traceparent();
+        });
+
+        let captured = captured.expect("a traceparent under the linked span");
+        assert_eq!(
+            captured.split('-').nth(1),
+            Some("4bf92f3577b34da6a3ce929d0e0e4736"),
+            "the worker's traceparent continues the caller's trace: {captured}"
+        );
+        let run = spans
+            .iter()
+            .find(|span| span.name == "run")
+            .expect("the run span");
+        assert_eq!(
+            run.span_context.trace_id().to_string(),
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+        assert_eq!(run.parent_span_id.to_string(), "00f067aa0ba902b7");
+    }
+
+    #[test]
+    fn without_a_traceparent_label_the_run_span_is_a_root() {
+        let spans = exported(|| {
+            let span = tracing::info_span!("run", id = "r1");
+            link_run_span(&span, "r1", &labels(&[("traceparent", "garbage")]));
+            let _guard = span.enter();
+        });
+        let run = spans
+            .iter()
+            .find(|span| span.name == "run")
+            .expect("the run span");
+        assert_ne!(
+            run.span_context.trace_id().to_string(),
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+        assert_eq!(run.parent_span_id, opentelemetry::trace::SpanId::INVALID);
+    }
+
+    #[test]
+    fn only_the_correlation_labels_reach_the_run_span() {
+        let spans = exported(|| {
+            let span = tracing::info_span!("run", id = "r1");
+            link_run_span(
+                &span,
+                "r1",
+                &labels(&[
+                    ("work.item.id", "bd-ib-6vhgqg"),
+                    ("livespec.dispatch.id", "0f1e2d3c4b5a69788796a5b4c3d2e1f0"),
+                    ("livespec.dispatch.factory", "hp"),
+                    ("team", "platform"),
+                ]),
+            );
+            let _guard = span.enter();
+        });
+        let run = spans
+            .iter()
+            .find(|span| span.name == "run")
+            .expect("the run span");
+        let attribute = |key: &str| {
+            run.attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == key)
+                .map(|kv| kv.value.as_str().into_owned())
+        };
+        assert_eq!(attribute("fabro.run_id").as_deref(), Some("r1"));
+        assert_eq!(attribute("work.item.id").as_deref(), Some("bd-ib-6vhgqg"));
+        assert_eq!(
+            attribute("livespec.dispatch.id").as_deref(),
+            Some("0f1e2d3c4b5a69788796a5b4c3d2e1f0")
+        );
+        assert_eq!(
+            attribute("livespec.dispatch.factory").as_deref(),
+            Some("hp")
+        );
+        assert_eq!(attribute("team"), None);
     }
 
     /// Pins the one hazard the capture test above cannot reach: fabro-CLI
