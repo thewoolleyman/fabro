@@ -14,13 +14,16 @@ use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
 use tracing_appender::rolling;
 use tracing_subscriber::field::RecordFields;
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::format::{DefaultFields, FormatEvent, FormatFields, Writer};
 use tracing_subscriber::fmt::writer::MakeWriter;
 use tracing_subscriber::fmt::{FmtContext, FormattedFields};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing_subscriber::{EnvFilter, Layer as _, fmt};
+
+use crate::otel;
 
 const LOG_RETENTION_DAYS: u32 = 7;
 
@@ -355,13 +358,20 @@ where
     W: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
 {
     tracing_subscriber::registry()
-        .with(filter)
         .with(
             fmt::layer()
                 .with_writer(file_writer)
                 .with_target(true)
-                .with_ansi(false),
+                .with_ansi(false)
+                .with_filter(filter),
         )
+        // Additive OTLP export: a no-op unless an OTLP endpoint env var is
+        // set. Filtered INDEPENDENTLY of FABRO_LOG, which gates only the fmt
+        // layers, so quieting logs cannot silently turn telemetry off. The
+        // INFO floor sits INSIDE the `Some` (via `map`): a `Filtered` around the
+        // whole `Option` would report an INFO max-level hint even when export
+        // is off, building INFO callsites only to drop them.
+        .with(otel::otel_layer().map(|layer| layer.with_filter(LevelFilter::INFO)))
         .init();
 }
 
@@ -376,14 +386,21 @@ where
 
     let ansi = console::colors_enabled();
     tracing_subscriber::registry()
-        .with(filter)
         .with(
             fmt::layer()
                 .fmt_fields(TtySpanFields::default())
                 .with_writer(stdout_writer)
                 .with_ansi(ansi)
-                .event_format(TtyLogFormat::new(ansi)),
+                .event_format(TtyLogFormat::new(ansi))
+                .with_filter(filter),
         )
+        // Additive OTLP export: a no-op unless an OTLP endpoint env var is
+        // set. Filtered INDEPENDENTLY of FABRO_LOG, which gates only the fmt
+        // layers, so quieting logs cannot silently turn telemetry off. The
+        // INFO floor sits INSIDE the `Some` (via `map`): a `Filtered` around the
+        // whole `Option` would report an INFO max-level hint even when export
+        // is off, building INFO callsites only to drop them.
+        .with(otel::otel_layer().map(|layer| layer.with_filter(LevelFilter::INFO)))
         .init();
 }
 
@@ -396,19 +413,27 @@ fn init_worker_subscriber<ServerWriter, RunWriter>(
     RunWriter: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
 {
     tracing_subscriber::registry()
-        .with(filter)
         .with(
             fmt::layer()
                 .with_writer(server_writer)
                 .with_target(true)
-                .with_ansi(false),
+                .with_ansi(false)
+                .with_filter(filter.clone()),
         )
         .with(
             fmt::layer()
                 .with_writer(run_writer)
                 .with_target(true)
-                .with_ansi(false),
+                .with_ansi(false)
+                .with_filter(filter),
         )
+        // Additive OTLP export: a no-op unless an OTLP endpoint env var is
+        // set. Filtered INDEPENDENTLY of FABRO_LOG, which gates only the fmt
+        // layers, so quieting logs cannot silently turn telemetry off. The
+        // INFO floor sits INSIDE the `Some` (via `map`): a `Filtered` around the
+        // whole `Option` would report an INFO max-level hint even when export
+        // is off, building INFO callsites only to drop them.
+        .with(otel::otel_layer().map(|layer| layer.with_filter(LevelFilter::INFO)))
         .init();
 }
 
@@ -427,20 +452,28 @@ fn init_worker_stdout_subscriber<ServerWriter, RunWriter>(
 
     let ansi = console::colors_enabled();
     tracing_subscriber::registry()
-        .with(filter)
         .with(
             fmt::layer()
                 .fmt_fields(TtySpanFields::default())
                 .with_writer(server_writer)
                 .with_ansi(ansi)
-                .event_format(TtyLogFormat::new(ansi)),
+                .event_format(TtyLogFormat::new(ansi))
+                .with_filter(filter.clone()),
         )
         .with(
             fmt::layer()
                 .with_writer(run_writer)
                 .with_target(true)
-                .with_ansi(false),
+                .with_ansi(false)
+                .with_filter(filter),
         )
+        // Additive OTLP export: a no-op unless an OTLP endpoint env var is
+        // set. Filtered INDEPENDENTLY of FABRO_LOG, which gates only the fmt
+        // layers, so quieting logs cannot silently turn telemetry off. The
+        // INFO floor sits INSIDE the `Some` (via `map`): a `Filtered` around the
+        // whole `Option` would report an INFO max-level hint even when export
+        // is off, building INFO callsites only to drop them.
+        .with(otel::otel_layer().map(|layer| layer.with_filter(LevelFilter::INFO)))
         .init();
 }
 
@@ -599,6 +632,67 @@ mod tests {
         assert!(
             !output.contains("\x1b["),
             "color-disabled output should be plain, got: {output:?}"
+        );
+    }
+
+    // Pins the decoupling the per-layer filtering exists to provide: a quiet
+    // FABRO_LOG must NOT silence OTLP export. Mirrors the builders'
+    // composition (FABRO_LOG on the fmt layer, a fixed INFO floor on the
+    // export layer) with a recording stand-in for the OTLP layer. A refactor
+    // that re-adds a GLOBAL `.with(filter)` stops the INFO span reaching the
+    // export layer at `warn`, and this test fails.
+    #[test]
+    fn export_layer_still_sees_info_when_fabro_log_is_quieter() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use tracing::span;
+        use tracing_subscriber::filter::{EnvFilter, LevelFilter};
+        use tracing_subscriber::layer::{Context, Layer};
+
+        #[derive(Clone, Default)]
+        struct RecordingLayer {
+            spans:  Arc<AtomicUsize>,
+            events: Arc<AtomicUsize>,
+        }
+        impl<S: tracing::Subscriber> Layer<S> for RecordingLayer {
+            fn on_new_span(&self, _: &span::Attributes<'_>, _: &span::Id, _: Context<'_, S>) {
+                self.spans.fetch_add(1, Ordering::Relaxed);
+            }
+            fn on_event(&self, _: &tracing::Event<'_>, _: Context<'_, S>) {
+                self.events.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let logs = CapturedTrace::default();
+        let recorder = RecordingLayer::default();
+        let subscriber = registry()
+            .with(
+                tracing_fmt::layer()
+                    .with_writer(logs.clone())
+                    .with_ansi(false)
+                    .with_filter(EnvFilter::new("warn")),
+            )
+            .with(recorder.clone().with_filter(LevelFilter::INFO));
+
+        subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("run", id = "test");
+            let _guard = span.enter();
+            tracing::info!("inside the run");
+        });
+
+        assert!(
+            logs.captured_output().is_empty(),
+            "FABRO_LOG=warn must drop INFO from logs, got: {:?}",
+            logs.captured_output()
+        );
+        assert_eq!(
+            recorder.spans.load(Ordering::Relaxed),
+            1,
+            "the export layer must still see the INFO span at FABRO_LOG=warn"
+        );
+        assert!(
+            recorder.events.load(Ordering::Relaxed) >= 1,
+            "the export layer must still see the INFO event at FABRO_LOG=warn"
         );
     }
 
