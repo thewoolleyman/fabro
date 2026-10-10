@@ -62,6 +62,10 @@ tokio-tungstenite.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+tracing-opentelemetry.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 dirs.workspace = true
 serde.workspace = true
