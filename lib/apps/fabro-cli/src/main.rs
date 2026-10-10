@@ -12,6 +12,7 @@ mod local_server;
 mod logging;
 mod manifest_args;
 mod mcp_servers;
+mod otel;
 mod server_client;
 mod server_runs;
 mod shared;
@@ -114,6 +115,10 @@ async fn main() {
         }
     }
     fabro_telemetry::shutdown();
+    // Best-effort final drain of the OTLP span batch (no-op when export is
+    // off; the batch processor also exports periodically). Before the
+    // `process::exit` below, which would otherwise drop the last batch.
+    otel::shutdown();
 
     if let Err(err) = result {
         let json_mode = raw_args.iter().any(|a| a == "--json");
