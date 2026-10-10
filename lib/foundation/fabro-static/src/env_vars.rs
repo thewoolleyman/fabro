@@ -194,6 +194,26 @@ impl EnvVars {
     pub const TWIN_OPENAI_REQUIRE_AUTH: &'static str = "TWIN_OPENAI_REQUIRE_AUTH";
     pub const USER: &'static str = "USER";
     pub const ZDOTDIR: &'static str = "ZDOTDIR";
+
+    // Observability / OTLP export (opt-in; see fabro-cli's `otel` module).
+    pub const OTEL_EXPORTER_OTLP_ENDPOINT: &'static str = "OTEL_EXPORTER_OTLP_ENDPOINT";
+    pub const OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: &'static str =
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT";
+    pub const OTEL_EXPORTER_OTLP_PROTOCOL: &'static str = "OTEL_EXPORTER_OTLP_PROTOCOL";
+    pub const OTEL_EXPORTER_OTLP_TRACES_PROTOCOL: &'static str =
+        "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL";
+    pub const OTEL_EXPORTER_OTLP_TIMEOUT: &'static str = "OTEL_EXPORTER_OTLP_TIMEOUT";
+    pub const OTEL_EXPORTER_OTLP_TRACES_TIMEOUT: &'static str = "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT";
+    /// Credential-bearing: the collector's egress key travels here. Never
+    /// forwarded to a worker.
+    pub const OTEL_EXPORTER_OTLP_HEADERS: &'static str = "OTEL_EXPORTER_OTLP_HEADERS";
+    /// Credential-bearing, per-signal spelling. Never forwarded to a worker.
+    pub const OTEL_EXPORTER_OTLP_TRACES_HEADERS: &'static str = "OTEL_EXPORTER_OTLP_TRACES_HEADERS";
+    pub const OTEL_RESOURCE_ATTRIBUTES: &'static str = "OTEL_RESOURCE_ATTRIBUTES";
+    pub const OTEL_SERVICE_NAME: &'static str = "OTEL_SERVICE_NAME";
+    /// W3C Trace Context carrier that parents a subprocess's spans on the span
+    /// that spawned it. Per-run data (trace and span ids, flags), non-secret.
+    pub const TRACEPARENT: &'static str = "TRACEPARENT";
 }
 
 #[cfg(test)]
@@ -348,6 +368,17 @@ mod tests {
             EnvVars::TWIN_OPENAI_REQUIRE_AUTH,
             EnvVars::USER,
             EnvVars::ZDOTDIR,
+            EnvVars::OTEL_EXPORTER_OTLP_ENDPOINT,
+            EnvVars::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,
+            EnvVars::OTEL_EXPORTER_OTLP_PROTOCOL,
+            EnvVars::OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,
+            EnvVars::OTEL_EXPORTER_OTLP_TIMEOUT,
+            EnvVars::OTEL_EXPORTER_OTLP_TRACES_TIMEOUT,
+            EnvVars::OTEL_EXPORTER_OTLP_HEADERS,
+            EnvVars::OTEL_EXPORTER_OTLP_TRACES_HEADERS,
+            EnvVars::OTEL_RESOURCE_ATTRIBUTES,
+            EnvVars::OTEL_SERVICE_NAME,
+            EnvVars::TRACEPARENT,
         ];
 
         for value in values {

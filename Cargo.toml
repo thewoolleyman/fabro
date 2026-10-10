@@ -51,6 +51,17 @@ unicase = "2"
 unicode-normalization = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tracing-appender = "0.2"
+# Opt-in OTLP/HTTP export of fabro's `tracing` spans and the worker's
+# `run_turn` spans (see fabro-cli/src/otel.rs and fabro-petri/src/run_turn.rs).
+# Inert unless an OTLP endpoint env var is set. The BLOCKING OTLP client keeps
+# the SDK batch processor's export thread free of any async runtime.
+# `opentelemetry-otlp`'s HTTP features enable `metrics` unconditionally, so the
+# metrics SDK compiles regardless; `default-features = false` only drops its
+# unused logs exporter.
+opentelemetry = "0.30"
+opentelemetry_sdk = "0.30"
+opentelemetry-otlp = { version = "0.30", default-features = false, features = ["trace", "http-proto", "http-json", "reqwest-blocking-client"] }
+tracing-opentelemetry = "0.31"
 rmcp = { version = "1.4", default-features = false }
 walkdir = "2"
 regex = "1"
