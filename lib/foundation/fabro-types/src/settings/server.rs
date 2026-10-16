@@ -191,19 +191,23 @@ pub struct SandboxPluginSettings {
     /// Executable path. When absent the server, and Petri in the run's
     /// worker, search `PATH` for `sandbox-driver-<kind>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path:        Option<String>,
+    pub path:         Option<String>,
     /// Pinned SHA-256 of the executable, hex.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sha256:      Option<String>,
+    pub sha256:       Option<String>,
     /// Allow launching without a checksum.
     #[serde(default)]
-    pub dev:         bool,
+    pub dev:          bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub args:        Vec<String>,
+    pub args:         Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub env:         BTreeMap<String, String>,
+    pub env:          BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub inherit_env: Vec<String>,
+    pub inherit_env:  Vec<String>,
+    /// The host name or address the plugin's sandboxes use to reach
+    /// services on the Fabro host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_address: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

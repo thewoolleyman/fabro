@@ -9,18 +9,24 @@
 //! [`bare_runtime`], so none falls back to launching a provider plugin,
 //! which a release build cannot verify.
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use fabro_static::EnvVars;
+use fabro_types::SandboxProviderKind;
+use fabro_types::settings::server::{SandboxPluginSettings, ServerSandboxProvidersSettings};
 use petri_runtime::{
-    InProcessProviders, ProviderContext, ProviderFactory, ProviderNetwork, Runtime, fingerprint,
+    InProcessProviders, PluginSettings, ProviderContext, ProviderFactory, ProviderNetwork, Runtime,
+    fingerprint,
 };
 use sandbox_driver::{AuthError, Error, ProviderKind, SandboxProvider};
 use sandbox_driver_daytona::{DaytonaConfig, DaytonaProvider};
 use sandbox_driver_docker::DockerProvider;
 use sandbox_driver_host::HostProvider;
+
+use crate::engine::RunError;
 
 const USER_AGENT: &str = concat!("fabro-server/", env!("CARGO_PKG_VERSION"));
 
@@ -99,6 +105,9 @@ pub struct SandboxProviderConfig {
     docker_host:         Option<String>,
     docker_host_address: Option<String>,
     daytona:             Option<DaytonaCredentials>,
+    /// The enabled third-party providers' plugin settings, from the
+    /// server's `server.sandbox.providers`.
+    plugins:             BTreeMap<SandboxProviderKind, SandboxPluginSettings>,
 }
 
 impl SandboxProviderConfig {
@@ -123,7 +132,43 @@ impl SandboxProviderConfig {
             docker_host_address: lookup(EnvVars::PETRI_SANDBOX_DOCKER_HOST_ADDRESS)
                 .filter(|value| !value.trim().is_empty()),
             daytona,
+            plugins: BTreeMap::new(),
         }
+    }
+}
+
+impl SandboxProviderConfig {
+    /// This configuration with the server's enabled third-party plugins.
+    #[must_use]
+    pub fn with_plugins(mut self, providers: &ServerSandboxProvidersSettings) -> Self {
+        self.plugins = providers
+            .enabled_plugins()
+            .map(|(kind, settings)| (kind.clone(), settings.clone()))
+            .collect();
+        self
+    }
+
+    /// Petri's settings for launching `kind`'s plugin, as the server
+    /// configured it.
+    pub(crate) fn plugin(&self, kind: &SandboxProviderKind) -> Result<PluginSettings, RunError> {
+        let settings = self
+            .plugins
+            .get(kind)
+            .ok_or_else(|| RunError::UnconfiguredPlugin {
+                provider: kind.clone(),
+            })?;
+        PluginSettings::configured(
+            kind.as_str(),
+            settings.path.as_ref().map(PathBuf::from),
+            settings.sha256.clone(),
+            settings.dev,
+            settings.host_address.clone(),
+            settings.env.clone(),
+        )
+        .map_err(|error| RunError::InvalidPlugin {
+            provider: kind.clone(),
+            message:  error.to_string(),
+        })
     }
 }
 
