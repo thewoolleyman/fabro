@@ -194,3 +194,15 @@ opt-level = 2
 opt-level = 2
 [profile.dev.package.regex-syntax]
 opt-level = 2
+
+# PROTOTYPE ONLY (kubernetes-sandbox-backend, bd-ib-n7zj4a): the local Petri
+# branch k8s-plugin-backend-proto, based on the locked commit 2548c10, which
+# adds the generic plugin backend and resources. Not for merge.
+[patch."https://github.com/lithoscomputer/petri.git"]
+petri_runtime = { path = "/data/projects/petri/crates/core/runtime", package = "petri-runtime" }
+petri_execution = { path = "/data/projects/petri/crates/core/execution", package = "petri-execution" }
+petri_store = { path = "/data/projects/petri/crates/core/store", package = "petri-store" }
+petri_attractor_steps = { path = "/data/projects/petri/crates/attractor/steps", package = "petri-attractor-steps" }
+petri_frontend_attractor = { path = "/data/projects/petri/crates/attractor/frontend", package = "petri-frontend-attractor" }
+petri_frontend_fabro = { path = "/data/projects/petri/crates/fabro/frontend", package = "petri-frontend-fabro" }
+petri_testkit = { path = "/data/projects/petri/crates/core/testkit", package = "petri-testkit" }

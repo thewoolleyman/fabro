@@ -74,7 +74,7 @@ use petri_runtime::driver::lifecycle::ExecutionHooks;
 pub use petri_runtime::executor::Retention;
 use petri_runtime::executor::SecretProvider;
 use petri_runtime::{DaytonaResources, LostSandbox, RunOptions, Runtime, SandboxBackend};
-use sandbox_driver::NetworkPolicy;
+use sandbox_driver::{NetworkPolicy, Resources};
 use tokio::fs;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -169,6 +169,14 @@ pub enum RunError {
     UnsupportedProvider { provider: SandboxProviderKind },
     #[error("the Daytona CPU allocation must be a non-negative integer: {cpu}")]
     InvalidCpu { cpu: i32 },
+    /// The run's provider is a plugin the server has no enabled settings for.
+    #[error("sandbox provider `{provider}` is not an enabled plugin in server.sandbox.providers")]
+    UnconfiguredPlugin { provider: SandboxProviderKind },
+    #[error("sandbox provider `{provider}`'s plugin settings are invalid: {message}")]
+    InvalidPlugin {
+        provider: SandboxProviderKind,
+        message:  String,
+    },
     #[error("the run's record could not be opened")]
     Open(#[source] petri_store::StoreError),
     #[error("the run's record could not be read")]
@@ -235,6 +243,14 @@ pub async fn run(request: RunRequest) -> Result<RunOutcome, RunError> {
     }
     if backend == SandboxBackend::Daytona {
         options.sandbox.daytona_resources = daytona_resources(&request.resources)?;
+    }
+    if backend == SandboxBackend::Plugin {
+        options.sandbox.plugin = Some(request.runtime.sandbox.plugin(&request.provider)?);
+    }
+    // Every container backend but Daytona, which sizes its snapshot above,
+    // receives the environment's resources on each sandbox it creates.
+    if matches!(backend, SandboxBackend::Docker | SandboxBackend::Plugin) {
+        options.sandbox.resources = Some(container_resources(&request.resources)?);
     }
     // A normal resume requires its original sandbox to survive.
     options.sandbox.lost_sandbox = LostSandbox::Refuse;
@@ -475,12 +491,23 @@ fn daytona_resources(
     })
 }
 
+fn container_resources(settings: &EnvironmentResourcesSettings) -> Result<Resources, RunError> {
+    let mut resources = Resources::default();
+    resources.cpu_cores = settings
+        .cpu
+        .map(|cpu| u32::try_from(cpu).map_err(|_| RunError::InvalidCpu { cpu }))
+        .transpose()?;
+    resources.memory_mb = settings.memory.map(mebibytes);
+    resources.disk_mb = settings.disk.map(mebibytes);
+    Ok(resources)
+}
+
 fn mebibytes(size: Size) -> u64 {
     size.as_bytes().div_ceil(1024 * 1024)
 }
 
-/// The sandbox backend for Fabro's provider kind; `None` for a kind Petri
-/// does not serve.
+/// The sandbox backend for Fabro's provider kind: a bundled kind's own
+/// backend, and the plugin backend for any other kind.
 pub(crate) fn backend(provider: &SandboxProviderKind) -> Option<SandboxBackend> {
     if *provider == SandboxProviderKind::LOCAL {
         Some(SandboxBackend::Host)
@@ -489,7 +516,7 @@ pub(crate) fn backend(provider: &SandboxProviderKind) -> Option<SandboxBackend> 
     } else if *provider == SandboxProviderKind::DAYTONA {
         Some(SandboxBackend::Daytona)
     } else {
-        None
+        Some(SandboxBackend::Plugin)
     }
 }
 

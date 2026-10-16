@@ -1154,6 +1154,7 @@ mod tests {
                 args:        vec!["--flag".to_string()],
                 env:         BTreeMap::from([("A".to_string(), "1".to_string())]),
                 inherit_env: vec!["PATH".to_string()],
+                host_address: None,
             },
         );
         assert_eq!(

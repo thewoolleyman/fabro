@@ -141,6 +141,10 @@ pub struct ServerSandboxProviderLayer {
     pub env:         Option<BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherit_env: Option<Vec<String>>,
+    /// The host name or address this provider's sandboxes use to reach
+    /// services on the Fabro host. Rejected for bundled kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_address: Option<String>,
 }
 
 /// `[server.storage]` — single managed local disk root.

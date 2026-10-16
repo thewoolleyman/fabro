@@ -204,6 +204,10 @@ pub struct SandboxPluginSettings {
     pub env:         BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inherit_env: Vec<String>,
+    /// The host name or address the plugin's sandboxes use to reach
+    /// services on the Fabro host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_address: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

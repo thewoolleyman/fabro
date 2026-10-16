@@ -678,7 +678,13 @@ async fn runtime_spec(
     });
     Ok(RuntimeSpec {
         stage_credentials: None,
-        sandbox: SandboxProviderConfig::from_lookup(daytona, crate::process_env_var),
+        sandbox: SandboxProviderConfig::from_lookup(daytona, crate::process_env_var).with_plugins(
+            &fabro_config::ServerSettingsBuilder::load_default()
+                .context("loading the server settings")?
+                .server
+                .sandbox
+                .providers,
+        ),
         settings_toml: None,
         mcp_catalog_toml: None,
         model_client,

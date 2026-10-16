@@ -51,6 +51,8 @@ pub struct PruneRequest {
 pub enum PruneError {
     #[error("the run's sandbox provider `{provider}` is not one Petri serves")]
     UnsupportedProvider { provider: SandboxProviderKind },
+    #[error("{message}")]
+    Plugin { message: String },
     /// A live process holds the run's lease: pruning under it would delete
     /// the sandboxes it is using.
     #[error("run {locator} is held by a live process; stop it first")]
@@ -72,6 +74,13 @@ pub async fn prune(request: PruneRequest) -> Result<PruneReport, PruneError> {
     options.run_key = Some(RunKey::new(request.run_id.as_str()));
     options.retention = engine::RETENTION;
     options.sandbox.backend = backend;
+    if backend == petri_runtime::SandboxBackend::Plugin {
+        options.sandbox.plugin = Some(request.sandbox.plugin(&request.provider).map_err(|error| {
+            PruneError::Plugin {
+                message: error.to_string(),
+            }
+        })?);
+    }
     let runtime = providers::bare_runtime(&request.sandbox)
         .store(request.store)
         .options(options);
