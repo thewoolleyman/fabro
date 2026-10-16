@@ -165,6 +165,9 @@ impl SandboxProviderConfig {
             settings.host_address.clone(),
             settings.env.clone(),
         )
+        .map(|configured| {
+            configured.with_launch(settings.args.clone(), settings.inherit_env.clone())
+        })
         .map_err(|error| RunError::InvalidPlugin {
             provider: kind.clone(),
             message:  error.to_string(),
