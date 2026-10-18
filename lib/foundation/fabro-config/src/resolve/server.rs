@@ -66,7 +66,9 @@ pub fn resolve_server(layer: &ServerLayer, errors: &mut Vec<ResolveError>) -> Se
     }
 }
 
-fn resolve_sandbox(
+/// `server.sandbox` alone. A run worker reads only its sandbox providers,
+/// so it resolves this section without the rest of the server namespace.
+pub fn resolve_sandbox(
     layer: Option<&ServerSandboxLayer>,
     errors: &mut Vec<ResolveError>,
 ) -> ServerSandboxSettings {
