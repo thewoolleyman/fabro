@@ -194,3 +194,16 @@ opt-level = 2
 opt-level = 2
 [profile.dev.package.regex-syntax]
 opt-level = 2
+
+# Carried for the factory (thewoolleyman/fabro factory-integration only, never
+# upstream): Petri from the thewoolleyman/petri fork's factory-integration
+# branch, which carries the plugin sandbox backend and generic resources
+# (topic branch plugin-sandbox-backend) until lithoscomputer/petri merges it.
+[patch."https://github.com/lithoscomputer/petri.git"]
+petri_runtime = { git = "https://github.com/thewoolleyman/petri.git", branch = "factory-integration", package = "petri-runtime" }
+petri_execution = { git = "https://github.com/thewoolleyman/petri.git", branch = "factory-integration", package = "petri-execution" }
+petri_store = { git = "https://github.com/thewoolleyman/petri.git", branch = "factory-integration", package = "petri-store" }
+petri_attractor_steps = { git = "https://github.com/thewoolleyman/petri.git", branch = "factory-integration", package = "petri-attractor-steps" }
+petri_frontend_attractor = { git = "https://github.com/thewoolleyman/petri.git", branch = "factory-integration", package = "petri-frontend-attractor" }
+petri_frontend_fabro = { git = "https://github.com/thewoolleyman/petri.git", branch = "factory-integration", package = "petri-frontend-fabro" }
+petri_testkit = { git = "https://github.com/thewoolleyman/petri.git", branch = "factory-integration", package = "petri-testkit" }
