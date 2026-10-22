@@ -194,3 +194,23 @@ opt-level = 2
 opt-level = 2
 [profile.dev.package.regex-syntax]
 opt-level = 2
+
+# TEMPORARY, drop before merge: Petri main with lithoscomputer/petri#122 and the
+# registered-provider resources PR on top. Remove once both land and the
+# internal-dependency update moves the `petri_*` pins past them.
+[patch."https://github.com/lithoscomputer/petri.git"]
+petri-attractor-steps = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
+petri-driver = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
+petri-engine = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
+petri-execution = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
+petri-executor = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
+petri-executor-sandbox = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
+petri-frontend = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
+petri-frontend-attractor = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
+petri-frontend-fabro = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
+petri-frontend-native = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
+petri-ir = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
+petri-runtime = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
+petri-steps = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
+petri-store = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
+petri-testkit = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
