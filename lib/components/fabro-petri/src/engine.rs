@@ -276,16 +276,10 @@ pub async fn run(mut request: RunRequest) -> Result<RunOutcome, RunError> {
     if backend != SandboxBackend::Host {
         options.sandbox.network = network_policy(&request.network);
     }
-    match &backend {
-        SandboxBackend::Daytona => {
-            options.sandbox.daytona_resources = daytona_resources(&request.resources)?;
-        }
-        // A registered provider sizes each sandbox over its template.
-        SandboxBackend::Registered(_) => {
-            options.sandbox.resources = Some(registered_resources(&request.resources)?);
-        }
-        _ => {}
+    if backend == SandboxBackend::Daytona {
+        options.sandbox.daytona_resources = daytona_resources(&request.resources)?;
     }
+    options.sandbox.resources = sandbox_resources(&backend, &request.resources)?;
     options.sandbox.backend = backend.clone();
     // A normal resume requires its original sandbox to survive.
     options.sandbox.lost_sandbox = LostSandbox::Refuse;
@@ -565,6 +559,23 @@ fn daytona_resources(
 
 /// The environment's resources for a registered provider: each one given
 /// replaces the template's, and one left out keeps it.
+/// The size each sandbox of `backend` is created with, from the environment's
+/// resources. A registered provider sizes each sandbox over its template, and a
+/// Docker container sandbox takes the same size; without it a Docker sandbox
+/// runs with no CPU or memory limit at all. The host runs no container, and
+/// Daytona sizes its runner snapshot from `daytona_resources` instead.
+fn sandbox_resources(
+    backend: &SandboxBackend,
+    settings: &EnvironmentResourcesSettings,
+) -> Result<Option<Resources>, RunError> {
+    match backend {
+        SandboxBackend::Registered(_) | SandboxBackend::Docker => {
+            registered_resources(settings).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
 fn registered_resources(settings: &EnvironmentResourcesSettings) -> Result<Resources, RunError> {
     let mut resources = Resources::default();
     resources.cpu_cores = settings
@@ -729,6 +740,34 @@ mod tests {
         assert_eq!(resources.cpu_cores, Some(2));
         assert_eq!(resources.memory_mb, Some(3815));
         assert_eq!(resources.disk_mb, None, "the template's disk is kept");
+    }
+
+    #[test]
+    fn docker_and_registered_sandboxes_are_sized_and_the_host_is_not() {
+        let settings = EnvironmentResourcesSettings {
+            cpu: Some(4),
+            memory: Some("8GB".parse().expect("a size")),
+            ..EnvironmentResourcesSettings::default()
+        };
+        let docker = sandbox_resources(&SandboxBackend::Docker, &settings)
+            .expect("valid resources")
+            .expect("a Docker sandbox is sized");
+        assert_eq!(docker.cpu_cores, Some(4));
+        assert_eq!(docker.memory_mb, Some(7630), "8GB is 7630 MiB, rounded up");
+        let kind = SandboxProviderKind::try_new("kubernetes").expect("a valid kind");
+        let registered = backend(&kind).expect("a registered backend");
+        assert!(
+            sandbox_resources(&registered, &settings)
+                .expect("valid resources")
+                .is_some(),
+            "a registered provider's sandbox is sized"
+        );
+        assert!(
+            sandbox_resources(&SandboxBackend::Host, &settings)
+                .expect("valid resources")
+                .is_none(),
+            "the host runs no container to size"
+        );
     }
 
     fn outcome_with(status: RunStatus, failure: Option<&str>, complete: bool) -> RunOutcome {
