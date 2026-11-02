@@ -97,6 +97,24 @@ pub struct RunIntegrationsGithubLayer {
     /// one wholesale (`Some(vec![])` is an explicit clear); no `...` splice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub additional_repositories: Option<Vec<String>>,
+    /// `[run.integrations.github.app]` — the GitHub App this run
+    /// authenticates as instead of the server's global integration, named
+    /// by vault secret names. The higher-precedence table replaces the lower
+    /// one wholesale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app:                     Option<RunGithubAppSourceLayer>,
+}
+
+/// `[run.integrations.github.app]` — vault secret NAMES, never values.
+/// Kept as raw strings here; emptiness is rejected at resolve time so the
+/// diagnostic carries the field path.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunGithubAppSourceLayer {
+    #[serde(default)]
+    pub app_id_secret:      String,
+    #[serde(default)]
+    pub private_key_secret: String,
 }
 
 impl Combine for RunIntegrationsGithubLayer {
@@ -106,6 +124,7 @@ impl Combine for RunIntegrationsGithubLayer {
             additional_repositories: self
                 .additional_repositories
                 .or(other.additional_repositories),
+            app:                     self.app.or(other.app),
         }
     }
 }

@@ -8,9 +8,10 @@ use fabro_types::settings::run::{
     McpServerSettings, McpTransport, MergeStrategy, NotificationProviderSettings,
     NotificationRouteSettings, PreparedStep, PreparedStepRun, PullRequestSettings,
     ResolvedMcpEntry, RunAgentSettings, RunBranchSettings, RunCheckpointSettings, RunCloneSettings,
-    RunExecutionSettings, RunGitSettings, RunGoal, RunIntegrationsGithubSettings,
-    RunIntegrationsSettings, RunInterviewsSettings, RunModelControls, RunModelSettings,
-    RunNamespace, RunPrepareSettings, RunScmSettings, ScmGitHubSettings, TlsMode,
+    RunExecutionSettings, RunGitSettings, RunGithubAppSource, RunGoal,
+    RunIntegrationsGithubSettings, RunIntegrationsSettings, RunInterviewsSettings,
+    RunModelControls, RunModelSettings, RunNamespace, RunPrepareSettings, RunScmSettings,
+    ScmGitHubSettings, TlsMode,
 };
 use fabro_util::workspace_glob::WorkspaceGlob;
 
@@ -19,9 +20,9 @@ use crate::{
     EnvironmentLayer, HookAgentMarker, HookEntry, HookTlsMode, InterviewProviderLayer,
     InterviewsLayer, McpEntryLayer, MergeMap, ModelRefOrSplice, NotificationProviderLayer,
     NotificationRouteLayer, RunAgentLayer, RunArtifactsLayer, RunCheckpointLayer, RunCloneLayer,
-    RunExecutionLayer, RunGitLayer, RunGoalLayer, RunIntegrationsGithubLayer, RunIntegrationsLayer,
-    RunLayer, RunModelLayer, RunPrepareLayer, RunPullRequestLayer, RunRunBranchLayer, RunScmLayer,
-    StickyMap, StringOrSplice,
+    RunExecutionLayer, RunGitLayer, RunGithubAppSourceLayer, RunGoalLayer,
+    RunIntegrationsGithubLayer, RunIntegrationsLayer, RunLayer, RunModelLayer, RunPrepareLayer,
+    RunPullRequestLayer, RunRunBranchLayer, RunScmLayer, StickyMap, StringOrSplice,
 };
 
 pub fn resolve_run(
@@ -166,7 +167,41 @@ fn resolve_integrations_github(
     RunIntegrationsGithubSettings {
         permissions,
         additional_repositories,
+        app: github
+            .app
+            .as_ref()
+            .and_then(|app| resolve_github_app_source(app, errors)),
     }
+}
+
+/// A per-run GitHub App source names two vault secrets. Both names are
+/// required and must be non-blank: an empty name could only ever resolve
+/// to "no secret", and a selected source that cannot resolve has to fail
+/// the configuration rather than leave the run on the server's App.
+fn resolve_github_app_source(
+    app: &RunGithubAppSourceLayer,
+    errors: &mut Vec<ResolveError>,
+) -> Option<RunGithubAppSource> {
+    let mut valid = true;
+    for (field, value) in [
+        ("app_id_secret", &app.app_id_secret),
+        ("private_key_secret", &app.private_key_secret),
+    ] {
+        if value.trim().is_empty() || value.trim() != value {
+            errors.push(ResolveError::Invalid {
+                path:   format!("run.integrations.github.app.{field}"),
+                reason: format!(
+                    "a selected GitHub App source must name a vault secret in `{field}` (a \
+                     non-empty name without surrounding whitespace), got `{value}`"
+                ),
+            });
+            valid = false;
+        }
+    }
+    valid.then(|| RunGithubAppSource {
+        app_id_secret:      app.app_id_secret.clone(),
+        private_key_secret: app.private_key_secret.clone(),
+    })
 }
 
 /// A non-empty additional-repository set needs a token that can reach

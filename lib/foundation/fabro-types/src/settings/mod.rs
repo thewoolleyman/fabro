@@ -40,9 +40,9 @@ pub use run::{
     McpServerRef, McpServerSettings, McpTransport, NotificationProviderSettings,
     NotificationRouteSettings, PreparedStep, PullRequestSettings, ResolvedMcpEntry,
     RunAgentSettings, RunCheckpointSettings, RunEnvironmentSettings, RunExecutionSettings,
-    RunGitSettings, RunGoal, RunIntegrationsGithubSettings, RunIntegrationsSettings,
-    RunInterviewsSettings, RunModelControls, RunModelSettings, RunNamespace, RunPrepareSettings,
-    RunScmSettings, ScmGitHubSettings, TlsMode,
+    RunGitSettings, RunGithubAppSource, RunGoal, RunIntegrationsGithubSettings,
+    RunIntegrationsSettings, RunInterviewsSettings, RunModelControls, RunModelSettings,
+    RunNamespace, RunPrepareSettings, RunScmSettings, ScmGitHubSettings, TlsMode,
 };
 pub use server::{
     GithubIntegrationSettings, IntegrationWebhooksSettings, LogDestination, ObjectStoreSettings,
