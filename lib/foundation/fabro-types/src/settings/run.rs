@@ -557,6 +557,30 @@ pub struct RunIntegrationsGithubSettings {
     /// byte-identical to earlier releases for single-repository runs.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub additional_repositories: BTreeSet<crate::GitHubRepositorySlug>,
+    /// The GitHub App this run authenticates as, when the run selects one
+    /// instead of the server's global integration. `None` keeps the server's
+    /// integration; omitted when `None` so settings serialized by this
+    /// release stay byte-identical for runs that select nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app:                     Option<RunGithubAppSource>,
+}
+
+/// `[run.integrations.github.app]` — a per-run GitHub App credential source.
+///
+/// Both fields are NAMES of secrets in the serving server's vault, never
+/// their values: the run configuration, the immutable workflow version and
+/// every inspectable record carry only these names. The worker resolves
+/// them from its vault snapshot and uses the one selected App for the run's
+/// checkout, its stages' renewed credentials and its publication, failing
+/// the run rather than falling back to the server's integration when they
+/// do not resolve.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunGithubAppSource {
+    /// The vault secret holding the App's numeric id.
+    pub app_id_secret:      String,
+    /// The vault secret holding the App's private key (PEM, or base64 PEM).
+    pub private_key_secret: String,
 }
 
 impl RunIntegrationsGithubSettings {
@@ -642,6 +666,7 @@ mod run_integrations_github_tests {
                 .map(|(k, v)| ((*k).to_string(), InterpString::parse(v)))
                 .collect(),
             additional_repositories: std::collections::BTreeSet::new(),
+            app:                     None,
         }
     }
 

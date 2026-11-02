@@ -117,3 +117,22 @@ fn run_integrations_settings_round_trips() {
     assert_eq!(serde_json::to_value(&api).unwrap(), json_value);
     assert_eq!(serde_json::to_value(&canonical).unwrap(), json_value);
 }
+
+#[test]
+fn run_integrations_github_settings_round_trips_a_selected_app() {
+    let json_value = json!({
+        "permissions": { "contents": "write" },
+        "app": {
+            "app_id_secret": "HOMELAB_APP_ID",
+            "private_key_secret": "HOMELAB_APP_KEY",
+        }
+    });
+
+    let api: ApiRunIntegrationsGithubSettings =
+        serde_json::from_value(json_value.clone()).expect("api type should parse a selected app");
+    let canonical: RunIntegrationsGithubSettings = serde_json::from_value(json_value.clone())
+        .expect("canonical type should parse a selected app");
+
+    assert_eq!(serde_json::to_value(&api).unwrap(), json_value);
+    assert_eq!(serde_json::to_value(&canonical).unwrap(), json_value);
+}

@@ -15938,6 +15938,23 @@ components:
           items:
             type: string
           uniqueItems: true
+        app:
+          type: object
+          description: |
+            The GitHub App this run authenticates as instead of the server's
+            global integration. Both fields are names of secrets in the
+            server's vault, never their values. The run's checkout, managed
+            stage credentials and publication all use the selected App, and
+            a selection that does not resolve fails the run rather than
+            falling back to the server's integration. Omitted when the run
+            selects none.
+          required: [app_id_secret, private_key_secret]
+          additionalProperties: false
+          properties:
+            app_id_secret:
+              type: string
+            private_key_secret:
+              type: string
 
     RunGoal:
       oneOf:
