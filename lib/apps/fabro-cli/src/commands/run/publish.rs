@@ -28,7 +28,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use fabro_config::ServerSettingsBuilder;
 use fabro_github::token_source::{InstallationTokenSource, SecretString};
-use fabro_github::{GitHubContext, GitHubCredentials};
+use fabro_github::{GitHubAppCredentials, GitHubContext, GitHubCredentials};
 use fabro_llm::credentials::{self, CredentialProvider};
 use fabro_llm::lithos_catalog::Catalog;
 use fabro_petri::checkpoint::Site;
@@ -37,7 +37,7 @@ use fabro_petri::platform_records::PlatformRecords;
 use fabro_petri::source::{SourceCredential, SourceCredentials};
 use fabro_static::EnvVars;
 use fabro_store::platform_records::{PlatformRecord, PullRequestCreatedRecord};
-use fabro_types::settings::run::{PullRequestSettings, RunMode};
+use fabro_types::settings::run::{PullRequestSettings, RunGithubAppSource, RunMode};
 use fabro_types::settings::server::GithubIntegrationStrategy;
 use fabro_types::{GitHubRepositorySlug, RunId, RunSpec, RunTarget};
 use fabro_vault::Vault;
@@ -74,6 +74,106 @@ pub(super) fn github_credentials(vault: &Vault) -> Result<Option<GitHubCredentia
             Ok(Some(GitHubCredentials::Pat(token.to_string())))
         }
     }
+}
+
+/// Why a run's selected GitHub App source could not be used. Each variant
+/// names the selected secret names and never a secret value.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum SelectedAppError {
+    #[error(
+        "the run selects GitHub App secrets `{app_id_secret}` and `{private_key_secret}`, but \
+         `{missing}` is absent or empty in the server's vault"
+    )]
+    Missing {
+        app_id_secret:      String,
+        private_key_secret: String,
+        missing:            String,
+    },
+    #[error(
+        "the run selects GitHub App id secret `{app_id_secret}`, whose value is not a numeric \
+         App id"
+    )]
+    InvalidAppId { app_id_secret: String },
+    #[error(
+        "the run selects GitHub App private key secret `{private_key_secret}`, whose value is \
+         not a usable RSA private key: {reason}"
+    )]
+    InvalidKey {
+        private_key_secret: String,
+        reason:             String,
+    },
+}
+
+/// The GitHub credentials a run authenticates with: the App its settings
+/// select, resolved from the worker's vault snapshot, or the server's
+/// global integration when the run selects none.
+///
+/// A selected source that does not resolve is an error and never falls
+/// back to the server's integration: the run asked to act as one App, and
+/// acting as another would publish under the wrong identity.
+pub(super) fn run_github_credentials(
+    spec: &RunSpec,
+    vault: &Vault,
+) -> std::result::Result<Option<GitHubCredentials>, RunCredentialsError> {
+    match &spec.settings.run.integrations.github.app {
+        Some(source) => selected_app_credentials(source, vault)
+            .map(Some)
+            .map_err(RunCredentialsError::Selected),
+        None => github_credentials(vault).map_err(RunCredentialsError::Server),
+    }
+}
+
+/// The two ways a run's credentials can fail to resolve, kept apart because
+/// they are handled oppositely: a selected source refuses the run, while the
+/// server's own integration failing leaves the run to proceed anonymously
+/// as before.
+#[derive(Debug)]
+pub(super) enum RunCredentialsError {
+    Selected(SelectedAppError),
+    Server(anyhow::Error),
+}
+
+/// The App credentials a run selects, from the secrets its source names.
+fn selected_app_credentials(
+    source: &RunGithubAppSource,
+    vault: &Vault,
+) -> std::result::Result<GitHubCredentials, SelectedAppError> {
+    let value = |name: &str| {
+        vault
+            .get(name)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let missing = |name: &str| SelectedAppError::Missing {
+        app_id_secret:      source.app_id_secret.clone(),
+        private_key_secret: source.private_key_secret.clone(),
+        missing:            name.to_string(),
+    };
+    let app_id = value(&source.app_id_secret).ok_or_else(|| missing(&source.app_id_secret))?;
+    if !app_id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(SelectedAppError::InvalidAppId {
+            app_id_secret: source.app_id_secret.clone(),
+        });
+    }
+    let raw_key =
+        value(&source.private_key_secret).ok_or_else(|| missing(&source.private_key_secret))?;
+    let invalid_key = |reason: String| SelectedAppError::InvalidKey {
+        private_key_secret: source.private_key_secret.clone(),
+        reason,
+    };
+    let private_key_pem =
+        fabro_github::decode_private_key_pem(&source.private_key_secret, &raw_key)
+            .map_err(invalid_key)?;
+    // Signing proves the key parses now, before any forge operation, rather
+    // than at the first mint inside the clone.
+    fabro_github::sign_app_jwt(&app_id, &private_key_pem)
+        .map_err(|err| invalid_key(format!("{err:#}")))?;
+    Ok(GitHubCredentials::App(GitHubAppCredentials {
+        app_id,
+        private_key_pem,
+        slug: None,
+    }))
 }
 
 /// The run's GitHub repository, when its target names one.
@@ -116,6 +216,36 @@ pub(super) fn read_token_source(
     credentials: Option<&GitHubCredentials>,
 ) -> Option<Arc<InstallationTokenSource>> {
     token_source(spec, credentials, serde_json::json!({ "contents": "read" }))
+}
+
+/// The read-only token source of a run that selects its own App, with its
+/// first token already minted: minting is what proves the selected App is
+/// installed on, and authorized for, the run's repository, so a selection
+/// that cannot reach it is refused here rather than at the clone. `Ok(None)`
+/// for a run with no GitHub target.
+pub(super) async fn selected_read_token_source(
+    spec: &RunSpec,
+    credentials: Option<&GitHubCredentials>,
+) -> std::result::Result<Option<Arc<InstallationTokenSource>>, String> {
+    let Some(repository) = repository(spec) else {
+        return Ok(None);
+    };
+    let credentials = credentials
+        .ok_or_else(|| "the run selects a GitHub App but no credentials resolved".to_string())?;
+    let source = InstallationTokenSource::for_repository(
+        credentials,
+        repository.owner().to_string(),
+        repository.repo().to_string(),
+        serde_json::json!({ "contents": "read" }),
+    )
+    .map_err(|err| {
+        format!("no token source over the selected GitHub App for {repository}: {err:#}")
+    })?;
+    source
+        .resolve()
+        .await
+        .map_err(|err| format!("the selected GitHub App cannot reach {repository}: {err:#}"))?;
+    Ok(Some(source))
 }
 
 /// Fetch credentials over the run's read-only token source.
@@ -374,8 +504,9 @@ mod tests {
     use fabro_llm::credentials::NoCredentials;
     use fabro_llm::test_support;
     use fabro_petri::test_support::MemoryPlatformRecords;
-    use fabro_types::GitRunTarget;
     use fabro_types::test_support::test_run_spec;
+    use fabro_types::{GitRunTarget, SecretType};
+    use tokio::runtime;
 
     use super::*;
 
@@ -419,6 +550,148 @@ mod tests {
         let mut empty = spec();
         empty.target = Some(RunTarget::None {});
         assert!(!publishes(&empty));
+    }
+
+    const TEST_KEY: &str =
+        include_str!("../../../../../components/fabro-github/src/testdata/rsa_private.pem");
+
+    fn vault_with(entries: &[(&str, &str)]) -> (tempfile::TempDir, Vault) {
+        let temp = tempfile::tempdir().unwrap();
+        let mut vault = Vault::load(temp.path().join("secrets.json")).unwrap();
+        for (name, value) in entries {
+            vault.set(name, value, SecretType::Token, None).unwrap();
+        }
+        (temp, vault)
+    }
+
+    fn selecting(spec: RunSpec) -> RunSpec {
+        let mut spec = spec;
+        spec.settings.run.integrations.github.app = Some(RunGithubAppSource {
+            app_id_secret:      "HOMELAB_APP_ID".to_string(),
+            private_key_secret: "HOMELAB_APP_KEY".to_string(),
+        });
+        spec
+    }
+
+    #[test]
+    fn a_selected_app_resolves_from_the_named_vault_secrets() {
+        let (_temp, vault) =
+            vault_with(&[("HOMELAB_APP_ID", "4688510"), ("HOMELAB_APP_KEY", TEST_KEY)]);
+        let credentials = run_github_credentials(&selecting(spec()), &vault)
+            .unwrap()
+            .expect("the selected App resolves");
+        let GitHubCredentials::App(app) = credentials else {
+            panic!("a selected source resolves to App credentials");
+        };
+        assert_eq!(app.app_id, "4688510");
+        // The vault value is trimmed, as every other vault read is.
+        assert_eq!(app.private_key_pem, TEST_KEY.trim());
+    }
+
+    #[test]
+    fn a_selected_app_accepts_a_base64_private_key() {
+        let encoded = BASE64_STANDARD.encode(TEST_KEY);
+        let (_temp, vault) =
+            vault_with(&[("HOMELAB_APP_ID", "4688510"), ("HOMELAB_APP_KEY", &encoded)]);
+        let credentials = run_github_credentials(&selecting(spec()), &vault).unwrap();
+        assert!(
+            matches!(credentials, Some(GitHubCredentials::App(app)) if app.private_key_pem == TEST_KEY)
+        );
+    }
+
+    fn selected_error(entries: &[(&str, &str)]) -> String {
+        let (_temp, vault) = vault_with(entries);
+        match run_github_credentials(&selecting(spec()), &vault) {
+            Err(RunCredentialsError::Selected(err)) => err.to_string(),
+            Err(RunCredentialsError::Server(err)) => panic!("selected source fell back: {err}"),
+            Ok(_) => panic!("an unresolvable selected source must not resolve"),
+        }
+    }
+
+    #[test]
+    fn a_selected_app_with_a_missing_secret_refuses_naming_it() {
+        let message = selected_error(&[("HOMELAB_APP_ID", "4688510")]);
+        assert!(
+            message.contains("`HOMELAB_APP_KEY` is absent or empty"),
+            "{message}"
+        );
+        let message = selected_error(&[("HOMELAB_APP_KEY", TEST_KEY)]);
+        assert!(
+            message.contains("`HOMELAB_APP_ID` is absent or empty"),
+            "{message}"
+        );
+        let message = selected_error(&[("HOMELAB_APP_ID", "  "), ("HOMELAB_APP_KEY", TEST_KEY)]);
+        assert!(
+            message.contains("`HOMELAB_APP_ID` is absent or empty"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_selected_app_with_an_invalid_value_refuses_without_echoing_it() {
+        let message = selected_error(&[
+            ("HOMELAB_APP_ID", "not-a-number"),
+            ("HOMELAB_APP_KEY", TEST_KEY),
+        ]);
+        assert!(message.contains("`HOMELAB_APP_ID`"), "{message}");
+        assert!(!message.contains("not-a-number"), "{message}");
+
+        let bogus = "-----BEGIN RSA PRIVATE KEY-----\nbm90IGEga2V5\n-----END RSA PRIVATE KEY-----";
+        let message = selected_error(&[("HOMELAB_APP_ID", "4688510"), ("HOMELAB_APP_KEY", bogus)]);
+        assert!(message.contains("`HOMELAB_APP_KEY`"), "{message}");
+        assert!(!message.contains("bm90IGEga2V5"), "{message}");
+    }
+
+    #[test]
+    fn a_selected_app_never_falls_back_to_the_server_integration() {
+        // The server's own App key is in the vault, and the selected secrets
+        // are not: the run is refused rather than served under the server's App.
+        let (_temp, vault) = vault_with(&[
+            ("GITHUB_APP_PRIVATE_KEY", TEST_KEY),
+            ("GITHUB_TOKEN", "ghs_serverwide"),
+        ]);
+        assert!(matches!(
+            run_github_credentials(&selecting(spec()), &vault),
+            Err(RunCredentialsError::Selected(
+                SelectedAppError::Missing { .. }
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_run_without_a_github_target_needs_no_selected_read_source() {
+        let mut spec = selecting(spec());
+        spec.target = Some(RunTarget::None {});
+        let (_temp, vault) =
+            vault_with(&[("HOMELAB_APP_ID", "4688510"), ("HOMELAB_APP_KEY", TEST_KEY)]);
+        let credentials = run_github_credentials(&spec, &vault).unwrap();
+        assert!(
+            selected_read_token_source(&spec, credentials.as_ref())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_selected_app_that_cannot_mint_for_the_repository_refuses() {
+        // No GitHub answers at this API base, so the first mint fails: the
+        // selection is refused before any checkout or push.
+        let (_temp, vault) =
+            vault_with(&[("HOMELAB_APP_ID", "4688510"), ("HOMELAB_APP_KEY", TEST_KEY)]);
+        let spec = selecting(spec());
+        let credentials = run_github_credentials(&spec, &vault).unwrap();
+        let runtime = runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error =
+            temp_env::with_var(EnvVars::GITHUB_BASE_URL, Some("http://127.0.0.1:9"), || {
+                runtime.block_on(selected_read_token_source(&spec, credentials.as_ref()))
+            })
+            .err()
+            .expect("an App that cannot mint is refused");
+        assert!(error.contains("cannot reach acme/widgets"), "{error}");
     }
 
     /// Mints `token-<n>` for its n-th mint, valid for an hour.

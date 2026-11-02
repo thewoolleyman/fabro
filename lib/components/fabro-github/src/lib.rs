@@ -339,6 +339,13 @@ pub async fn gh_auth_token() -> anyhow::Result<String> {
     Ok(token)
 }
 
+/// Decode a GitHub App private key held as raw PEM or as base64 PEM, the
+/// two forms a vault or environment carries it in. `name` labels the
+/// source in the error and is never the value.
+pub fn decode_private_key_pem(name: &str, raw: &str) -> Result<String, String> {
+    decode_pem_env(name, raw)
+}
+
 fn decode_pem_env(name: &str, raw: &str) -> Result<String, String> {
     if raw.starts_with("-----") {
         return Ok(raw.to_string());

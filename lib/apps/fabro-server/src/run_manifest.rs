@@ -474,7 +474,34 @@ async fn build_preflight_report(
     run_environment_capability_check(&mut checks, &resolved_run);
     let needs_github_credentials = sandbox_provider.clones_workspace()
         || resolved_run.integrations.github.is_token_requested();
-    let github_app = if needs_github_credentials {
+    let selected_app = resolved_run.integrations.github.app.as_ref();
+    let github_app = if let Some(source) = selected_app.filter(|_| needs_github_credentials) {
+        // A run that selects its own App is checked under that App alone; a
+        // selection the vault cannot satisfy fails the preflight instead of
+        // being checked under the server's integration.
+        match state.selected_github_app_credentials(source).await {
+            Ok(credentials) => Some(credentials),
+            Err(err) => {
+                checks.push(CheckResult {
+                    name:        "Selected GitHub App".into(),
+                    status:      CheckStatus::Error,
+                    summary:     "unresolvable".into(),
+                    details:     Vec::new(),
+                    remediation: Some(format!("{err:#}")),
+                });
+                return Ok((
+                    CheckReport {
+                        title:    "Run Preflight".into(),
+                        sections: vec![CheckSection {
+                            title: String::new(),
+                            checks,
+                        }],
+                    },
+                    false,
+                ));
+            }
+        }
+    } else if needs_github_credentials {
         match state.github_credentials(github_integration).await {
             Ok(credentials) => credentials,
             Err(err)
@@ -3101,6 +3128,7 @@ dockerfile = { path = "Dockerfile" }
                     .iter()
                     .map(|value| value.parse().expect("test slug should parse"))
                     .collect(),
+                app:                     None,
             };
             (prepared, resolved)
         }
