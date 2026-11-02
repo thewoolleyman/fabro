@@ -1,0 +1,26 @@
+delayed bug: unexpected rigid alias in layout_of after normalization: Alias(Yes, Alias { kind: Opaque { def_id: DefId(0:63 ~ fabro_db[b0f2]::applied_migration_versions::{opaque#0}) }, args: ['{erased}], .. })
+disabled backtrace
+delayed bug: unexpected rigid alias in layout_of after normalization: Alias(Yes, Alias { kind: Opaque { def_id: DefId(0:44 ~ fabro_db[b0f2]::{impl#0}::snapshot_before_new_migrations::{opaque#0}) }, args: ['{erased}, '{erased}], .. })
+disabled backtrace
+delayed bug: unexpected rigid alias in layout_of after normalization: Alias(Yes, Alias { kind: Opaque { def_id: DefId(29:2536 ~ sqlx_core[e53b]::migrate::migrator::{impl#0}::run::{opaque#0}) }, args: ['{erased}, &'{erased} sqlx::Pool<sqlx::Sqlite>, '{erased}, '{erased}], .. })
+disabled backtrace
+delayed bug: unexpected rigid alias in layout_of after normalization: Alias(Yes, Alias { kind: Opaque { def_id: DefId(0:67 ~ fabro_db[b0f2]::write_snapshot_to_staging::{opaque#0}) }, args: ['{erased}, '{erased}], .. })
+disabled backtrace
+delayed bug: unexpected rigid alias in layout_of after normalization: Alias(Yes, Alias { kind: Opaque { def_id: DefId(0:88 ~ fabro_db[b0f2]::remove_file_if_exists::{opaque#0}) }, args: ['{erased}], .. })
+disabled backtrace
+delayed bug: unexpected rigid alias in layout_of after normalization: Alias(Yes, Alias { kind: Opaque { def_id: DefId(83:1245 ~ tokio[17d1]::fs::rename::rename::{opaque#0}) }, args: [&'{erased} std::path::PathBuf, &'{erased} std::path::PathBuf], .. })
+disabled backtrace
+delayed bug: unexpected rigid alias in layout_of after normalization: Alias(Yes, Alias { kind: Opaque { def_id: DefId(29:1022 ~ sqlx_core[e53b]::query::{impl#3}::execute::{opaque#0}) }, args: ['{erased}, sqlx::Sqlite, sqlx::sqlx_sqlite::SqliteArguments, '{erased}, '{erased}, &'{erased} sqlx::Pool<sqlx::Sqlite>, '{erased}, '{erased}, '{erased}], .. })
+disabled backtrace
+delayed bug: unexpected rigid alias in layout_of after normalization: Alias(Yes, Alias { kind: Opaque { def_id: DefId(29:632 ~ sqlx_core[e53b]::pool::{impl#0}::acquire::{opaque#0}) }, args: [sqlx::Sqlite], .. })
+disabled backtrace
+delayed bug: unexpected rigid alias in layout_of after normalization: Alias(Yes, Alias { kind: Opaque { def_id: DefId(0:72 ~ fabro_db[b0f2]::write_snapshot_to_staging_inner::{opaque#0}) }, args: [Closure(DefId(0:69 ~ fabro_db[b0f2]::write_snapshot_to_staging::{closure#0}::{closure#0}), [i32, Binder { value: extern "RustCall" fn((&'^0 std::path::Path,)), bound_vars: [Region(BrAnon)] }, ()]), '{erased}, '{erased}], .. })
+disabled backtrace
+delayed bug: unexpected rigid alias in layout_of after normalization: Alias(Yes, Alias { kind: Opaque { def_id: DefId(83:1234 ~ tokio[17d1]::fs::remove_file::remove_file::{opaque#0}) }, args: [&'{erased} std::path::Path], .. })
+disabled backtrace
+delayed bug: unexpected rigid alias in layout_of after normalization: Alias(Yes, Alias { kind: Opaque { def_id: DefId(83:1256 ~ tokio[17d1]::fs::set_permissions::set_permissions::{opaque#0}) }, args: [&'{erased} std::path::Path], .. })
+disabled backtrace
+
+
+rustc version: 1.100.0-nightly (c656540d6 2026-08-21)
+platform: x86_64-unknown-linux-gnu
