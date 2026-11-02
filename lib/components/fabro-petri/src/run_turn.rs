@@ -43,7 +43,10 @@
 //! `run_turn.command` (the program and arguments, shell-quoted, through the
 //! run's secret masker), `run_turn.command.digest`, `run_turn.env.keys`
 //! (the sorted variable NAMES, comma-joined), `run_turn.status`
-//! (`ok` / `error` / `cancelled`), every `acp.*` metric on the attempt's
+//! (`ok` / `error` / `cancelled`), `k8s.node.name` (the cluster node the
+//! sandbox's pod runs on, read from the provider's ambient
+//! `K8S_NODE_NAME` at launch; absent on a provider that does not report it,
+//! such as Docker), every `acp.*` metric on the attempt's
 //! record flattened to dotted scalars (`acp.turns`, `acp.usage.*`,
 //! `acp.context.*`), and `acp.stop_reason` when the record names one. The
 //! span starts at `before_attempt` and ends when the agent process exits, if
@@ -432,8 +435,9 @@ impl RunTurns {
     }
 
     /// A spawn in a wrapped environment: attribute it to the turn it
-    /// launches, when it launches one.
-    fn launched(&self, env: usize, spec: &ProcessSpec) -> Option<TurnCell> {
+    /// launches, when it launches one. `node` is the cluster node the
+    /// environment's provider reports, when it reports one.
+    fn launched(&self, env: usize, spec: &ProcessSpec, node: Option<String>) -> Option<TurnCell> {
         if spec.stdin != StdinMode::Piped {
             return None;
         }
@@ -465,6 +469,9 @@ impl RunTurns {
                     command_digest(spec),
                 ));
                 span.set_attribute(KeyValue::new("run_turn.env.keys", env_keys(spec)));
+                if let Some(node) = node {
+                    span.set_attribute(KeyValue::new(NODE_NAME_ATTRIBUTE, node));
+                }
             }
         }
         Some(turn)
@@ -621,6 +628,15 @@ impl Executor for TelemetryExecutor {
     }
 }
 
+/// The ambient variable a Kubernetes sandbox provider uses to report the
+/// node its pod runs on (sandbox-driver-kubernetes 0.6.0 and later). Petri
+/// passes a provider's environment map through unchanged, so this is the one
+/// path from the provider to the worker that needs no protocol change.
+const NODE_NAME_AMBIENT: &str = "K8S_NODE_NAME";
+
+/// The OpenTelemetry semantic-convention attribute naming that node.
+const NODE_NAME_ATTRIBUTE: &str = "k8s.node.name";
+
 struct TelemetryEnv {
     inner: Arc<dyn ExecEnv>,
     turns: Arc<RunTurns>,
@@ -631,7 +647,11 @@ struct TelemetryEnv {
 #[async_trait]
 impl ExecEnv for TelemetryEnv {
     async fn spawn(&self, spec: ProcessSpec) -> Result<Box<dyn ProcessHandle>, EnvError> {
-        let turn = self.turns.launched(env_id(self), &spec);
+        let turn = self.turns.launched(
+            env_id(self),
+            &spec,
+            self.inner.ambient_env(NODE_NAME_AMBIENT),
+        );
         let handle = self.inner.spawn(spec).await?;
         Ok(match turn {
             Some(turn) => Box::new(TelemetryProcess {
@@ -819,6 +839,7 @@ mod tests {
     /// An environment whose processes exit at once with status zero.
     struct FakeEnv {
         spawned: StdMutex<Vec<ProcessSpec>>,
+        node:    Option<String>,
     }
 
     struct FakeProcess;
@@ -860,11 +881,25 @@ mod tests {
         fn grace(&self) -> Duration {
             Duration::from_millis(10)
         }
+
+        fn ambient_env(&self, name: &str) -> Option<String> {
+            (name == NODE_NAME_AMBIENT)
+                .then(|| self.node.clone())
+                .flatten()
+        }
     }
 
     fn fake_env() -> Arc<FakeEnv> {
         Arc::new(FakeEnv {
             spawned: StdMutex::new(Vec::new()),
+            node:    None,
+        })
+    }
+
+    fn fake_env_on_node(node: &str) -> Arc<FakeEnv> {
+        Arc::new(FakeEnv {
+            spawned: StdMutex::new(Vec::new()),
+            node:    Some(node.to_owned()),
         })
     }
 
@@ -980,6 +1015,7 @@ mod tests {
         );
         assert_eq!(attribute(span, "other.metric"), None);
         assert_eq!(attribute(span, "acp.stop_reason"), None);
+        assert_eq!(attribute(span, NODE_NAME_ATTRIBUTE), None);
         for value in every_attribute_text(span) {
             assert!(!value.contains(SECRET), "an env value leaked: {value}");
         }
@@ -987,6 +1023,27 @@ mod tests {
             !span.attributes.iter().any(|kv| kv.value.as_str() == "acp"),
             "the literal env value `acp` must not appear as an attribute"
         );
+    }
+
+    #[tokio::test]
+    async fn a_turn_names_the_cluster_node_its_sandbox_pod_runs_on() {
+        let (_provider, recorded, tracer) = recording();
+        let turns = RunTurns::new(tracer, Context::new(), "01RUN", masker());
+        let env = turns.wrap_env(fake_env_on_node("gmktec-xubuntu"), 0);
+        turns.bind_env(1, &env);
+
+        turns.open_at(&at(1));
+        let mut process = env.spawn(agent_spec(SECRET)).await.unwrap();
+        process.wait().await.unwrap();
+        turns.close_at(1, 7, 1, &Outcome::success(Value::Null));
+
+        let spans = recorded.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(
+            text(&spans[0], NODE_NAME_ATTRIBUTE).as_deref(),
+            Some("gmktec-xubuntu")
+        );
+        assert_eq!(text(&spans[0], "run_turn.status").as_deref(), Some("ok"));
     }
 
     #[tokio::test]
