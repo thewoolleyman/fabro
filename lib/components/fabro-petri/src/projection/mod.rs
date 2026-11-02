@@ -41,8 +41,8 @@ pub(crate) use coordinator::{finished_status, stall_message};
 use fabro_store::StagePosition;
 use fabro_store::platform_records::StoredPlatformRecord;
 use fabro_types::{
-    FailureReason, RunControlAction, RunDiff, RunId, RunProjection, RunStatus, StageId,
-    StageProjection,
+    FailureCategory, FailureReason, RunControlAction, RunDiff, RunId, RunProjection, RunStatus,
+    StageId, StageProjection,
 };
 use petri_execution::events::{NodeRef, RunEvent, Subject};
 use petri_execution::{CancelReason, CoordinatorEvent, CoordinatorRecord, ExecutionId};
@@ -371,6 +371,48 @@ fn millis(recorded_at: u64) -> DateTime<Utc> {
         .unwrap_or_default()
 }
 
+/// Message fragments a sandbox provider's TRANSPORT failure carries.
+///
+/// A sandbox operation that could not reach its provider -- the Kubernetes API
+/// went away, or the sandbox-driver plugin's own pipe closed -- says nothing
+/// about the work item, so the run it ended is retryable. Measured 2026-11-02
+/// on gmktec (carrier 613add1): eight runs killed while the k3s server
+/// restarted all ended with "sandbox exec failed: ... reaching the Kubernetes
+/// API failed: ServiceError: client error (Connect)" and reported
+/// `deterministic` (livespec-orchestrator-beads-fabro bd-ib-6r3yax).
+const SANDBOX_TRANSPORT_FAILURE_FRAGMENTS: &[&str] = &[
+    "reaching the Kubernetes API failed",
+    "client error (Connect)",
+    "plugin response transport closed",
+    "plugin transport failed",
+];
+
+/// Whether a run's failure message names a sandbox provider transport fault.
+#[must_use]
+pub fn is_sandbox_transport_failure(message: &str) -> bool {
+    SANDBOX_TRANSPORT_FAILURE_FRAGMENTS
+        .iter()
+        .any(|fragment| message.contains(fragment))
+}
+
+/// The category a failed run's conclusion reports.
+///
+/// The recorded reason decides first, because it is the run's own statement of
+/// why it ended. A failure with no more specific reason is `deterministic`
+/// unless its message names a sandbox provider transport fault, which is
+/// `transient_infra`: the Dispatcher keys retryability on that category, and an
+/// infrastructure outage read as `deterministic` is charged to the work item.
+#[must_use]
+pub fn run_failure_category(reason: FailureReason, message: Option<&str>) -> FailureCategory {
+    match reason {
+        FailureReason::Cancelled => FailureCategory::Canceled,
+        FailureReason::TransientInfra => FailureCategory::TransientInfra,
+        FailureReason::BudgetExhausted => FailureCategory::BudgetExhausted,
+        _ if message.is_some_and(is_sandbox_transport_failure) => FailureCategory::TransientInfra,
+        _ => FailureCategory::Deterministic,
+    }
+}
+
 /// The run id a Petri run key names.
 #[must_use]
 pub fn run_id_of(key: &str) -> Option<RunId> {
@@ -423,6 +465,61 @@ pub fn finished_run_result(record: &Record) -> Option<(RunStatus, Option<String>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_kubernetes_connect_failure_is_transient_infra() {
+        let message = "sandbox exec failed: exec in pod petri-01m6ehxa0pey-l0 failed: \
+                       reaching the Kubernetes API failed: ServiceError: client error (Connect)";
+        assert_eq!(
+            super::run_failure_category(fabro_types::FailureReason::WorkflowError, Some(message)),
+            fabro_types::FailureCategory::TransientInfra
+        );
+    }
+
+    #[test]
+    fn a_closed_plugin_transport_is_transient_infra() {
+        assert_eq!(
+            super::run_failure_category(
+                fabro_types::FailureReason::SandboxInitFailed,
+                Some("sandbox create failed: plugin response transport closed"),
+            ),
+            fabro_types::FailureCategory::TransientInfra
+        );
+    }
+
+    #[test]
+    fn a_failure_with_no_transport_cause_stays_deterministic() {
+        assert_eq!(
+            super::run_failure_category(
+                fabro_types::FailureReason::WorkflowError,
+                Some("stage implement failed: tests did not pass"),
+            ),
+            fabro_types::FailureCategory::Deterministic
+        );
+        assert_eq!(
+            super::run_failure_category(fabro_types::FailureReason::WorkflowError, None),
+            fabro_types::FailureCategory::Deterministic
+        );
+    }
+
+    #[test]
+    fn a_recorded_reason_decides_before_the_message() {
+        assert_eq!(
+            super::run_failure_category(fabro_types::FailureReason::BudgetExhausted, None),
+            fabro_types::FailureCategory::BudgetExhausted
+        );
+        assert_eq!(
+            super::run_failure_category(fabro_types::FailureReason::TransientInfra, None),
+            fabro_types::FailureCategory::TransientInfra
+        );
+        assert_eq!(
+            super::run_failure_category(
+                fabro_types::FailureReason::Cancelled,
+                Some("reaching the Kubernetes API failed"),
+            ),
+            fabro_types::FailureCategory::Canceled
+        );
+    }
+
     use fabro_store::platform_records::{PlatformRecord, RunCreatedRecord};
     use fabro_types::test_support as types_support;
     use petri_runtime::driver::BranchRole;
