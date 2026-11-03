@@ -12,10 +12,10 @@ doctest = false
 workspace = true
 
 [features]
-test-support = ["dep:fabro-db"]
+test-support = []
 
 [dependencies]
-fabro-db = { path = "../../foundation/fabro-db", optional = true }
+fabro-db = { path = "../../foundation/fabro-db" }
 fabro-types = { path = "../../foundation/fabro-types" }
 lithos-llm = { workspace = true, features = ["runtime"] }
 pebble-coding-agent.workspace = true
