@@ -639,14 +639,16 @@ impl PlatformRecordStore {
         Self { pool }
     }
 
-    /// Store a record at the run's next seq, in a transaction of its own.
+    /// Store a record at the run's next seq, in a transaction of its own. A
+    /// write lock another writer holds past the pool's busy timeout is waited
+    /// out with [`fabro_db::begin_immediate`]'s bounded retry.
     pub async fn append(
         &self,
         run_id: &RunId,
         record: &PlatformRecord,
         position: Option<StagePosition>,
     ) -> Result<StoredPlatformRecord> {
-        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut transaction = fabro_db::begin_immediate(&self.pool).await?;
         let stored =
             Self::append_on_connection(&mut transaction, run_id, now_ms(), record, position)
                 .await?;
