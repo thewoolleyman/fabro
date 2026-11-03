@@ -46,8 +46,11 @@
 //!
 //! # Appends
 //!
-//! One `BEGIN IMMEDIATE` transaction per batch. A record at a seq below the
-//! log's head must equal the stored record as a JSON value, and is then
+//! One `BEGIN IMMEDIATE` transaction per batch, begun through
+//! [`fabro_db::begin_immediate`]: a write lock another writer holds past the
+//! pool's busy timeout (a large run deletion, say) is waited out with a
+//! bounded retry instead of failing the run's store. A record at a seq below
+//! the log's head must equal the stored record as a JSON value, and is then
 //! accepted without a second insert (a lost-reply retry is safe). A different
 //! record at a taken seq, or a seq past the head, is `Conflict`, and the
 //! batch stores nothing. A committed transaction is durable past a process
@@ -225,9 +228,7 @@ impl Shared {
     /// Take the lease of an existing run for `owner`, or share it when the
     /// same owner holds it.
     async fn take_lease(&self, key: &RunKey, owner: &OwnerId) -> Result<(), StoreError> {
-        let mut tx = self
-            .pool
-            .begin_with("BEGIN IMMEDIATE")
+        let mut tx = fabro_db::begin_immediate(&self.pool)
             .await
             .map_err(|cause| self.backend(key, "take the run's lease", cause))?;
         let holder: Option<Option<String>> =
@@ -447,10 +448,7 @@ impl RunLogs for SqliteRunLogs {
 
     async fn append(&self, log: &LogId, records: &[Record]) -> Result<(), StoreError> {
         let owner = self.owner()?;
-        let mut tx = self
-            .shared
-            .pool
-            .begin_with("BEGIN IMMEDIATE")
+        let mut tx = fabro_db::begin_immediate(&self.shared.pool)
             .await
             .map_err(|cause| self.backend("begin an append", cause))?;
         self.shared.check_owner(&mut *tx, &self.key, owner).await?;
