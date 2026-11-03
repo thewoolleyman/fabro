@@ -12,6 +12,13 @@ use tokio::fs;
 use tokio::task::spawn_blocking;
 use tracing::info;
 
+mod busy;
+
+pub use busy::{
+    BatchedDelete, BusyRetry, DeleteBatches, begin_immediate, begin_immediate_with,
+    delete_in_batches, is_busy,
+};
+
 pub type DbPool = sqlx::SqlitePool;
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
