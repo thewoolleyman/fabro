@@ -309,6 +309,73 @@ async fn create_run_can_set_parent_and_list_children() {
 }
 
 #[tokio::test]
+async fn run_list_entry_carries_a_bounded_goal_preview_and_single_run_read_the_full_goal() {
+    const PREVIEW_MAX_BYTES: usize = 1024;
+    let workspace = tempfile::tempdir().expect("run target workspace should be created");
+    let app = fabro_server::test_support::build_test_router(crate::helpers::test_app_state());
+    // Multi-byte characters put the byte bound mid-character, so the preview
+    // must cut on a character boundary.
+    let goal = format!(
+        "goal-head {} goal-tail-marker",
+        "\u{00e9}t\u{00e9} ".repeat(800)
+    );
+    assert!(goal.len() > 4 * PREVIEW_MAX_BYTES);
+    let mut intent = minimal_intent_json(&app, MINIMAL_DOT, workspace.path()).await;
+    intent["goal"] = serde_json::json!(goal);
+    let run = create_run(&app, intent).await;
+    let run_id = run["id"].as_str().unwrap();
+
+    let list_request = Request::builder()
+        .method("GET")
+        .uri(api("/runs"))
+        .body(Body::empty())
+        .unwrap();
+    let list = response_json(
+        app.clone().oneshot(list_request).await.unwrap(),
+        StatusCode::OK,
+        "GET /api/v1/runs",
+    )
+    .await;
+    let entry = list["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == run_id)
+        .expect("created run should be listed");
+    let preview = entry["goal"].as_str().unwrap();
+    assert!(
+        preview.len() <= PREVIEW_MAX_BYTES,
+        "list goal is {} bytes, over the {PREVIEW_MAX_BYTES}-byte bound",
+        preview.len()
+    );
+    assert!(preview.starts_with("goal-head "), "{preview}");
+    assert!(!preview.contains("goal-tail-marker"), "{preview}");
+    let kept = preview.trim_end_matches('\u{2026}');
+    assert!(
+        goal.starts_with(kept),
+        "preview must be a prefix of the goal"
+    );
+    assert!(
+        kept.len() > PREVIEW_MAX_BYTES / 2,
+        "preview kept {} bytes",
+        kept.len()
+    );
+
+    let get_request = Request::builder()
+        .method("GET")
+        .uri(api(&format!("/runs/{run_id}")))
+        .body(Body::empty())
+        .unwrap();
+    let full = response_json(
+        app.clone().oneshot(get_request).await.unwrap(),
+        StatusCode::OK,
+        format!("GET /api/v1/runs/{run_id}"),
+    )
+    .await;
+    assert_eq!(full["goal"].as_str().unwrap(), goal);
+}
+
+#[tokio::test]
 async fn link_relink_and_unlink_parent_are_idempotent() {
     let workspace = tempfile::tempdir().expect("run target workspace should be created");
     let app = fabro_server::test_support::build_test_router(crate::helpers::test_app_state());
