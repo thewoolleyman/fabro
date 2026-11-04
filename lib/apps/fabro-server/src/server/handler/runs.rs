@@ -337,7 +337,10 @@ pub(super) async fn run_summary_page_response(
 ) -> Response {
     match state.stores.run_summaries.list(query, Utc::now()).await {
         Ok(page) => {
-            let data = state.decorate_run_summaries(page.data).await;
+            let mut data = state.decorate_run_summaries(page.data).await;
+            for run in &mut data {
+                bound_goal_preview(&mut run.goal);
+            }
             (
                 StatusCode::OK,
                 Json(ListResponse::paginated(data, page.has_more, page.total)),
@@ -348,6 +351,28 @@ pub(super) async fn run_summary_page_response(
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
     }
+}
+
+/// Largest goal, in bytes, that a run-list entry carries. A board read
+/// lists every run, and a goal can run to hundreds of KB, so list entries
+/// carry a preview; the single-run read (`GET /api/v1/runs/{id}`) still
+/// returns the full goal.
+pub(crate) const RUN_LIST_GOAL_PREVIEW_MAX_BYTES: usize = 1024;
+
+const GOAL_PREVIEW_ELLIPSIS: &str = "\u{2026}";
+
+/// Cuts `goal` to at most [`RUN_LIST_GOAL_PREVIEW_MAX_BYTES`] bytes, on a
+/// character boundary, ending in an ellipsis when anything was cut.
+fn bound_goal_preview(goal: &mut String) {
+    if goal.len() <= RUN_LIST_GOAL_PREVIEW_MAX_BYTES {
+        return;
+    }
+    let mut end = RUN_LIST_GOAL_PREVIEW_MAX_BYTES - GOAL_PREVIEW_ELLIPSIS.len();
+    while !goal.is_char_boundary(end) {
+        end -= 1;
+    }
+    goal.truncate(end);
+    goal.push_str(GOAL_PREVIEW_ELLIPSIS);
 }
 
 #[derive(Debug, serde::Deserialize)]

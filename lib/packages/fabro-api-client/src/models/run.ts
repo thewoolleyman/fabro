@@ -79,6 +79,9 @@ export interface Run {
      */
     'children_count': number;
     'title': string;
+    /**
+     * The run goal. Entries in a run list (`GET /api/v1/runs` and automation run lists) carry a preview of at most 1 KiB, cut on a character boundary and ending in an ellipsis when shortened; the single-run read (`GET /api/v1/runs/{id}`) returns the full goal.
+     */
     'goal': string;
     'workflow': WorkflowRef;
     'automation': AutomationRef | null;
