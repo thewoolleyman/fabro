@@ -130,26 +130,37 @@ async fn compression_applies_over_a_real_tcp_connection() {
     // `oneshot` exercises the tower stack directly; this pins the same
     // behavior through hyper's real connection handling, matching how the
     // production server actually serves (`axum::serve`).
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     let app = fabro_server::test_support::build_test_router(test_app_state());
     let addr = serve_on_ephemeral_port(app).await;
 
-    let response = fabro_test::test_http_client()
-        .get(format!("http://{addr}/api/v1/openapi.json"))
-        // Setting the header manually also disables reqwest's transparent
-        // decompression, so Content-Encoding stays visible on the response.
-        .header(header::ACCEPT_ENCODING.as_str(), "gzip")
-        .send()
+    // Raw HTTP/1.1 over the socket: the workspace reqwest decompresses
+    // transparently and strips Content-Encoding even when the caller sets
+    // Accept-Encoding itself, so a reqwest client cannot see what the server
+    // actually sent.
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            b"GET /api/v1/openapi.json HTTP/1.1\r\nHost: localhost:3000\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n",
+        )
         .await
-        .expect("openapi request should succeed");
+        .unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.unwrap();
+    let head_len = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("response should have a header block");
+    let head = String::from_utf8_lossy(&raw[..head_len]).to_lowercase();
 
-    assert_eq!(response.status(), fabro_http::StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get(header::CONTENT_ENCODING.as_str())
-            .and_then(|v| v.to_str().ok()),
-        Some("gzip"),
-        "compression must survive real hyper serving, not just oneshot"
+    assert!(
+        head.starts_with("http/1.1 200"),
+        "unexpected response: {head}"
+    );
+    assert!(
+        head.contains("content-encoding: gzip"),
+        "compression must survive real hyper serving, not just oneshot; got:\n{head}"
     );
 }
 
