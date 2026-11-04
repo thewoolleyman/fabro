@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use fabro_util::terminal::Styles;
 use tracing::info;
@@ -23,11 +23,6 @@ pub(crate) async fn run(
     };
 
     // A Petri run's events are its stream, in the stream envelope.
-    let state = client
-        .get_run_state(&run_id)
-        .await
-        .context("Failed to read run state from server")?;
-    let _ = state;
     let pretty = args.pretty && !ctx.json_output();
     Box::pin(petri_stream::print_events(
         client.as_ref(),
