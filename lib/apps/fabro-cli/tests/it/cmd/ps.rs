@@ -542,3 +542,110 @@ fn ps_explicit_remote_target_ignores_broken_local_storage_settings() {
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0]["workflow_name"], "Explicit Remote");
 }
+
+fn mock_run_list_page(then: httpmock::Then, run_id: &str, status: &Value) -> httpmock::Then {
+    let summary = remote_run_summary_json(
+        run_id,
+        "Remote Workflow",
+        "remote-workflow",
+        "Remote goal",
+        status,
+        "2026-11-04T00:00:00Z",
+    );
+    then.status(200)
+        .header("Content-Type", "application/json")
+        .body(
+            serde_json::json!({
+                "data": [summary],
+                "meta": { "has_more": false }
+            })
+            .to_string(),
+        )
+}
+
+#[test]
+fn ps_default_asks_server_for_only_active_board_columns() {
+    let context = test_context!();
+    let server = MockServer::start();
+    let run_id = unique_run_id();
+    let active_columns = [
+        "pending",
+        "runnable",
+        "initializing",
+        "running",
+        "blocked",
+        "removing",
+    ];
+    let list_mock = server.mock(|when, then| {
+        let mut when = when
+            .method("GET")
+            .path("/api/v1/runs")
+            .query_param_missing("include_archived")
+            .query_param_count("^status$", ".*", active_columns.len());
+        for column in active_columns {
+            when = when.query_param("status", column);
+        }
+        mock_run_list_page(then, &run_id, &serde_json::json!({ "kind": "running" }));
+    });
+
+    let output = context
+        .ps()
+        .args([
+            "--json",
+            "--server",
+            &format!("{}/api/v1", server.base_url()),
+        ])
+        .output()
+        .expect("ps should execute");
+
+    assert!(
+        output.status.success(),
+        "ps should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    list_mock.assert();
+    let runs: Vec<Value> = serde_json::from_slice(&output.stdout).expect("ps JSON should parse");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["run_id"], run_id);
+}
+
+#[test]
+fn ps_all_lists_every_run_including_archived() {
+    let context = test_context!();
+    let server = MockServer::start();
+    let run_id = unique_run_id();
+    let list_mock = server.mock(|when, then| {
+        when.method("GET")
+            .path("/api/v1/runs")
+            .query_param("include_archived", "true")
+            .query_param_missing("status");
+        mock_run_list_page(
+            then,
+            &run_id,
+            &serde_json::json!({ "kind": "succeeded", "reason": "completed" }),
+        );
+    });
+
+    let output = context
+        .ps()
+        .args([
+            "-a",
+            "--json",
+            "--server",
+            &format!("{}/api/v1", server.base_url()),
+        ])
+        .output()
+        .expect("ps should execute");
+
+    assert!(
+        output.status.success(),
+        "ps -a should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    list_mock.assert();
+    let runs: Vec<Value> = serde_json::from_slice(&output.stdout).expect("ps JSON should parse");
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0]["run_id"], run_id);
+}

@@ -28,10 +28,7 @@ pub(crate) async fn list_command(
         None => None,
     };
     let filtered_by_parent = parent_id.is_some();
-    let lookup = match parent_id {
-        Some(parent_id) => ServerRunLookup::from_client_by_parent(client, parent_id).await?,
-        None => ServerRunLookup::from_client(client).await?,
-    };
+    let lookup = ServerRunLookup::from_client(client, parent_id, !args.all).await?;
     let label_filters = parse_label_filters(&args.filter.label);
     let filtered = filter_server_runs(
         lookup.runs(),
