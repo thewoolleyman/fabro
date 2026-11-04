@@ -24,7 +24,7 @@ use petri_store::{
     Access, Digest, LogId, MemoryRunStore, OwnerId, Record, RunKey, RunLogs, RunStore, StoreError,
 };
 use support::{SETTINGS, Silent, admit, all_records, no_questions, run_request};
-use tokio::runtime::Handle;
+use tokio::sync::watch;
 
 /// One command stage between start and exit.
 const COMMAND: &str = r#"digraph Command {
@@ -81,6 +81,7 @@ async fn a_failed_store_write_interrupts_the_run_and_a_resume_finishes_it() {
         inner:    Arc::clone(&memory),
         log:      LogId::Resources,
         appended: Arc::new(AtomicUsize::new(0)),
+        open:     OpenHandles::new().hold(),
     });
     let runtime = RuntimeSpec::default();
     let graphs = || {
@@ -164,6 +165,7 @@ struct FailingStore {
     inner:    Arc<MemoryRunStore>,
     log:      LogId,
     appended: Arc<AtomicUsize>,
+    open:     Held,
 }
 
 #[async_trait::async_trait]
@@ -173,6 +175,7 @@ impl RunStore for FailingStore {
             inner:    self.inner.open(key, access).await?,
             log:      self.log,
             appended: Arc::clone(&self.appended),
+            _open:    self.open.again(),
         }))
     }
 }
@@ -181,6 +184,7 @@ struct FailingLogs {
     inner:    Arc<dyn RunLogs>,
     log:      LogId,
     appended: Arc<AtomicUsize>,
+    _open:    Held,
 }
 
 #[async_trait::async_trait]
@@ -250,10 +254,12 @@ async fn resumed_stall_policy(persisted: &str, fallback: &str, expected: RunStat
     };
     // Fail after the root graph is durable but before acquiring a workspace.
     // This exercises cleanup on host error and a genuine persisted resume.
+    let first_handles = OpenHandles::new();
     let failing = Arc::new(FailingStore {
         inner:    memory.clone(),
         log:      LogId::Resources,
         appended: Arc::new(AtomicUsize::new(0)),
+        open:     first_handles.hold(),
     });
     let first = engine::run(run_request(
         "stall-resume",
@@ -265,13 +271,16 @@ async fn resumed_stall_policy(persisted: &str, fallback: &str, expected: RunStat
     ))
     .await;
     assert!(matches!(first, Err(RunError::StoreFailed(_))), "{first:?}");
-    let metrics = Handle::current().metrics();
-    support::wait_until("error cleanup", || metrics.num_alive_tasks() == 0).await;
+    first_handles.all_closed().await;
+    let resume_handles = OpenHandles::new();
     let outcome = engine::run(resume_request(
         "stall-resume",
         root.path(),
         graphs(fallback),
-        memory.clone(),
+        Arc::new(Tracked {
+            inner: memory.clone(),
+            open:  resume_handles.hold(),
+        }),
         runtime,
     ))
     .await
@@ -299,7 +308,7 @@ async fn resumed_stall_policy(persisted: &str, fallback: &str, expected: RunStat
     } else {
         assert_eq!(*reason, None);
     }
-    support::wait_until("resume cleanup", || metrics.num_alive_tasks() == 0).await;
+    resume_handles.all_closed().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -463,24 +472,23 @@ impl PrepareFixture {
     }
 
     /// Run until the store fails on the append that carries `needle`, then
-    /// wait for the interrupted run's tasks to end.
+    /// wait for the interrupted run's teardown to finish: every handle it
+    /// held on the run's store is dropped.
     async fn interrupt_on(&self, memory: &Arc<MemoryRunStore>, needle: &'static str) {
         let runtime = RuntimeSpec::default();
+        let handles = OpenHandles::new();
         let failing = Arc::new(FailOnText {
             inner: Arc::clone(memory),
             needle,
             failed: Arc::new(AtomicUsize::new(0)),
+            open: handles.hold(),
         });
         let first = engine::run(self.request(failing, &runtime, false)).await;
         assert!(
             matches!(&first, Err(RunError::StoreFailed(message)) if message.contains("the disk is full")),
             "{first:?}"
         );
-        let metrics = Handle::current().metrics();
-        support::wait_until("the interrupted run's tasks", || {
-            metrics.num_alive_tasks() == 0
-        })
-        .await;
+        handles.all_closed().await;
     }
 
     async fn resume(&self, memory: &Arc<MemoryRunStore>) -> engine::RunOutcome {
@@ -618,6 +626,7 @@ struct FailOnText {
     inner:  Arc<MemoryRunStore>,
     needle: &'static str,
     failed: Arc<AtomicUsize>,
+    open:   Held,
 }
 
 #[async_trait::async_trait]
@@ -627,6 +636,7 @@ impl RunStore for FailOnText {
             inner:  self.inner.open(key, access).await?,
             needle: self.needle,
             failed: Arc::clone(&self.failed),
+            _open:  self.open.again(),
         }))
     }
 }
@@ -635,6 +645,7 @@ struct FailOnTextLogs {
     inner:  Arc<dyn RunLogs>,
     needle: &'static str,
     failed: Arc<AtomicUsize>,
+    _open:  Held,
 }
 
 #[async_trait::async_trait]
@@ -654,6 +665,96 @@ impl RunLogs for FailOnTextLogs {
                 "the disk is full",
             ));
         }
+        self.inner.append(log, records).await
+    }
+
+    async fn read(&self, log: &LogId) -> Result<Vec<Record>, StoreError> {
+        self.inner.read(log).await
+    }
+
+    async fn put_blob(&self, bytes: &[u8]) -> Result<Digest, StoreError> {
+        self.inner.put_blob(bytes).await
+    }
+
+    async fn get_blob(&self, digest: Digest) -> Result<Option<Vec<u8>>, StoreError> {
+        self.inner.get_blob(digest).await
+    }
+}
+
+/// The handles a run holds on its store: the store itself and every log
+/// handle opened through it. A run's teardown is over when the last one
+/// drops, whatever task or thread held it, so a test waits on that event
+/// rather than on a count of live tasks or a clock. Once the test has handed
+/// the store over and the run has returned, nothing opens a new handle
+/// except through one still held, so the count reaching zero is final.
+#[derive(Clone)]
+struct OpenHandles(Arc<watch::Sender<usize>>);
+
+impl OpenHandles {
+    fn new() -> Self {
+        Self(Arc::new(watch::channel(0).0))
+    }
+
+    /// Count one more handle, until the guard drops.
+    fn hold(&self) -> Held {
+        self.0.send_modify(|open| *open += 1);
+        Held(self.clone())
+    }
+
+    /// Wait until every handle has dropped.
+    async fn all_closed(&self) {
+        self.0
+            .subscribe()
+            .wait_for(|open| *open == 0)
+            .await
+            .expect("the sender lives as long as these handles");
+    }
+}
+
+/// One counted handle, released on drop.
+struct Held(OpenHandles);
+
+impl Held {
+    /// A handle opened through this one.
+    fn again(&self) -> Self {
+        self.0.hold()
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.0.0.send_modify(|open| *open -= 1);
+    }
+}
+
+/// The in-memory store, passed through, with its handles counted.
+struct Tracked {
+    inner: Arc<MemoryRunStore>,
+    open:  Held,
+}
+
+#[async_trait::async_trait]
+impl RunStore for Tracked {
+    async fn open(&self, key: &RunKey, access: Access) -> Result<Arc<dyn RunLogs>, StoreError> {
+        Ok(Arc::new(TrackedLogs {
+            inner: self.inner.open(key, access).await?,
+            _open: self.open.again(),
+        }))
+    }
+}
+
+struct TrackedLogs {
+    inner: Arc<dyn RunLogs>,
+    _open: Held,
+}
+
+#[async_trait::async_trait]
+impl RunLogs for TrackedLogs {
+    fn locator(&self) -> String {
+        self.inner.locator()
+    }
+
+    async fn append(&self, log: &LogId, records: &[Record]) -> Result<(), StoreError> {
         self.inner.append(log, records).await
     }
 
