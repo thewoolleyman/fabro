@@ -104,7 +104,7 @@ use petri_runtime::driver::lifecycle::{
     ScopeReleased, Transition, TransitionError, TransitionReport,
 };
 use petri_runtime::engine::Admission;
-use petri_runtime::executor::{EnvError, ExecEnv};
+use petri_runtime::executor::{EnvError, ExecEnv, SecretProvider};
 use petri_runtime::ir::{
     ExecutionId, FailureInfo, FinalizationFailure, RunStatus, ScopeId, Status,
 };
@@ -121,6 +121,7 @@ use crate::checkpoint::{
 };
 use crate::fork::{self, ForkError};
 use crate::platform_records::{PlatformRecordError, PlatformRecords};
+use crate::prepare::{self, PrepareBlock};
 use crate::projection;
 use crate::recovery::{self, Plan, RecoveryError, RestoreTarget};
 use crate::run_turn::RunTurns;
@@ -472,6 +473,14 @@ pub struct FabroHooks {
     store:              Arc<dyn RunStore>,
     /// The run's `run_turn` spans, when the runtime observes its launches.
     run_turns:          Option<Arc<RunTurns>>,
+    /// The run's key: it names the marker a sandbox holding the run's
+    /// prepare block carries.
+    run_key:            RunKey,
+    /// The root graph's prepare block, run again on a resumed run's
+    /// re-acquired sandbox ([`crate::prepare`]).
+    prepare:            Option<PrepareBlock>,
+    /// Where the prepare steps' secret references resolve from.
+    secrets:            Option<Arc<dyn SecretProvider>>,
 }
 
 impl FabroHooks {
@@ -517,7 +526,7 @@ impl FabroHooks {
             workspaces,
             checkpoint_enabled,
             sites: Mutex::default(),
-            lookup: WorkspaceLookup::new(Arc::clone(&store), run_key),
+            lookup: WorkspaceLookup::new(Arc::clone(&store), run_key.clone()),
             identity,
             host_workspaces: spec.git.host_workspaces,
             test_gates: spec.test_gates,
@@ -535,7 +544,86 @@ impl FabroHooks {
             restore: OnceCell::new(),
             store,
             run_turns: None,
+            run_key,
+            prepare: None,
+            secrets: None,
         }
+    }
+
+    /// The run's prepare block, from the root graph the run executes (the
+    /// stored one, on a resume), and where its secret references resolve
+    /// from. A resume that acquires the block's scope on a sandbox without
+    /// the run's marker runs the block again before any node.
+    #[must_use]
+    pub fn with_prepare(
+        mut self,
+        prepare: Option<PrepareBlock>,
+        secrets: Option<Arc<dyn SecretProvider>>,
+    ) -> Self {
+        self.prepare = prepare;
+        self.secrets = secrets;
+        self
+    }
+
+    /// A sandbox's prepare block. A fresh run marks the sandbox whose scope
+    /// runs the prepare nodes; the nodes then run the block. A resume that
+    /// acquires that scope on a sandbox without the marker (a re-acquired
+    /// sandbox, which kept only its workspace) runs the block again, in
+    /// order, and marks the sandbox; a failed step fails the scope.
+    async fn prepare_sandbox(
+        &self,
+        context: &HookContext,
+        acquired: &ScopeAcquired,
+    ) -> Result<(), ScopeAcquiredError> {
+        let Some(prepare) = &self.prepare else {
+            return Ok(());
+        };
+        if context.invocation != InvocationId::ROOT || !prepare.runs_in(acquired.scope) {
+            return Ok(());
+        }
+        let marker = prepare::marker_path(&self.run_key);
+        if self.resumed {
+            match PrepareBlock::marked(&acquired.env, &marker).await {
+                Ok(true) => {
+                    debug!(
+                        run_id = %self.run_id,
+                        marker,
+                        "the resumed sandbox holds the run's prepare block"
+                    );
+                    return Ok(());
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    warn!(
+                        run_id = %self.run_id,
+                        marker,
+                        error,
+                        "the prepare marker could not be checked; running the prepare block again"
+                    );
+                }
+            }
+            info!(
+                run_id = %self.run_id,
+                scope = %acquired.scope,
+                "the resumed sandbox lacks the run's prepare block; running it again"
+            );
+            prepare
+                .run(&acquired.env, self.secrets.as_ref())
+                .await
+                .map_err(|error| {
+                    warn!(run_id = %self.run_id, error, "the prepare block failed on resume");
+                    ScopeAcquiredError::new(format!(
+                        "the run's prepare block failed on the resumed sandbox: {error}"
+                    ))
+                })?;
+            info!(run_id = %self.run_id, "the run's prepare block ran again on the resumed sandbox");
+        }
+        // A marker that cannot be written costs only a second run of the
+        // block on a later resume onto this sandbox.
+        if let Err(error) = PrepareBlock::mark(&acquired.env, &marker).await {
+            warn!(run_id = %self.run_id, marker, error, "the prepare marker was not written");
+        }
+        Ok(())
     }
 
     /// Open and close the run's `run_turn` spans at each ACP agent attempt.
@@ -1741,7 +1829,8 @@ impl ExecutionHooks for FabroHooks {
                 .await
                 .map_err(|error| ScopeAcquiredError::new(error.render()))?;
         }
-        self.check_out_source(&workspace, &site).await
+        self.check_out_source(&workspace, &site).await?;
+        self.prepare_sandbox(context, &acquired).await
     }
 }
 

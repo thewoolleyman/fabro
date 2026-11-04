@@ -86,6 +86,7 @@ use crate::admission::AdmittedGraphs;
 use crate::blobs::{Blobs, RunBlobs};
 use crate::controls::RunControls;
 use crate::hooks::{FabroHooks, HooksSpec};
+use crate::prepare::PrepareBlock;
 use crate::run_turn::RunTurns;
 use crate::runtime::RuntimeSpec;
 use crate::secrets::SharedSecrets;
@@ -249,22 +250,26 @@ pub async fn run(mut request: RunRequest) -> Result<RunOutcome, RunError> {
         .transpose()
         .map_err(RunError::ModelHeaders)?;
     let key = RunKey::new(request.run_id.as_str());
-    let stall_timeout = match &request.execution {
-        Execution::Start(graphs) => graphs.graph.policy.stall_timeout,
+    // The root graph the run executes: the admitted one on a start, the
+    // stored one on a resume. Only a run with no root yet uses the graph
+    // that the resume-to-start fallback runs.
+    let (stall_timeout, prepare) = match &request.execution {
+        Execution::Start(graphs) => (
+            graphs.graph.policy.stall_timeout,
+            PrepareBlock::of(&graphs.graph),
+        ),
         Execution::Resume(graphs) => {
             let logs = request
                 .store
                 .open(&key, Access::Read)
                 .await
                 .map_err(RunError::Open)?;
-            // A persisted disabled policy stays disabled. Only a run with no
-            // root yet uses the graph that the resume-to-start fallback runs.
-            host::stored_root_graph(&*logs)
+            // A persisted disabled policy stays disabled.
+            let stored = host::stored_root_graph(&*logs)
                 .await
-                .map_err(RunError::Read)?
-                .map_or(graphs.graph.policy.stall_timeout, |graph| {
-                    graph.policy.stall_timeout
-                })
+                .map_err(RunError::Read)?;
+            let root = stored.as_ref().unwrap_or(&graphs.graph);
+            (root.policy.stall_timeout, PrepareBlock::of(root))
         }
     };
     let watchdog = stall_timeout.map(StallWatchdog::new);
@@ -284,6 +289,7 @@ pub async fn run(mut request: RunRequest) -> Result<RunOutcome, RunError> {
     // A normal resume requires its original sandbox to survive.
     options.sandbox.lost_sandbox = LostSandbox::Refuse;
     let resumed = matches!(request.execution, Execution::Resume(_));
+    let prepare_secrets = request.secrets.clone();
     let mut runtime = request
         .runtime
         .runtime(true)
@@ -337,6 +343,7 @@ pub async fn run(mut request: RunRequest) -> Result<RunOutcome, RunError> {
             resumed,
             request.blobs.clone(),
         );
+        let hooks = hooks.with_prepare(prepare, prepare_secrets);
         Arc::new(match &run_turns {
             Some(run_turns) => hooks.with_run_turns(Arc::clone(run_turns)),
             None => hooks,
