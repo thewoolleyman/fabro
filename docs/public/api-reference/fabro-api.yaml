@@ -3036,11 +3036,17 @@ paths:
         cursor is `after`: the last `stream_seq` the client saw, exclusive;
         the first page is `after=0`. A client that reconnects resumes from
         its last `stream_seq` and deduplicates by each item's `id`; every
-        item is delivered once, in order, with no gap.
+        item is delivered once, in order, with no gap. With `tail=true`
+        the page is the newest `limit` items past `after` instead, still
+        oldest first, and `meta.has_more` says whether older items past
+        `after` precede it. A workflow node an item names carries its
+        identity and display metadata but not its script; a command
+        stage's script is its stage's `script_invocation`.
       parameters:
         - $ref: "#/components/parameters/RunId"
         - $ref: "#/components/parameters/EventLimit"
         - $ref: "#/components/parameters/StreamAfter"
+        - $ref: "#/components/parameters/StreamTail"
       responses:
         "200":
           description: One page of the run's stream
@@ -6291,6 +6297,18 @@ components:
         minimum: 0
         default: 0
       example: 42
+
+    StreamTail:
+      name: tail
+      in: query
+      required: false
+      description: |
+        Serve the newest end of a Petri run's stream: the last `limit`
+        items past `after`, in `stream_seq` order.
+      schema:
+        type: boolean
+        default: false
+      example: true
 
     QuestionId:
       name: qid

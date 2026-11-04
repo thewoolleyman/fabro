@@ -358,6 +358,12 @@ impl RunView {
             .saturating_add(1);
         let stage = projection.stage_entry(stage_id.node_id(), visit, first_event_seq(ordinal));
         stage.handler = Some(StageHandler::from_handler_type(Some(meta_kind)));
+        // The script a command node runs is a fact of the workflow graph:
+        // the stage keeps it, and the stream's items name the node without
+        // it (`projector::stream::drop_node_scripts`).
+        if let Some(script) = subject.node.meta.get("script").and_then(Value::as_str) {
+            stage.script_invocation = Some(serde_json::json!({ "command": script }));
+        }
         stage.started_at = Some(at);
         stage.graph_visit = Some(visit);
         stage.state = StageState::Pending;

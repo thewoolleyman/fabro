@@ -353,7 +353,7 @@ export function buildPetriStageActivity(
       turns.push({
         kind: "command",
         ts: startTs,
-        script: commandScriptOf(items) ?? "",
+        script: commandScriptOf(items, stage) ?? "",
         running,
         exitCode: outcome.exitCode,
         durationMs: outcome.durationMs || (stage?.timing?.wall_time_ms ?? 0),

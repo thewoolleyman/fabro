@@ -1,7 +1,9 @@
 use fabro_test::{fabro_snapshot, json_elapsed_ms_snapshot_filters, test_context};
-use serde_json::Value;
+use httpmock::MockServer;
+use serde_json::{Value, json};
 
-use super::support::{setup_detached_dry_run, setup_seeded_completed_dry_run};
+use super::support::{mock_resolved_run, setup_detached_dry_run, setup_seeded_completed_dry_run};
+use crate::support::unique_run_id;
 
 fn parse_ndjson(stdout: &[u8]) -> Vec<Value> {
     String::from_utf8(stdout.to_vec())
@@ -263,4 +265,157 @@ fn events_follow_detached_run_streams_until_completion() {
         "run.completed",
         "sandbox.stop.completed",
     ]);
+}
+
+/// One stream item as `GET /runs/{id}/events` serves it.
+fn stream_item_json(run_id: &str, stream_seq: u64) -> Value {
+    json!({
+        "run_id": run_id,
+        "stream_seq": stream_seq,
+        "kind": "petri",
+        "id": format!("execution 0/{stream_seq}/0"),
+        "recorded_at": 1_789_706_579_000_u64 + stream_seq,
+        "item": {
+            "id": {"log": "execution", "execution": 0, "seq": stream_seq, "index": 0},
+            "origin": "external",
+            "context": {},
+            "record": {"seq": stream_seq, "body": {"event": "step.progress.recorded"}}
+        }
+    })
+}
+
+/// One page of the listing holding the items `seqs`.
+fn stream_page_json(run_id: &str, seqs: impl IntoIterator<Item = u64>, has_more: bool) -> Value {
+    json!({
+        "data": seqs.into_iter().map(|seq| stream_item_json(run_id, seq)).collect::<Vec<_>>(),
+        "meta": {"has_more": has_more},
+        "event_contract_version": fabro_petri::petri::EVENT_CONTRACT_VERSION,
+    })
+}
+
+fn stream_seqs(stdout: &[u8]) -> Vec<u64> {
+    parse_ndjson(stdout)
+        .iter()
+        .map(|item| {
+            item["stream_seq"]
+                .as_u64()
+                .expect("an item has a stream_seq")
+        })
+        .collect()
+}
+
+/// `-n 30` on a twelve-thousand-item stream asks for the stream's newest
+/// item, then for the thirty items before it, and never for the stream
+/// from its first item.
+#[test]
+fn events_tail_reads_only_the_pages_holding_the_newest_items() {
+    let context = test_context!();
+    let server = MockServer::start();
+    let run_id = unique_run_id();
+    let events_path = format!("/api/v1/runs/{run_id}/events");
+    let _resolve = mock_resolved_run(&server, &run_id, &run_id);
+    let newest = server.mock(|when, then| {
+        when.method("GET")
+            .path(events_path.as_str())
+            .query_param("tail", "true")
+            .query_param("limit", "1");
+        then.status(200)
+            .header("Content-Type", "application/json")
+            .json_body(stream_page_json(&run_id, [12_000], true));
+    });
+    let last_thirty = server.mock(|when, then| {
+        when.method("GET")
+            .path(events_path.as_str())
+            .query_param_missing("tail")
+            .query_param("after", "11970");
+        then.status(200)
+            .header("Content-Type", "application/json")
+            .json_body(stream_page_json(&run_id, 11_971..=12_000, false));
+    });
+    let from_the_start = server.mock(|when, then| {
+        when.method("GET")
+            .path(events_path.as_str())
+            .query_param_missing("tail")
+            .query_param("after", "0");
+        then.status(200)
+            .header("Content-Type", "application/json")
+            .json_body(stream_page_json(&run_id, 1..=1000, true));
+    });
+
+    let mut cmd = context.command();
+    cmd.args([
+        "events",
+        "--json",
+        "-n",
+        "30",
+        "--server",
+        &server.base_url(),
+        &run_id,
+    ]);
+    let output = cmd.output().expect("command should execute");
+    assert!(
+        output.status.success(),
+        "events -n 30 should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        stream_seqs(&output.stdout),
+        (11_971..=12_000).collect::<Vec<u64>>()
+    );
+    assert_eq!(newest.calls(), 1, "the stream's end is read once");
+    assert_eq!(
+        last_thirty.calls(),
+        1,
+        "the newest thirty items are one page"
+    );
+    assert_eq!(
+        from_the_start.calls(),
+        0,
+        "the stream is never read from its first item"
+    );
+}
+
+/// A read stopped part-way has already printed every page it received: the
+/// listing's second page fails, and the first page's items are out.
+#[test]
+fn events_json_writes_each_page_as_it_arrives() {
+    let context = test_context!();
+    let server = MockServer::start();
+    let run_id = unique_run_id();
+    let events_path = format!("/api/v1/runs/{run_id}/events");
+    let _resolve = mock_resolved_run(&server, &run_id, &run_id);
+    let first = server.mock(|when, then| {
+        when.method("GET")
+            .path(events_path.as_str())
+            .query_param("after", "0");
+        then.status(200)
+            .header("Content-Type", "application/json")
+            .json_body(stream_page_json(&run_id, 1..=3, true));
+    });
+    let second = server.mock(|when, then| {
+        when.method("GET")
+            .path(events_path.as_str())
+            .query_param("after", "3");
+        then.status(500)
+            .header("Content-Type", "application/json")
+            .json_body(json!({"errors": [{"status": "500", "title": "Internal Server Error", "detail": "the read was cut short"}]}));
+    });
+
+    let mut cmd = context.command();
+    cmd.args(["events", "--json", "--server", &server.base_url(), &run_id]);
+    let output = cmd.output().expect("command should execute");
+    assert!(
+        !output.status.success(),
+        "the failed page fails the read\nstdout:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(
+        stream_seqs(&output.stdout),
+        vec![1, 2, 3],
+        "the first page was printed before the second was asked for\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(first.calls(), 1);
+    assert!(second.calls() >= 1);
 }
