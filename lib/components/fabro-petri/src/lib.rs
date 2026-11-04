@@ -76,6 +76,7 @@ pub mod http_store;
 pub mod interview;
 pub mod petri;
 pub mod platform_records;
+pub mod prepare;
 pub mod projection;
 pub mod projector;
 pub mod providers;

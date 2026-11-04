@@ -264,10 +264,10 @@ impl Site {
 }
 
 /// What one `git` run produced, on either site.
-struct GitOutput {
-    success: bool,
-    stdout:  Vec<u8>,
-    stderr:  Vec<u8>,
+pub(crate) struct GitOutput {
+    pub(crate) success: bool,
+    pub(crate) stdout:  Vec<u8>,
+    pub(crate) stderr:  Vec<u8>,
 }
 
 /// A checkpoint commit: the commit, whether an earlier attempt of the same
@@ -909,6 +909,20 @@ impl RunWorkspaces {
                 timeout,
             }),
         }
+    }
+
+    /// Run `program` through a scope's environment, in its workspace, with
+    /// a deadline and both streams captured: the prepare block's replay
+    /// runs its steps this way.
+    pub(crate) async fn run_in_env(
+        env: &Arc<dyn ExecEnv>,
+        program: &str,
+        args: &[&str],
+        action: &str,
+        extra_env: &[(String, String)],
+        timeout: Duration,
+    ) -> Result<GitOutput, CheckpointError> {
+        Self::run_sandbox(env, program, args, action, extra_env, timeout).await
     }
 
     /// Run `program` inside the sandbox, in its workspace, with the
