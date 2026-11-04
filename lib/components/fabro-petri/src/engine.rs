@@ -66,7 +66,7 @@ use fabro_util::sync;
 use lithos_llm::types::Error as LlmError;
 use petri_execution::host::{self, HostError, HostRun};
 use petri_execution::inspect::{self, InspectError, RunInspection};
-use petri_execution::watchdog::{StallWatchdog, WatchdogTask};
+use petri_execution::watchdog::{StallWatchdog, TokioClock, WatchdogClock, WatchdogTask};
 use petri_execution::{
     Access, CancelReason, CoordinatorError, ExecutionObserver, InterviewDispatcher, Interviewer,
     RECEIPT_FILE, RunKey, RunStore,
@@ -223,7 +223,29 @@ fn network_policy(settings: &EnvironmentNetworkSettings) -> NetworkPolicy {
 }
 
 /// Execute the run to its end and report what the record says.
-pub async fn run(mut request: RunRequest) -> Result<RunOutcome, RunError> {
+pub async fn run(request: RunRequest) -> Result<RunOutcome, RunError> {
+    run_on(request, Arc::new(TokioClock), Vec::new()).await
+}
+
+/// [`run`], with the stall watchdog measuring inactivity on `clock` instead
+/// of tokio's, for tests whose stall verdict must not depend on how long the
+/// host takes. `after_watchdog` observe each record after the watchdog has,
+/// so a test that moves `clock` on a record cannot move it before the
+/// watchdog counted that record as activity.
+#[cfg(feature = "test-support")]
+pub async fn run_with_stall_clock(
+    request: RunRequest,
+    clock: Arc<dyn WatchdogClock>,
+    after_watchdog: Vec<Arc<dyn ExecutionObserver>>,
+) -> Result<RunOutcome, RunError> {
+    run_on(request, clock, after_watchdog).await
+}
+
+async fn run_on(
+    mut request: RunRequest,
+    stall_clock: Arc<dyn WatchdogClock>,
+    after_watchdog: Vec<Arc<dyn ExecutionObserver>>,
+) -> Result<RunOutcome, RunError> {
     let backend = if request.runtime.dry_run {
         // The dry-run admission pass puts every scope on the host. Keep the
         // real local workspace for Fabro's checkpoint and artifact hooks.
@@ -272,7 +294,7 @@ pub async fn run(mut request: RunRequest) -> Result<RunOutcome, RunError> {
             (root.policy.stall_timeout, PrepareBlock::of(root))
         }
     };
-    let watchdog = stall_timeout.map(StallWatchdog::new);
+    let watchdog = stall_timeout.map(|timeout| StallWatchdog::with_clock(timeout, stall_clock));
     let mut options = RunOptions::new(&request.run_dir);
     options.run_key = Some(key.clone());
     options.retention = RETENTION;
@@ -393,6 +415,7 @@ pub async fn run(mut request: RunRequest) -> Result<RunOutcome, RunError> {
     if let Some(watchdog) = &watchdog {
         observers.push(Arc::new(watchdog.clone()));
     }
+    observers.extend(after_watchdog);
     let result = match request.execution {
         Execution::Start(graphs) => {
             info!(run_id = %request.run_id, backend = %backend, "Starting Petri run");

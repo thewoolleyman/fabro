@@ -12,6 +12,7 @@ use fabro_petri::engine::{self, Execution, RunRequest, RunStatus};
 use fabro_petri::runtime::RuntimeSpec;
 use pebble_coding_agent::test_support::{self, ScriptedCompletion, ScriptedProvider};
 use petri_execution::events::{self, ViewEvent};
+use petri_execution::watchdog::{ManualClock, WatchdogClock as _};
 use petri_execution::{CancelReason, InterviewReply, InterviewRequest, Interviewer, host, inspect};
 use petri_runtime::steps::Answer;
 use petri_store::{Access, MemoryRunStore, OwnerId, RunKey, RunStore};
@@ -108,13 +109,37 @@ async fn assert_no_tasks() {
 }
 
 async fn case(body: &str, budget: &str, runtime: RuntimeSpec, expected: RunStatus) {
+    case_on(body, budget, runtime, expected, None).await;
+}
+
+/// Run `body` and check its verdict. With a `clock`, the stall watchdog
+/// measures inactivity on that manual clock alone and `pace` observes the
+/// run, so the verdict depends only on how far the run's fake model advances
+/// the clock, never on host load or the wall clock.
+async fn case_on(
+    body: &str,
+    budget: &str,
+    runtime: RuntimeSpec,
+    expected: RunStatus,
+    clock: Option<(ManualClock, Arc<slow_stream::Pace>)>,
+) {
     let root = tempfile::tempdir().expect("a temporary run directory");
     let store = Arc::new(MemoryRunStore::new());
     let request = request(root.path(), store.clone(), body, budget, runtime);
-    let started = Instant::now();
-    let outcome = engine::run(request)
-        .await
-        .expect("the adapter returns an outcome");
+    let elapsed: Box<dyn Fn() -> Duration> = if let Some((clock, _)) = clock.clone() {
+        let started = clock.now();
+        Box::new(move || clock.now() - started)
+    } else {
+        let started = Instant::now();
+        Box::new(move || started.elapsed())
+    };
+    let outcome = match clock {
+        Some((clock, pace)) => {
+            engine::run_with_stall_clock(request, Arc::new(clock), vec![pace]).await
+        }
+        None => engine::run(request).await,
+    }
+    .expect("the adapter returns an outcome");
     assert_eq!(outcome.status, expected, "{outcome:?}");
     assert!(outcome.complete, "{outcome:?}");
     if expected == RunStatus::Cancelled {
@@ -124,7 +149,7 @@ async fn case(body: &str, budget: &str, runtime: RuntimeSpec, expected: RunStatu
         };
         assert!(message.contains("stall timeout: 1000 ms"), "{message}");
     } else {
-        assert!(started.elapsed() > Duration::from_secs(1));
+        assert!(elapsed() > Duration::from_secs(1));
         assert_eq!(stall_reason(&store).await, None);
     }
     assert_no_tasks().await;
@@ -316,15 +341,40 @@ async fn pending_question_parks_the_clock_and_answer_gets_a_full_budget() {
     assert_no_tasks().await;
 }
 
-#[tokio::test]
-async fn streaming_model_activity_in_child_branches_refreshes_the_budget() {
-    case(r#"
+const MODEL_BRANCHES: &str = r#"
         fan [shape=component]
-        a [shape=box, prompt="Reply briefly", model="test/model", timeout="10s", project_memory=false]
-        b [shape=box, prompt="Reply briefly", model="test/model", timeout="10s", project_memory=false]
+        a [shape=box, prompt="Reply briefly", model="test/model", project_memory=false]
+        b [shape=box, prompt="Reply briefly", model="test/model", project_memory=false]
         join [shape=tripleoctagon]
         start -> fan; fan -> a; fan -> b; a -> join; b -> join; join -> exit
-    "#, "1s", RuntimeSpec { model_client: Some(slow_stream::client()), ..RuntimeSpec::default() }, RunStatus::Success).await;
+    "#;
+
+/// Both model branches run on a manual stall clock. The sandbox start-up
+/// before the model is called takes real time but none on that clock, so
+/// only the model's own pace against the 1 s budget decides the verdict.
+/// The nodes carry no `timeout`: an attempt deadline runs on the real clock,
+/// and would put host load back into the verdict.
+async fn model_branches(gap: Duration, silent: bool, expected: RunStatus) {
+    let clock = ManualClock::new();
+    let pace = slow_stream::Pace::new(clock.clone(), gap);
+    let runtime = RuntimeSpec {
+        model_client: Some(slow_stream::client(pace.clone(), silent)),
+        ..RuntimeSpec::default()
+    };
+    case_on(MODEL_BRANCHES, "1s", runtime, expected, Some((clock, pace))).await;
+}
+
+#[tokio::test]
+async fn streaming_model_activity_in_child_branches_refreshes_the_budget() {
+    // Thirty deltas, each 200 ms after the run's last record: ~6 s in all.
+    model_branches(Duration::from_millis(200), false, RunStatus::Success).await;
+}
+
+#[tokio::test]
+async fn model_branches_with_no_streamed_activity_in_the_budget_stall() {
+    // The same graph, but the models stream nothing: 1.5 s passes after
+    // every record, and nothing refreshes the budget.
+    model_branches(Duration::from_millis(1500), true, RunStatus::Cancelled).await;
 }
 
 #[tokio::test]
