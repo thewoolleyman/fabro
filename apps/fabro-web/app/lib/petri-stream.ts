@@ -631,10 +631,18 @@ function selectedEdgeMetadata(item: RunStreamItem): UnknownRecord | undefined {
 }
 
 /**
- * A command stage's script: the text the step runs rides on the node's
- * `meta.script`, on every event of the stage (EVENTS.md "Source metadata").
+ * A command stage's script: the stage projection's `script_invocation`,
+ * which the server folds from the workflow node. The run stream names a
+ * node without its script, so the node's `meta.script` on a stage's event
+ * is read only for a run whose projection was folded before the stage kept
+ * it.
  */
-export function commandScriptOf(items: PetriStream): string | null {
+export function commandScriptOf(
+  items: PetriStream,
+  stage?: StageProjection,
+): string | null {
+  const invoked = getString(stage?.script_invocation, "command");
+  if (invoked) return invoked;
   for (const item of items) {
     const script = getString(getObject(subjectNode(item), "meta"), "script");
     if (script) return script;

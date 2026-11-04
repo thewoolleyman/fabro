@@ -807,6 +807,67 @@ mod tests {
         assert_eq!(view.state.stages.len(), 2);
     }
 
+    /// The stream names a node without its script, so the stage keeps it:
+    /// a command stage's `script_invocation` is the node's `meta.script`,
+    /// and a node without one leaves it unset.
+    #[test]
+    fn a_command_stage_keeps_its_script_as_its_invocation() {
+        let mut view = RunView::new();
+        let created = StoredPlatformRecord {
+            seq:         1,
+            recorded_at: 1_000,
+            record:      PlatformRecord::RunCreated(RunCreatedRecord {
+                spec:         types_support::test_run_spec(),
+                title:        Some("A run".to_string()),
+                parent_id:    None,
+                retried_from: None,
+                web_url:      None,
+            }),
+            position:    None,
+        };
+        view.fold(&Item::Platform(&created), 1);
+        let subject = |name: &str, firing: u64, meta: serde_json::Value| Subject {
+            node:       NodeRef {
+                id: NodeId::new(1),
+                name: name.into(),
+                kind: "attractor/command".into(),
+                meta,
+            },
+            firing:     Some(FiringId::new(firing)),
+            visit:      Some(1),
+            attempt:    None,
+            generation: None,
+            branch:     BranchRole::None,
+        };
+        view.start_visit(
+            ExecutionId::new(1),
+            &subject(
+                "build",
+                4,
+                serde_json::json!({ "kind": "command", "label": "Build", "script": "cargo build" }),
+            ),
+            millis(2_000),
+        );
+        view.start_visit(
+            ExecutionId::new(1),
+            &subject("plan", 5, serde_json::json!({ "kind": "agent" })),
+            millis(3_000),
+        );
+        let invocations: Vec<(String, Option<serde_json::Value>)> = view
+            .projection()
+            .expect("the run was created")
+            .iter_stages()
+            .map(|(id, stage)| (id.to_string(), stage.script_invocation.clone()))
+            .collect();
+        assert_eq!(invocations, vec![
+            (
+                "build@1".to_string(),
+                Some(serde_json::json!({ "command": "cargo build" }))
+            ),
+            ("plan@1".to_string(), None),
+        ]);
+    }
+
     #[test]
     fn a_firing_key_is_stored_as_execution_colon_firing() {
         let mut stages: BTreeMap<FiringKey, u32> = BTreeMap::new();

@@ -36,6 +36,9 @@ struct RunEventListParams {
     /// The run stream cursor: the last `stream_seq` seen.
     #[serde(default)]
     after: Option<u64>,
+    /// Serve the newest `limit` items past `after` instead of the oldest.
+    #[serde(default)]
+    tail:  Option<bool>,
 }
 
 impl RunEventListParams {
@@ -133,7 +136,12 @@ async fn list_run_events(
     if let Err(response) = ensure_run_exists(&state, &id).await {
         return response;
     }
-    list_run_stream(&state, id, params.after.unwrap_or(0), limit).await
+    let after = params.after.unwrap_or(0);
+    if params.tail.unwrap_or(false) {
+        list_run_stream_tail(&state, id, after, limit).await
+    } else {
+        list_run_stream(&state, id, after, limit).await
+    }
 }
 
 /// The canonical 404 when there is no such run.
@@ -158,6 +166,41 @@ async fn list_run_stream(state: &AppState, id: RunId, after: u64, limit: usize) 
             // The same items the attached stream serves, redacted the same
             // way, so a client that pages the listing after a stream sees
             // what the stream showed.
+            for item in &mut items {
+                item.item = redact_json_value(std::mem::take(&mut item.item));
+            }
+            Json(PaginatedRunStreamList {
+                data:                   items,
+                meta:                   PaginationMeta {
+                    has_more,
+                    total: None,
+                },
+                event_contract_version: EVENT_CONTRACT_VERSION,
+            })
+            .into_response()
+        }
+        Err(err) => {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
+        }
+    }
+}
+
+/// The newest page of a Petri run's stream past `after`: its last `limit`
+/// items, oldest first. `has_more` says whether older items past `after`
+/// precede the page. A reader that wants the stream's tail (`fabro events
+/// -n`) learns where it ends from this page and reads no item before the
+/// ones it keeps.
+async fn list_run_stream_tail(state: &AppState, id: RunId, after: u64, limit: usize) -> Response {
+    match state
+        .petri_projector
+        .stream_tail(id, after, limit.saturating_add(1))
+        .await
+    {
+        Ok(mut items) => {
+            let has_more = items.len() > limit;
+            if has_more {
+                items.drain(..items.len() - limit);
+            }
             for item in &mut items {
                 item.item = redact_json_value(std::mem::take(&mut item.item));
             }

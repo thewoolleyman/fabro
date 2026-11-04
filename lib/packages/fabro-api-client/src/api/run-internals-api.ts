@@ -607,15 +607,16 @@ export const RunInternalsApiAxiosParamCreator = function (configuration?: Config
             };
         },
         /**
-         * Returns one page of the run\'s stream (`PaginatedRunStreamList`): one ordered delivery of Petri\'s own `RunEvent`s and Fabro\'s platform records in the `RunStreamItem` envelope, in `stream_seq` order. The cursor is `after`: the last `stream_seq` the client saw, exclusive; the first page is `after=0`. A client that reconnects resumes from its last `stream_seq` and deduplicates by each item\'s `id`; every item is delivered once, in order, with no gap.
+         * Returns one page of the run\'s stream (`PaginatedRunStreamList`): one ordered delivery of Petri\'s own `RunEvent`s and Fabro\'s platform records in the `RunStreamItem` envelope, in `stream_seq` order. The cursor is `after`: the last `stream_seq` the client saw, exclusive; the first page is `after=0`. A client that reconnects resumes from its last `stream_seq` and deduplicates by each item\'s `id`; every item is delivered once, in order, with no gap. With `tail=true` the page is the newest `limit` items past `after` instead, still oldest first, and `meta.has_more` says whether older items past `after` precede it. A workflow node an item names carries its identity and display metadata but not its script; a command stage\'s script is its stage\'s `script_invocation`.
          * @summary List Run Events
          * @param {string} id Unique run identifier (ULID).
          * @param {number} [limit] Maximum number of events to return.
          * @param {number} [after] Run stream cursor for a Petri run: the last &#x60;stream_seq&#x60; the client saw, exclusive. &#x60;0&#x60; starts at the first item.
+         * @param {boolean} [tail] Serve the newest end of a Petri run\&#39;s stream: the last &#x60;limit&#x60; items past &#x60;after&#x60;, in &#x60;stream_seq&#x60; order.
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        listRunEvents: async (id: string, limit?: number, after?: number, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
+        listRunEvents: async (id: string, limit?: number, after?: number, tail?: boolean, options: RawAxiosRequestConfig = {}): Promise<RequestArgs> => {
             // verify required parameter 'id' is not null or undefined
             assertParamExists('listRunEvents', 'id', id)
             const localVarPath = `/api/v1/runs/{id}/events`
@@ -643,6 +644,10 @@ export const RunInternalsApiAxiosParamCreator = function (configuration?: Config
 
             if (after !== undefined) {
                 localVarQueryParameter['after'] = after;
+            }
+
+            if (tail !== undefined) {
+                localVarQueryParameter['tail'] = tail;
             }
 
             localVarHeaderParameter['Accept'] = 'application/json';
@@ -1292,16 +1297,17 @@ export const RunInternalsApiFp = function(configuration?: Configuration) {
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
         },
         /**
-         * Returns one page of the run\'s stream (`PaginatedRunStreamList`): one ordered delivery of Petri\'s own `RunEvent`s and Fabro\'s platform records in the `RunStreamItem` envelope, in `stream_seq` order. The cursor is `after`: the last `stream_seq` the client saw, exclusive; the first page is `after=0`. A client that reconnects resumes from its last `stream_seq` and deduplicates by each item\'s `id`; every item is delivered once, in order, with no gap.
+         * Returns one page of the run\'s stream (`PaginatedRunStreamList`): one ordered delivery of Petri\'s own `RunEvent`s and Fabro\'s platform records in the `RunStreamItem` envelope, in `stream_seq` order. The cursor is `after`: the last `stream_seq` the client saw, exclusive; the first page is `after=0`. A client that reconnects resumes from its last `stream_seq` and deduplicates by each item\'s `id`; every item is delivered once, in order, with no gap. With `tail=true` the page is the newest `limit` items past `after` instead, still oldest first, and `meta.has_more` says whether older items past `after` precede it. A workflow node an item names carries its identity and display metadata but not its script; a command stage\'s script is its stage\'s `script_invocation`.
          * @summary List Run Events
          * @param {string} id Unique run identifier (ULID).
          * @param {number} [limit] Maximum number of events to return.
          * @param {number} [after] Run stream cursor for a Petri run: the last &#x60;stream_seq&#x60; the client saw, exclusive. &#x60;0&#x60; starts at the first item.
+         * @param {boolean} [tail] Serve the newest end of a Petri run\&#39;s stream: the last &#x60;limit&#x60; items past &#x60;after&#x60;, in &#x60;stream_seq&#x60; order.
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        async listRunEvents(id: string, limit?: number, after?: number, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<PaginatedRunStreamList>> {
-            const localVarAxiosArgs = await localVarAxiosParamCreator.listRunEvents(id, limit, after, options);
+        async listRunEvents(id: string, limit?: number, after?: number, tail?: boolean, options?: RawAxiosRequestConfig): Promise<(axios?: AxiosInstance, basePath?: string) => AxiosPromise<PaginatedRunStreamList>> {
+            const localVarAxiosArgs = await localVarAxiosParamCreator.listRunEvents(id, limit, after, tail, options);
             const localVarOperationServerIndex = configuration?.serverIndex ?? 0;
             const localVarOperationServerBasePath = operationServerMap['RunInternalsApi.listRunEvents']?.[localVarOperationServerIndex]?.url;
             return (axios, basePath) => createRequestFunction(localVarAxiosArgs, globalAxios, BASE_PATH, configuration)(axios, localVarOperationServerBasePath || basePath);
@@ -1591,16 +1597,17 @@ export const RunInternalsApiFactory = function (configuration?: Configuration, b
             return localVarFp.listRunArtifacts(id, options).then((request) => request(axios, basePath));
         },
         /**
-         * Returns one page of the run\'s stream (`PaginatedRunStreamList`): one ordered delivery of Petri\'s own `RunEvent`s and Fabro\'s platform records in the `RunStreamItem` envelope, in `stream_seq` order. The cursor is `after`: the last `stream_seq` the client saw, exclusive; the first page is `after=0`. A client that reconnects resumes from its last `stream_seq` and deduplicates by each item\'s `id`; every item is delivered once, in order, with no gap.
+         * Returns one page of the run\'s stream (`PaginatedRunStreamList`): one ordered delivery of Petri\'s own `RunEvent`s and Fabro\'s platform records in the `RunStreamItem` envelope, in `stream_seq` order. The cursor is `after`: the last `stream_seq` the client saw, exclusive; the first page is `after=0`. A client that reconnects resumes from its last `stream_seq` and deduplicates by each item\'s `id`; every item is delivered once, in order, with no gap. With `tail=true` the page is the newest `limit` items past `after` instead, still oldest first, and `meta.has_more` says whether older items past `after` precede it. A workflow node an item names carries its identity and display metadata but not its script; a command stage\'s script is its stage\'s `script_invocation`.
          * @summary List Run Events
          * @param {string} id Unique run identifier (ULID).
          * @param {number} [limit] Maximum number of events to return.
          * @param {number} [after] Run stream cursor for a Petri run: the last &#x60;stream_seq&#x60; the client saw, exclusive. &#x60;0&#x60; starts at the first item.
+         * @param {boolean} [tail] Serve the newest end of a Petri run\&#39;s stream: the last &#x60;limit&#x60; items past &#x60;after&#x60;, in &#x60;stream_seq&#x60; order.
          * @param {*} [options] Override http request option.
          * @throws {RequiredError}
          */
-        listRunEvents(id: string, limit?: number, after?: number, options?: RawAxiosRequestConfig): AxiosPromise<PaginatedRunStreamList> {
-            return localVarFp.listRunEvents(id, limit, after, options).then((request) => request(axios, basePath));
+        listRunEvents(id: string, limit?: number, after?: number, tail?: boolean, options?: RawAxiosRequestConfig): AxiosPromise<PaginatedRunStreamList> {
+            return localVarFp.listRunEvents(id, limit, after, tail, options).then((request) => request(axios, basePath));
         },
         /**
          * Returns the ordered list of stages in a run\'s workflow graph with their current status and timing. Stages are bounded by the workflow graph size, typically fewer than 20.
@@ -1867,16 +1874,17 @@ export class RunInternalsApi extends BaseAPI {
     }
 
     /**
-     * Returns one page of the run\'s stream (`PaginatedRunStreamList`): one ordered delivery of Petri\'s own `RunEvent`s and Fabro\'s platform records in the `RunStreamItem` envelope, in `stream_seq` order. The cursor is `after`: the last `stream_seq` the client saw, exclusive; the first page is `after=0`. A client that reconnects resumes from its last `stream_seq` and deduplicates by each item\'s `id`; every item is delivered once, in order, with no gap.
+     * Returns one page of the run\'s stream (`PaginatedRunStreamList`): one ordered delivery of Petri\'s own `RunEvent`s and Fabro\'s platform records in the `RunStreamItem` envelope, in `stream_seq` order. The cursor is `after`: the last `stream_seq` the client saw, exclusive; the first page is `after=0`. A client that reconnects resumes from its last `stream_seq` and deduplicates by each item\'s `id`; every item is delivered once, in order, with no gap. With `tail=true` the page is the newest `limit` items past `after` instead, still oldest first, and `meta.has_more` says whether older items past `after` precede it. A workflow node an item names carries its identity and display metadata but not its script; a command stage\'s script is its stage\'s `script_invocation`.
      * @summary List Run Events
      * @param {string} id Unique run identifier (ULID).
      * @param {number} [limit] Maximum number of events to return.
      * @param {number} [after] Run stream cursor for a Petri run: the last &#x60;stream_seq&#x60; the client saw, exclusive. &#x60;0&#x60; starts at the first item.
+     * @param {boolean} [tail] Serve the newest end of a Petri run\&#39;s stream: the last &#x60;limit&#x60; items past &#x60;after&#x60;, in &#x60;stream_seq&#x60; order.
      * @param {*} [options] Override http request option.
      * @throws {RequiredError}
      */
-    public listRunEvents(id: string, limit?: number, after?: number, options?: RawAxiosRequestConfig) {
-        return RunInternalsApiFp(this.configuration).listRunEvents(id, limit, after, options).then((request) => request(this.axios, this.basePath));
+    public listRunEvents(id: string, limit?: number, after?: number, tail?: boolean, options?: RawAxiosRequestConfig) {
+        return RunInternalsApiFp(this.configuration).listRunEvents(id, limit, after, tail, options).then((request) => request(this.axios, this.basePath));
     }
 
     /**

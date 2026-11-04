@@ -283,6 +283,18 @@ impl Projector {
         stream::stream_after(&self.pool, run_id, after, limit).await
     }
 
+    /// The newest end of the run's stream past the cursor: the last
+    /// `limit` items with `stream_seq > after`, in `stream_seq` order, each
+    /// in Fabro's envelope.
+    pub async fn stream_tail(
+        &self,
+        run_id: RunId,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<RunStreamItem>, ProjectError> {
+        stream::stream_tail(&self.pool, run_id, after, limit).await
+    }
+
     /// Delete everything the store and the view tables hold for the run:
     /// its Petri records and lease, its platform records, its projection
     /// and its stream. The caller has ended the run's worker, so no writer

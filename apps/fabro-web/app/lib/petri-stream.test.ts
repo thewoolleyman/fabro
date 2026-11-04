@@ -295,6 +295,22 @@ describe("stage renderers", () => {
     expect(commandScriptOf(itemsForStage(command.stream, "start@1"))).toBeNull();
   });
 
+  test("a command stage's script is its stage's invocation when the stream names the node without it", () => {
+    const say = itemsForStage(command.stream, "say@1").map((item) => {
+      const copy = structuredClone(item);
+      const node = (copy.item as { subject?: { node?: { meta?: Record<string, unknown> } } })
+        .subject?.node;
+      if (node?.meta) delete node.meta.script;
+      return copy;
+    });
+    expect(commandScriptOf(say)).toBeNull();
+    const stage = command.projection.stages["say@1"];
+    expect(stage).toBeDefined();
+    expect(
+      commandScriptOf(say, { ...stage!, script_invocation: { command: "echo hello from petri" } }),
+    ).toBe("echo hello from petri");
+  });
+
   test("the condition an edge matched is read from the node's edge table", () => {
     const applied = (edge: number): RunStreamItem => ({
       run_id: "run",

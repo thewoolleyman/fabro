@@ -17,7 +17,7 @@
     reason = "sync CLI `run events` output: streams lines to std::io::stdout directly"
 )]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::time::Duration;
@@ -919,6 +919,14 @@ fn millis(recorded_at: u64) -> DateTime<Utc> {
 
 /// `run events` for a Petri run: the stream, filtered by `--since` and
 /// `--tail`, raw or pretty, then followed live when asked.
+///
+/// The stream is read page by page and each page is written as it arrives,
+/// so a read stopped part-way has already printed every item it received.
+/// `--tail` alone reads only the pages that hold the newest items: the
+/// stream's newest item says where it ends, and the listing is read from
+/// that many items before it. With `--since` as well, which items are the
+/// last matching ones is known only at the end of the stream, so that read
+/// keeps the newest matching items as it pages and prints them last.
 pub(crate) async fn print_events(
     client: &server_client::Client,
     run_id: &RunId,
@@ -927,32 +935,155 @@ pub(crate) async fn print_events(
     pretty: bool,
     styles: &Styles,
 ) -> Result<()> {
-    let items = client
-        .list_run_stream(run_id, 0)
-        .await
-        .context("Failed to list the run's stream")?;
-    let last_seq = items.last().map_or(0, |item| item.stream_seq);
-    let mut selected: Vec<&RunStreamItem> = items
-        .iter()
-        .filter(|item| since.is_none_or(|cutoff| PetriItem::new(item).recorded_at() >= cutoff))
-        .collect();
-    if let Some(tail) = args.tail {
-        let start = selected.len().saturating_sub(tail);
-        selected.drain(..start);
-    }
-
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    let mut state = PrettyState::default();
-    for item in selected {
-        write_item(&mut out, item, pretty, styles, &mut state)?;
-    }
-    out.flush()?;
+    let mut printer = Printer {
+        out: &mut out,
+        pretty,
+        styles,
+        state: PrettyState::default(),
+    };
+    let last_seq = match (args.tail, since) {
+        (Some(tail), None) => print_tail(client, run_id, tail, &mut printer).await?,
+        (Some(tail), Some(cutoff)) => {
+            print_tail_since(client, run_id, tail, cutoff, &mut printer).await?
+        }
+        (None, since) => print_since(client, run_id, since, &mut printer).await?,
+    };
+    let state = printer.state;
 
     if args.follow {
         Box::pin(follow(client, run_id, last_seq, pretty, styles, state)).await?;
     }
     Ok(())
+}
+
+/// Where `run events` writes the items it read, and how.
+struct Printer<'a> {
+    out:    &'a mut dyn Write,
+    pretty: bool,
+    styles: &'a Styles,
+    state:  PrettyState,
+}
+
+impl Printer<'_> {
+    /// Write the items and flush them, so they are out before the next
+    /// page is asked for.
+    fn print<'i>(&mut self, items: impl IntoIterator<Item = &'i RunStreamItem>) -> Result<()> {
+        for item in items {
+            write_item(self.out, item, self.pretty, self.styles, &mut self.state)?;
+        }
+        self.out.flush()?;
+        Ok(())
+    }
+}
+
+/// The newest `tail` items, page by page from `tail` items before the
+/// stream's newest one. Returns the last `stream_seq` printed (the newest
+/// item's, when `tail` is zero), or 0 for an empty stream.
+async fn print_tail(
+    client: &server_client::Client,
+    run_id: &RunId,
+    tail: usize,
+    printer: &mut Printer<'_>,
+) -> Result<u64> {
+    let newest = client
+        .list_run_stream_tail_page(run_id, 1)
+        .await
+        .context("Failed to read the end of the run's stream")?;
+    let Some(end) = newest.items.last().map(|item| item.stream_seq) else {
+        return Ok(0);
+    };
+    // `stream_seq` is dense, so the newest `tail` items are the ones past
+    // `end - tail`, up to `end`: the ones that land meanwhile are left to
+    // `--follow`.
+    let mut cursor = end.saturating_sub(u64::try_from(tail).unwrap_or(u64::MAX));
+    while cursor < end {
+        let remaining = usize::try_from(end - cursor).unwrap_or(usize::MAX);
+        let page = client
+            .list_run_stream_page(run_id, cursor, Some(remaining))
+            .await
+            .context("Failed to list the run's stream")?;
+        let Some(last) = page.items.last().map(|item| item.stream_seq) else {
+            break;
+        };
+        printer.print(page.items.iter().filter(|item| item.stream_seq <= end))?;
+        cursor = last;
+        if !page.has_more {
+            break;
+        }
+    }
+    Ok(end)
+}
+
+/// Every item recorded at or after `since` (every item without it), page
+/// by page from the stream's first. Returns the last `stream_seq` read.
+async fn print_since(
+    client: &server_client::Client,
+    run_id: &RunId,
+    since: Option<DateTime<Utc>>,
+    printer: &mut Printer<'_>,
+) -> Result<u64> {
+    let mut cursor = 0;
+    loop {
+        let page = client
+            .list_run_stream_page(run_id, cursor, None)
+            .await
+            .context("Failed to list the run's stream")?;
+        let Some(last) = page.items.last().map(|item| item.stream_seq) else {
+            break;
+        };
+        printer.print(page.items.iter().filter(|item| recorded_since(item, since)))?;
+        cursor = last;
+        if !page.has_more {
+            break;
+        }
+    }
+    Ok(cursor)
+}
+
+/// The newest `tail` items recorded at or after `since`: the whole stream
+/// is read, keeping only those, and they are printed at its end. Returns
+/// the last `stream_seq` read.
+async fn print_tail_since(
+    client: &server_client::Client,
+    run_id: &RunId,
+    tail: usize,
+    since: DateTime<Utc>,
+    printer: &mut Printer<'_>,
+) -> Result<u64> {
+    let mut kept: VecDeque<RunStreamItem> = VecDeque::new();
+    let mut cursor = 0;
+    loop {
+        let page = client
+            .list_run_stream_page(run_id, cursor, None)
+            .await
+            .context("Failed to list the run's stream")?;
+        let Some(last) = page.items.last().map(|item| item.stream_seq) else {
+            break;
+        };
+        cursor = last;
+        let has_more = page.has_more;
+        for item in page.items {
+            if recorded_since(&item, Some(since)) {
+                if kept.len() == tail {
+                    kept.pop_front();
+                }
+                if tail > 0 {
+                    kept.push_back(item);
+                }
+            }
+        }
+        if !has_more {
+            break;
+        }
+    }
+    printer.print(&kept)?;
+    Ok(cursor)
+}
+
+fn recorded_since(item: &RunStreamItem, since: Option<DateTime<Utc>>) -> bool {
+    since.is_none_or(|cutoff| PetriItem::new(item).recorded_at() >= cutoff)
 }
 
 fn write_item(

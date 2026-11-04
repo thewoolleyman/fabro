@@ -1764,6 +1764,31 @@ impl Client {
         })
     }
 
+    /// The newest page of a Petri run's stream: its last `limit` items (at
+    /// most 1000), in order. `has_more` says whether older items precede
+    /// the page.
+    pub async fn list_run_stream_tail_page(
+        &self,
+        run_id: &RunId,
+        limit: usize,
+    ) -> Result<RunStreamPage> {
+        let response = self
+            .send_api(|client| async move {
+                let mut request = client.list_run_events().id(run_id.to_string()).tail(true);
+                if let Some(limit) = non_zero_u64_from_usize(limit.min(1000)) {
+                    request = request.limit(limit);
+                }
+                request.send().await
+            })
+            .await?;
+        let page = response.into_inner();
+        Ok(RunStreamPage {
+            items:                  page.data,
+            has_more:               page.meta.has_more,
+            event_contract_version: Some(page.event_contract_version),
+        })
+    }
+
     /// At most `max_items` items of a Petri run's stream past `after`, in
     /// order, page by page.
     pub async fn list_run_stream_until(
