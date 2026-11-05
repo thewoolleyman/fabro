@@ -113,5 +113,11 @@ jobs:
       - uses: taiki-e/install-action@773334c0e05d7e699e4d78234494308223f3a2cf # v2
         with:
           tool: nextest,sccache
+      # The workflow pod runs as root inside a user namespace, while the
+      # checkout's files keep the runner's ownership, so libgit2 refuses the
+      # workspace ("repository path ... is not owned by current user") and the
+      # fabro-cli tests that observe a local workflow's Git worktree fail.
+      # Measured on the first fabro-k3s run (run 42124630229, 2026-11-05).
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - run: cargo nextest run --locked --workspace --status-level slow --profile ci
       - run: sccache --show-stats
