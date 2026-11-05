@@ -118,6 +118,9 @@ jobs:
       # workspace ("repository path ... is not owned by current user") and the
       # fabro-cli tests that observe a local workflow's Git worktree fail.
       # Measured on the first fabro-k3s run (run 42124630229, 2026-11-05).
-      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      # It goes in the SYSTEM config: the fabro-cli test harness runs each
+      # command with env_clear() and a temporary HOME, so a --global entry is
+      # never read (run 42128065950 failed the same way with one).
+      - run: git config --system --add safe.directory "$GITHUB_WORKSPACE"
       - run: cargo nextest run --locked --workspace --status-level slow --profile ci
       - run: sccache --show-stats
