@@ -1,0 +1,106 @@
+# Fork-only merge gate for the branches the livespec factory builds from.
+#
+# Upstream's rust.yml runs only for `main`, on GitHub-hosted larger runners, so
+# a pull request against a carrier branch of this fork shows no checks at all.
+# Until this file existed, every fork gate ran on the shared livespec dev host
+# (livespec-orchestrator-beads-fabro .ai/fabro-fork-hand-build.md, "The merge
+# gate is local"). This workflow runs the same format, clippy and nextest gates
+# on the fleet's self-hosted ARC k3s scale set instead (work-item bd-ib-dqxcsh).
+#
+# It is a separate file, not an edit of rust.yml, so rebasing a carrier onto
+# upstream never conflicts on it, and upstream's jobs keep their own runners.
+#
+# The scale set runs ARC kubernetes container mode with no Docker daemon (the
+# fleet forbids privileged pods), so the Docker sandbox scenarios that rust.yml's
+# `test` and `sandbox-docker` jobs pull images for are NOT run here. With
+# FABRO_REQUIRE_SANDBOX_BACKENDS unset, those scenarios self-skip. The
+# macOS job and the musl process-title job are likewise upstream-only.
+#
+# Each job's steps run in a separate workflow pod built from the fleet hook
+# template. That pod is root inside a user namespace, so apt-get needs no sudo.
+# The template also injects CARGO_BUILD_JOBS, NEXTEST_TEST_THREADS and the
+# read-only sccache Redis endpoint.
+name: Fork gates
+
+on:
+  push:
+    branches:
+      - "carrier-*"
+      - factory-integration
+  pull_request:
+    branches:
+      - "carrier-*"
+      - factory-integration
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  RUSTC_WRAPPER: sccache
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ${{ fromJSON(vars.FORK_RUST_RUNNER_LABELS || '["fabro-k3s"]') }}
+    container:
+      image: buildpack-deps:noble
+    permissions:
+      contents: read
+    env:
+      RUSTC_WRAPPER: ""
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: nightly-2026-04-14
+          components: rustfmt
+      - run: cargo +nightly-2026-04-14 fmt --check --all
+
+  clippy:
+    name: Clippy
+    runs-on: ${{ fromJSON(vars.FORK_RUST_RUNNER_LABELS || '["fabro-k3s"]') }}
+    container:
+      image: buildpack-deps:noble
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: nightly-2026-04-14
+          components: clippy
+      - uses: taiki-e/install-action@773334c0e05d7e699e4d78234494308223f3a2cf # v2
+        with:
+          tool: sccache
+      - run: cargo +nightly-2026-04-14 clippy --locked --workspace --all-targets -- -D warnings
+      - run: sccache --show-stats
+
+  test:
+    name: Test (Linux, no Docker)
+    runs-on: ${{ fromJSON(vars.FORK_RUST_RUNNER_LABELS || '["fabro-k3s"]') }}
+    container:
+      image: buildpack-deps:noble
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.97.1
+      - uses: taiki-e/install-action@773334c0e05d7e699e4d78234494308223f3a2cf # v2
+        with:
+          tool: nextest,sccache
+      - run: cargo nextest run --locked --workspace --status-level slow --profile ci
+      - run: sccache --show-stats
