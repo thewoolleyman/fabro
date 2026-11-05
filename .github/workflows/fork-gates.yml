@@ -122,5 +122,11 @@ jobs:
       # command with env_clear() and a temporary HOME, so a --global entry is
       # never read (run 42128065950 failed the same way with one).
       - run: git config --system --add safe.directory "$GITHUB_WORKSPACE"
-      - run: cargo nextest run --locked --workspace --status-level slow --profile ci
+      # The Petri crash scenarios SIGKILL a worker whose parent server they
+      # killed first, then poll fabro_proc::process_running, which counts a
+      # zombie as running. On a GitHub-hosted runner PID 1 reaps the orphan;
+      # in this job container nothing does, so "the worker did not die"
+      # (run 42130472837). tini -s makes the test run its own subreaper.
+      - run: apt-get update && apt-get install -y --no-install-recommends tini
+      - run: tini -s -- cargo nextest run --locked --workspace --status-level slow --profile ci
       - run: sccache --show-stats
