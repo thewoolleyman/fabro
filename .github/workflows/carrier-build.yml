@@ -1,0 +1,97 @@
+# Fork-only release build of the factory engine from a named carrier ref.
+#
+# The livespec factory's engine binary was hand-built on the shared livespec dev
+# host until this file existed. This workflow builds it on the fleet's
+# self-hosted ARC k3s scale set instead (work-item bd-ib-dqxcsh). It uses the
+# same recipe as those hand builds:
+#   bun install --frozen-lockfile; cargo clean --release -p fabro-spa;
+#   cargo dev build --release -p fabro-cli   (NODE_ENV=production)
+# It publishes the binary as a workflow artifact with VERSION, SHA256SUMS and a
+# BUILD_INFO naming the source ref and commit. Fetch it with
+#   gh run download <run-id> -R thewoolleyman/fabro -n fabro-engine-<sha12>
+# with no build on the dev host.
+name: Carrier build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Carrier branch, tag or commit to build (e.g. carrier-candidate-registered-20261023)"
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  NODE_ENV: production
+  RUSTC_WRAPPER: sccache
+
+jobs:
+  build:
+    name: Build fabro (x86_64-unknown-linux-gnu)
+    runs-on: ${{ fromJSON(vars.FORK_RUST_RUNNER_LABELS || '["fabro-k3s"]') }}
+    container:
+      image: buildpack-deps:noble
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Resolve the commit being built
+        id: src
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short=${sha:0:12}" >> "$GITHUB_OUTPUT"
+          echo "building $INPUT_REF at $sha"
+      - name: Install unzip (setup-bun needs it)
+        run: apt-get update && apt-get install -y unzip
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+          no-cache: true
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.97.1
+      - uses: taiki-e/install-action@773334c0e05d7e699e4d78234494308223f3a2cf # v2
+        with:
+          tool: sccache
+      - run: bun install --frozen-lockfile
+      - run: cargo clean --release -p fabro-spa
+      - run: cargo dev build --release -p fabro-cli
+      - name: Stage the binary with VERSION, SHA256SUMS and BUILD_INFO
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          SHA: ${{ steps.src.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -eu
+          bin="${CARGO_TARGET_DIR:-target}/release/fabro"
+          version="$("$bin" --version)"
+          echo "version: $version"
+          case "$version" in
+            *"${SHA:0:7}"*) ;;
+            *) echo "::error::fabro --version does not name ${SHA:0:7}: $version"; exit 1 ;;
+          esac
+          mkdir -p stage
+          cp "$bin" stage/fabro
+          echo "$version" > stage/VERSION
+          (cd stage && sha256sum fabro > SHA256SUMS)
+          echo "source=${GITHUB_REPOSITORY} ref=${INPUT_REF} commit=${SHA} NODE_ENV=production recipe=\"bun install --frozen-lockfile; cargo clean --release -p fabro-spa; cargo dev build --release -p fabro-cli\" built=$(date -u +%FT%TZ) runner=${RUNNER_NAME} run=${RUN_URL}" > stage/BUILD_INFO
+          cat stage/BUILD_INFO stage/SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fabro-engine-${{ steps.src.outputs.short }}
+          path: stage/
+          if-no-files-found: error
+          retention-days: 90
