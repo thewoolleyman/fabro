@@ -16,6 +16,11 @@
 # FABRO_REQUIRE_SANDBOX_BACKENDS unset, those scenarios self-skip. The
 # macOS job and the musl process-title job are likewise upstream-only.
 #
+# A pull request from any other repository (a fork of this fork) is skipped by
+# each job's `if:` guard, so it never reaches a self-hosted runner. The fork's
+# Actions setting must also require approval for all external contributors
+# (approval_policy all_external_contributors), set before this file lands.
+#
 # Each job's steps run in a separate workflow pod built from the fleet hook
 # template. That pod is root inside a user namespace, so apt-get needs no sudo.
 # The template also injects CARGO_BUILD_JOBS, NEXTEST_TEST_THREADS and the
@@ -47,6 +52,8 @@ env:
 jobs:
   fmt:
     name: Format
+    # Self-hosted runners never run a pull request from another repository.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ fromJSON(vars.FORK_RUST_RUNNER_LABELS || '["fabro-k3s"]') }}
     container:
       image: buildpack-deps:noble
@@ -66,6 +73,8 @@ jobs:
 
   clippy:
     name: Clippy
+    # Self-hosted runners never run a pull request from another repository.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ fromJSON(vars.FORK_RUST_RUNNER_LABELS || '["fabro-k3s"]') }}
     container:
       image: buildpack-deps:noble
@@ -87,6 +96,8 @@ jobs:
 
   test:
     name: Test (Linux, no Docker)
+    # Self-hosted runners never run a pull request from another repository.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ fromJSON(vars.FORK_RUST_RUNNER_LABELS || '["fabro-k3s"]') }}
     container:
       image: buildpack-deps:noble
