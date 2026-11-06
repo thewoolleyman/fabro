@@ -99,6 +99,10 @@ jobs:
     # Self-hosted runners never run a pull request from another repository.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ fromJSON(vars.FORK_RUST_RUNNER_LABELS || '["fabro-k3s"]') }}
+    # The run-level bound. nextest's `ci` profile kills no test for being slow
+    # (bd-ib-adrhkf), so a hung test is stopped here. A cold build plus the full
+    # suite measured about 17 minutes on 2026-11-06 (run 42195909423).
+    timeout-minutes: 120
     container:
       image: buildpack-deps:noble
     permissions:

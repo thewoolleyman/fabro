@@ -59,30 +59,21 @@ leak-timeout = "500ms"
     slow-timeout = { period = "60s", terminate-after = 20 }
 
 [profile.ci]
-# CI runners are slower and more variable than dev machines; give tests room
-# before flagging them as hung. CI uses one uniform timeout for every test.
-#
-# Nextest falls back to `[[profile.default.overrides]]` when the active
-# profile has no matching override for a given setting, so the per-package
-# overrides below re-assert the CI timeout for packages narrowed down in
-# profile.default. See
-# https://nexte.st/docs/configuration/per-test-overrides/#override-precedence
-slow-timeout = { period = "30s", terminate-after = 4 }
+# CI never kills a test for being slow. A per-test kill that a healthy test can
+# reach on a loaded runner is a performance assertion: it turns machine load
+# into a failed verdict (livespec work-item bd-ib-adrhkf, maintainer ruling
+# 2026-11-03). The only time bound is the run-level one: the CI job's
+# `timeout-minutes`, or the caller's own bound on a local gate. A test that
+# genuinely hangs is a separate bug, and SLOW still names it after 30s.
+slow-timeout = { period = "30s" }
 leak-timeout = "2s"
 
+    # Nextest falls back to `[[profile.default.overrides]]` when the active
+    # profile has no matching override for a given setting, so without this
+    # catch-all every package profile.default narrows (fabro-cli, fabro-server,
+    # fabro-workflow, fabro-petri, fabro-proc's lifecycle binary) would keep
+    # its default-profile hard kill under CI. See
+    # https://nexte.st/docs/configuration/per-test-overrides/#override-precedence
     [[profile.ci.overrides]]
-    filter = "package(fabro-cli)"
-    slow-timeout = { period = "30s", terminate-after = 4 }
-
-    [[profile.ci.overrides]]
-    filter = "package(fabro-server)"
-    slow-timeout = { period = "30s", terminate-after = 4 }
-
-    [[profile.ci.overrides]]
-    filter = "package(fabro-workflow)"
-    slow-timeout = { period = "30s", terminate-after = 4 }
-
-    [[profile.ci.overrides]]
-    filter = "package(fabro-petri)"
-    slow-timeout = { period = "30s", terminate-after = 4 }
-
+    filter = "all()"
+    slow-timeout = { period = "30s" }
