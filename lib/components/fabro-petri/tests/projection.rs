@@ -17,11 +17,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use fabro_db::DbPool;
-use fabro_interview::ControlInterviewer;
+use fabro_interview::{Answer as LegacyAnswer, ControlInterviewer};
 use fabro_petri::blobs::{Blobs, RunBlobs};
 use fabro_petri::check::Launch;
 use fabro_petri::engine::{self, RunStatus as EngineRunStatus};
-use fabro_petri::interview::{Approval, FabroInterviewer};
+use fabro_petri::interview::{Approval, FabroInterviewer, engine_submission};
 use fabro_petri::projector::{self, Projector};
 use fabro_petri::providers::SandboxProviderConfig;
 use fabro_petri::runtime::RuntimeSpec;
@@ -103,7 +103,7 @@ fn described_gate_workflow(markers: &Path) -> String {
     start [shape=Mdiamond]
     exit [shape=Msquare]
     plan [shape=parallelogram, output_schema="routing", script="echo '{{\"outcome\": \"succeeded\", \"context_updates\": {{\"last_stage\": \"plan\", \"response.plan\": \"Ship the fix in one commit.\"}}}}'"]
-    gate [shape=hexagon, label="Deploy?", timeout="1500ms", human.default_choice="no"]
+    gate [shape=hexagon, label="Deploy?"]
     yes [shape=parallelogram, script="touch {dir}/yes"]
     no [shape=parallelogram, script="touch {dir}/no"]
     start -> plan -> gate
@@ -1112,6 +1112,8 @@ struct GateRun {
     scenario:  Scenario,
     markers:   PathBuf,
     projector: Arc<Projector>,
+    /// Where a test delivers an answer, as the API does.
+    control:   Arc<ControlInterviewer>,
     workflow:  String,
     _root:     tempfile::TempDir,
 }
@@ -1139,6 +1141,7 @@ async fn gate_run_of(workflow: impl FnOnce(&Path) -> String) -> GateRun {
         scenario,
         markers,
         projector,
+        control: Arc::new(ControlInterviewer::new()),
         workflow,
         _root: root,
     }
@@ -1157,7 +1160,7 @@ impl GateRun {
             Launch::default(),
             &runtime,
         );
-        let interviewer = FabroInterviewer::new(Arc::new(ControlInterviewer::new()), approval);
+        let interviewer = FabroInterviewer::new(Arc::clone(&self.control), approval);
         let store = self
             .projector
             .observe_store(Arc::new(SqliteRunStore::new(self.scenario.pool.clone())));
@@ -1174,9 +1177,12 @@ impl GateRun {
         self.projector.settle(self.scenario.run_id).await;
     }
 
-    /// The stored projection once a question is pending in it.
+    /// The stored projection once a question is pending in it. It waits on
+    /// that event alone, with no deadline of its own: a question that never
+    /// reaches the projection is a hang for the test runner's own timeout,
+    /// never a verdict host load can decide. The caller's gate must keep the
+    /// question open until it is answered, or it can close unobserved.
     async fn pending(&self) -> fabro_types::RunProjection {
-        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let stored =
                 petri_support::stored_projection(&self.scenario.pool, self.scenario.run_id)
@@ -1185,10 +1191,6 @@ impl GateRun {
             if let Some(stored) = stored.filter(|stored| !stored.pending_interviews.is_empty()) {
                 return stored;
             }
-            assert!(
-                Instant::now() < deadline,
-                "the question never showed as pending"
-            );
             sleep(Duration::from_millis(10)).await;
         }
     }
@@ -1284,7 +1286,8 @@ async fn an_expired_question_is_pending_while_the_gate_waits_and_closes_on_the_e
 /// they would do, and the question carries the previous stage's response
 /// as its context: the pending question in the projection shows all
 /// three, as Petri's question record carries them, and leaves them absent
-/// on a choice that has none.
+/// on a choice that has none. The gate has no timeout, so the question
+/// stays pending until the test, having seen it, answers it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pending_question_carries_its_choice_descriptions_previews_and_context() {
     let gate = Arc::new(gate_run_of(described_gate_workflow).await);
@@ -1293,7 +1296,7 @@ async fn a_pending_question_carries_its_choice_descriptions_previews_and_context
         tokio::spawn(async move { gate.run(Approval::Prompt).await })
     };
     let pending = gate.pending().await;
-    let (_, record) = pending
+    let (id, record) = pending
         .pending_interviews
         .iter()
         .next()
@@ -1321,8 +1324,12 @@ async fn a_pending_question_carries_its_choice_descriptions_previews_and_context
     assert_eq!(question.options[1].preview, None);
     assert!(question.review_target.is_none());
 
+    gate.control
+        .submit(id, engine_submission(LegacyAnswer::no()))
+        .await
+        .expect("the answer is accepted");
     running.await.expect("the run task ends");
-    assert!(gate.markers.join("no").exists(), "the default ran");
+    assert!(gate.markers.join("no").exists(), "the answered branch ran");
     assert_view_equals_rebuild(&gate.scenario.pool, gate.scenario.run_id).await;
 }
 

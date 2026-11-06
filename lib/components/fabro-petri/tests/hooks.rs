@@ -44,9 +44,9 @@ use fabro_types::{GitIdentitySource, RunId, SandboxProviderKind};
 use object_store::local::LocalFileSystem;
 use petri_execution::inspect::{self, RunInspection};
 use petri_store::{Access, MemoryRunStore, RunKey, RunStore as _};
+use tokio::fs;
 use tokio::process::Command;
 use tokio::sync::{Notify, Semaphore};
-use tokio::{fs, time};
 use tokio_util::sync::CancellationToken;
 
 mod support;
@@ -1744,12 +1744,11 @@ async fn required_publication_blocks_the_terminal_result_and_cleanup() {
                 )
                 .await
         });
-        time::timeout(
-            std::time::Duration::from_secs(15),
-            publisher.entered.notified(),
-        )
-        .await
-        .expect("publication reaches the gate");
+        // Wait on the event itself, with no deadline of our own: `entered` is
+        // notified with `notify_one`, whose permit outlives an early notify,
+        // and a publication that never reaches the gate is a hang for the
+        // test runner's timeout, never a verdict host load can decide.
+        publisher.entered.notified().await;
         let pending = harness.inspection().await;
         assert!(pending.required_finalization);
         assert!(
