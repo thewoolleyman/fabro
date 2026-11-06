@@ -1,5 +1,7 @@
 //! Fabro installs Petri's graph-wide inactivity policy on the real adapter.
 
+#[path = "support/command_pace.rs"]
+mod command_pace;
 #[path = "support/slow_stream.rs"]
 mod slow_stream;
 mod support;
@@ -13,7 +15,9 @@ use fabro_petri::runtime::RuntimeSpec;
 use pebble_coding_agent::test_support::{self, ScriptedCompletion, ScriptedProvider};
 use petri_execution::events::{self, ViewEvent};
 use petri_execution::watchdog::{ManualClock, WatchdogClock as _};
-use petri_execution::{CancelReason, InterviewReply, InterviewRequest, Interviewer, host, inspect};
+use petri_execution::{
+    CancelReason, ExecutionObserver, InterviewReply, InterviewRequest, Interviewer, host, inspect,
+};
 use petri_runtime::steps::Answer;
 use petri_store::{Access, MemoryRunStore, OwnerId, RunKey, RunStore};
 use support::{SETTINGS, Silent, admit, no_questions, run_request, wait_until};
@@ -23,7 +27,7 @@ use tokio::time;
 use tokio_util::sync::CancellationToken;
 
 const QUIET: &str = r#"work [shape=parallelogram, script="sleep 3; echo done", timeout="10s"] start -> work -> exit"#;
-const ACTIVE: &str = r#"work [shape=parallelogram, script="for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do echo tick; sleep 0.2; done", timeout="10s"] start -> work -> exit"#;
+const ACTIVE: &str = r#"work [shape=parallelogram, script="for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do echo tick; sleep 0.2; done"] start -> work -> exit"#;
 
 fn request(
     root: &std::path::Path,
@@ -114,14 +118,15 @@ async fn case(body: &str, budget: &str, runtime: RuntimeSpec, expected: RunStatu
 
 /// Run `body` and check its verdict. With a `clock`, the stall watchdog
 /// measures inactivity on that manual clock alone and `pace` observes the
-/// run, so the verdict depends only on how far the run's fake model advances
-/// the clock, never on host load or the wall clock.
+/// run after it, so the verdict depends only on how far the run's own
+/// activity (a fake model's stream, or a command's output) advances the
+/// clock, never on host load or the wall clock.
 async fn case_on(
     body: &str,
     budget: &str,
     runtime: RuntimeSpec,
     expected: RunStatus,
-    clock: Option<(ManualClock, Arc<slow_stream::Pace>)>,
+    clock: Option<(ManualClock, Arc<dyn ExecutionObserver>)>,
 ) {
     let root = tempfile::tempdir().expect("a temporary run directory");
     let store = Arc::new(MemoryRunStore::new());
@@ -165,9 +170,36 @@ async fn zero_disables_the_watchdog() {
     case(QUIET, "0s", RuntimeSpec::default(), RunStatus::Success).await;
 }
 
+/// A command graph on a manual stall clock that only the command's output
+/// moves: each line a command prints advances the clock by `gap`, after the
+/// watchdog has counted that line as activity. The sandbox start-up and the
+/// script's real sleeps take no time on that clock, so only the output's
+/// spacing against the 1 s budget decides the verdict. The command nodes
+/// carry no `timeout`: a command deadline runs on the real clock, and would
+/// put host load back into the verdict.
+async fn paced_commands(body: &str, gap: Duration, expected: RunStatus) {
+    let clock = ManualClock::new();
+    let pace: Arc<dyn ExecutionObserver> = command_pace::OutputPace::new(clock.clone(), gap);
+    case_on(
+        body,
+        "1s",
+        RuntimeSpec::default(),
+        expected,
+        Some((clock, pace)),
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn command_output_refreshes_the_budget() {
-    case(ACTIVE, "1s", RuntimeSpec::default(), RunStatus::Success).await;
+    // Fifteen lines, each 200 ms after the last: 3 s in all.
+    paced_commands(ACTIVE, Duration::from_millis(200), RunStatus::Success).await;
+}
+
+#[tokio::test]
+async fn command_output_spaced_wider_than_the_budget_stalls() {
+    // The same graph, with 1.5 s between the command's lines.
+    paced_commands(ACTIVE, Duration::from_millis(1500), RunStatus::Cancelled).await;
 }
 
 fn parallel(active: bool) -> String {
@@ -179,8 +211,8 @@ fn parallel(active: bool) -> String {
     format!(
         r#"
         fan [shape=component]
-        a [shape=parallelogram, script="{script}", timeout="10s"]
-        b [shape=parallelogram, script="sleep 3", timeout="10s"]
+        a [shape=parallelogram, script="{script}"]
+        b [shape=parallelogram, script="sleep 3"]
         join [shape=tripleoctagon]
         start -> fan; fan -> a; fan -> b; a -> join; b -> join; join -> exit
     "#
@@ -189,11 +221,22 @@ fn parallel(active: bool) -> String {
 
 #[tokio::test]
 async fn one_active_child_keeps_the_whole_parallel_run_alive() {
-    case(
+    // The echoing child's fifteen lines, 200 ms apart; the other is quiet.
+    paced_commands(
         &parallel(true),
-        "1s",
-        RuntimeSpec::default(),
+        Duration::from_millis(200),
         RunStatus::Success,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn one_child_with_output_spaced_wider_than_the_budget_stalls_the_parallel_run() {
+    // The same graph, with 1.5 s between the echoing child's lines.
+    paced_commands(
+        &parallel(true),
+        Duration::from_millis(1500),
+        RunStatus::Cancelled,
     )
     .await;
 }
@@ -361,6 +404,7 @@ async fn model_branches(gap: Duration, silent: bool, expected: RunStatus) {
         model_client: Some(slow_stream::client(pace.clone(), silent)),
         ..RuntimeSpec::default()
     };
+    let pace: Arc<dyn ExecutionObserver> = pace;
     case_on(MODEL_BRANCHES, "1s", runtime, expected, Some((clock, pace))).await;
 }
 
