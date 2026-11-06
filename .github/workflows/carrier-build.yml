@@ -38,6 +38,12 @@ jobs:
     runs-on: ${{ fromJSON(vars.FORK_RUST_RUNNER_LABELS || '["fabro-k3s"]') }}
     container:
       image: buildpack-deps:noble
+    # A container job's default shell is `sh -e` (dash), which rejects the
+    # bash substrings `${sha:0:12}` and `${SHA:0:7}` below with exit 2
+    # (run 42145878202). buildpack-deps:noble ships bash.
+    defaults:
+      run:
+        shell: bash
     permissions:
       contents: read
     steps:
