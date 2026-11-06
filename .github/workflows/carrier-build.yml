@@ -45,6 +45,14 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
           persist-credentials: false
+      # The workflow pod runs as root inside a user namespace, while the
+      # checkout's files keep the runner's ownership, so git refuses the
+      # workspace ("detected dubious ownership"). fork-gates.yml carries the
+      # same entry. Measured on the first carrier build (run 42143474207,
+      # 2026-11-06), which failed here before building anything. It goes in
+      # the SYSTEM config so the build's own git reads (the version stamp)
+      # see it whatever HOME they run with.
+      - run: git config --system --add safe.directory "$GITHUB_WORKSPACE"
       - name: Resolve the commit being built
         id: src
         env:
