@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -21,6 +21,7 @@ use fabro_client::Client;
 use fabro_config::bind::Bind;
 use fabro_config::daemon::ServerDaemon;
 use fabro_config::{Storage, envfile};
+pub(crate) use fabro_store::RunProjection;
 use fabro_test::{TestContext, expect_reqwest_status};
 use fabro_types::test_support::test_principal;
 use fabro_types::{
@@ -31,10 +32,11 @@ use httpmock::{HttpMockResponse, Mock, MockServer};
 use serde_json::Value;
 use shlex::try_quote;
 
-const LOCAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
-const CI_COMMAND_TIMEOUT: Duration = Duration::from_secs(90);
-
-pub(crate) use fabro_store::RunProjection;
+// No fixture helper here puts a wall-clock deadline on its command or its
+// poll: a setup step that is only slow because the host is loaded must not
+// fail the test before its assertion runs (livespec work-item bd-ib-sltfyg,
+// maintainer ruling 2026-11-03). A setup that genuinely hangs is bounded by
+// the run-level timeout alone: the CI job's `timeout-minutes`.
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 struct RunSummaryRecord {
@@ -67,14 +69,6 @@ pub(crate) struct WorkspaceRunSetup {
 
 pub(crate) struct WorkflowGate {
     gate_path: PathBuf,
-}
-
-fn command_timeout() -> Duration {
-    if std::env::var_os("CI").is_some() {
-        CI_COMMAND_TIMEOUT
-    } else {
-        LOCAL_COMMAND_TIMEOUT
-    }
 }
 
 /// Returns the repo-relative path to a test fixture.
@@ -352,7 +346,6 @@ pub(crate) fn run_success(context: &TestContext, args: &[&str]) -> Output {
 fn run_success_in(context: &TestContext, args: &[&str], cwd: &Path) -> Output {
     let mut cmd = context.command();
     cmd.current_dir(cwd);
-    cmd.timeout(command_timeout());
     cmd.args(args);
     let output = cmd.output().expect("command should execute");
     if !output.status.success() {
@@ -389,7 +382,6 @@ pub(crate) fn setup_seeded_created_dry_run(context: &TestContext) -> RunSetup {
 fn run_completed_dry_run(context: &TestContext, workflow: &Path) -> RunSetup {
     let mut cmd = context.run_cmd();
     cmd.current_dir(&context.temp_dir);
-    cmd.timeout(command_timeout());
     cmd.args(["--dry-run", "--auto-approve", "--environment", "local"]);
     cmd.arg(workflow);
     let output = cmd.output().expect("command should execute");
@@ -453,7 +445,6 @@ pub(crate) fn setup_detached_dry_run(context: &TestContext) -> RunSetup {
     let workflow = context.install_fixture("simple.fabro");
     let mut cmd = context.run_cmd();
     cmd.current_dir(&context.temp_dir);
-    cmd.timeout(command_timeout());
     cmd.args([
         "--detach",
         "--dry-run",
@@ -473,12 +464,7 @@ pub(crate) fn setup_detached_dry_run(context: &TestContext) -> RunSetup {
     }
     let run_id = created_run_id(&output);
     let run = resolve_run(context, &run_id);
-    let deadline = Instant::now() + command_timeout();
     while run_stream_items(&run.run_dir).is_empty() {
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for store events for {run_id}"
-        );
         std::thread::sleep(Duration::from_millis(50));
     }
     run
@@ -601,7 +587,6 @@ id = "local"
 fn run_local_workflow(context: &TestContext, workspace_dir: &Path, workflow: &str) -> RunSetup {
     let mut cmd = context.run_cmd();
     cmd.current_dir(workspace_dir);
-    cmd.timeout(command_timeout());
     cmd.env("OPENAI_API_KEY", "test");
     cmd.args([
         "--auto-approve",
@@ -683,7 +668,6 @@ pub(crate) fn write_gated_workflow(path: &Path, name: &str, goal: &str) -> Workf
     reason = "This sync integration helper polls stored run status without requiring a Tokio runtime."
 )]
 pub(crate) fn wait_for_status(run_dir: &Path, expected: &[&str]) -> String {
-    let deadline = Instant::now() + command_timeout();
     loop {
         let state = run_state(run_dir);
         let status = if state.archived_at.is_some() {
@@ -706,12 +690,6 @@ pub(crate) fn wait_for_status(run_dir: &Path, expected: &[&str]) -> String {
         if expected.contains(&status) {
             return status.to_string();
         }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for status {:?} in {}",
-            expected,
-            run_dir.display()
-        );
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -743,7 +721,6 @@ fn run_dirs_for_test_case(context: &TestContext) -> Vec<PathBuf> {
     reason = "This sync integration helper polls for the run directory to appear without requiring a Tokio runtime."
 )]
 pub(crate) fn resolve_run(context: &TestContext, run_id: &str) -> RunSetup {
-    let deadline = Instant::now() + command_timeout();
     loop {
         if let Some(run_dir) = find_run_dir(&context.storage_dir, run_id) {
             return RunSetup {
@@ -751,10 +728,6 @@ pub(crate) fn resolve_run(context: &TestContext, run_id: &str) -> RunSetup {
                 run_dir,
             };
         }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for run dir for {run_id}"
-        );
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -928,46 +901,34 @@ pub(crate) fn command_log_text(run_dir: &Path, stage_id: &StageId) -> String {
 
 /// Wait until the run's stream holds the terminal lifecycle record.
 pub(crate) fn wait_for_run_finished(run_dir: &Path) {
-    wait_for_stream_item(run_dir, "the terminal lifecycle record", |item| {
-        crate::support::is_terminal_lifecycle(item)
-    });
+    wait_for_stream_item(run_dir, crate::support::is_terminal_lifecycle);
 }
 
 /// Wait until the run's stream holds the `run.lifecycle` record of
 /// `transition` (`running`, `succeeded`, ...).
 pub(crate) fn wait_for_lifecycle(run_dir: &Path, transition: &str) {
-    wait_for_stream_item(
-        run_dir,
-        &format!("the {transition} lifecycle record"),
-        |item| {
-            let record = item.item.get("record");
-            record
-                .and_then(|record| record.get("kind"))
+    wait_for_stream_item(run_dir, |item| {
+        let record = item.item.get("record");
+        record
+            .and_then(|record| record.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            == Some("run.lifecycle")
+            && record
+                .and_then(|record| record.get("transition"))
                 .and_then(serde_json::Value::as_str)
-                == Some("run.lifecycle")
-                && record
-                    .and_then(|record| record.get("transition"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some(transition)
-        },
-    );
+                == Some(transition)
+    });
 }
 
 #[expect(
     clippy::disallowed_methods,
     reason = "This sync integration helper polls the run stream without requiring a Tokio runtime."
 )]
-fn wait_for_stream_item(run_dir: &Path, what: &str, matches: impl Fn(&RunStreamItem) -> bool) {
-    let deadline = std::time::Instant::now() + command_timeout();
+fn wait_for_stream_item(run_dir: &Path, matches: impl Fn(&RunStreamItem) -> bool) {
     loop {
         if run_stream_items(run_dir).iter().any(&matches) {
             return;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for {what} in {}",
-            run_dir.display()
-        );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
