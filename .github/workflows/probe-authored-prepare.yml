@@ -38,12 +38,17 @@ jobs:
       - run: apt-get update && apt-get install -y --no-install-recommends tini
       - name: Red, selection disabled
         shell: bash
+        # Uncoloured, so the FAIL lines grep cleanly (run 42414673350 failed
+        # its own grep on a colour escape between FAIL and the test name).
+        env:
+          CARGO_TERM_COLOR: never
+          NEXTEST_HIDE_PROGRESS_BAR: "1"
         run: |
           sed -i 's/PrepareBlock::of(&graphs.graph),/None::<PrepareBlock>,/; s/PrepareBlock::of(root))/None::<PrepareBlock>)/' lib/components/fabro-petri/src/engine.rs
           git diff --stat -- lib/components/fabro-petri/src/engine.rs
           test "$(git diff --numstat -- lib/components/fabro-petri/src/engine.rs | cut -f1)" = 2
           set +e
-          tini -s -- cargo nextest run --locked -p fabro-petri --test resume --profile ci --no-fail-fast -E 'test(authored_)' 2>&1 | tee red.log
+          tini -s -- cargo nextest run --locked -p fabro-petri --test resume --profile ci --no-fail-fast -E 'test(authored_)' 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g' | tee red.log
           status=${PIPESTATUS[0]}
           set -e
           echo "red leg exit status: $status"
