@@ -334,6 +334,9 @@ struct PrepareFixture {
     sandbox: std::path::PathBuf,
     /// Which scripts ran, one name per line, in order.
     ledger:  std::path::PathBuf,
+    /// When set, the setup is authored as command nodes with this name
+    /// prefix in the graph, and the settings declare no `[run.prepare]`.
+    authored: Option<&'static str>,
 }
 
 impl PrepareFixture {
@@ -353,7 +356,16 @@ impl PrepareFixture {
             run_id,
             sandbox,
             ledger,
+            authored: None,
         }
+    }
+
+    /// Setup authored in the graph as `<prefix>1` and `<prefix>2` command
+    /// nodes after `start`, the form upstream's removal of `run.prepare` asks for.
+    fn authored(prefix: &'static str) -> Self {
+        let mut fixture = Self::new();
+        fixture.authored = Some(prefix);
+        fixture
     }
 
     fn run_dir(&self) -> std::path::PathBuf {
@@ -363,6 +375,20 @@ impl PrepareFixture {
     fn files(&self) -> Vec<(&str, String)> {
         let sandbox = self.sandbox.display();
         let ledger = self.ledger.display();
+        if let Some(prefix) = self.authored {
+            let graph = format!(
+                r#"digraph Authored {{
+    graph [default_max_retries=0]
+    start [shape=Mdiamond]
+    exit [shape=Msquare]
+    {prefix}1 [shape=parallelogram, script="mkdir -p {sandbox} && printf 'helper' > {sandbox}/helper.py && echo prepare1 >> {ledger} && printf 'PREPARE-ONE-%s' RAN"]
+    {prefix}2 [shape=parallelogram, script="mkdir -p {sandbox}/cache && printf '{{}}' > {sandbox}/cache/config.json && echo prepare2 >> {ledger} && printf 'PREPARE-TWO-%s' RAN"]
+    work [shape=parallelogram, script="test -f {sandbox}/helper.py && test -f {sandbox}/cache/config.json && echo work >> {ledger} && printf 'WORK-%s' RAN"]
+    start -> {prefix}1 -> {prefix}2 -> work -> exit
+}}"#
+            );
+            return vec![("workflow.fabro", graph), ("workflow.toml", SETTINGS.to_owned())];
+        }
         let graph = format!(
             r#"digraph Prepared {{
     graph [default_max_retries=0]
@@ -769,4 +795,53 @@ impl RunLogs for TrackedLogs {
     async fn get_blob(&self, digest: Digest) -> Result<Option<Vec<u8>>, StoreError> {
         self.inner.get_blob(digest).await
     }
+}
+
+/// Setup authored as `run_prepare_<N>` command nodes, with no `[run.prepare]`
+/// in the settings, runs again on a re-acquired sandbox before the first
+/// resumed node, exactly as the lowered form does.
+#[tokio::test]
+async fn authored_run_prepare_nodes_run_again_on_a_reacquired_sandbox() {
+    let fixture = PrepareFixture::authored("run_prepare_");
+    let memory = Arc::new(MemoryRunStore::new());
+    fixture.interrupt_on(&memory, "WORK-RAN").await;
+    assert_eq!(fixture.order(), ["prepare1", "prepare2", "work"]);
+    fixture.reacquire_sandbox();
+
+    let outcome = fixture.resume(&memory).await;
+
+    assert_eq!(outcome.status, RunStatus::Success, "{outcome:?}");
+    assert!(outcome.complete, "{:?}", outcome.incomplete);
+    assert_eq!(fixture.order(), [
+        "prepare1", "prepare2", "work", "prepare1", "prepare2", "work"
+    ]);
+    assert!(fixture.marker().exists(), "the resumed sandbox is marked");
+}
+
+/// A resume onto the surviving sandbox runs authored setup nodes no second time.
+#[tokio::test]
+async fn authored_run_prepare_nodes_do_not_run_again_on_the_surviving_sandbox() {
+    let fixture = PrepareFixture::authored("run_prepare_");
+    let memory = Arc::new(MemoryRunStore::new());
+    fixture.interrupt_on(&memory, "WORK-RAN").await;
+
+    let outcome = fixture.resume(&memory).await;
+
+    assert_eq!(outcome.status, RunStatus::Success, "{outcome:?}");
+    assert_eq!(fixture.order(), ["prepare1", "prepare2", "work", "work"]);
+}
+
+/// The name is the contract: authored setup under any other prefix is never
+/// run again, so a migrated workflow must keep the `run_prepare_<N>` names.
+#[tokio::test]
+async fn authored_setup_under_another_name_does_not_run_again() {
+    let fixture = PrepareFixture::authored("setup_");
+    let memory = Arc::new(MemoryRunStore::new());
+    fixture.interrupt_on(&memory, "WORK-RAN").await;
+    assert_eq!(fixture.order(), ["prepare1", "prepare2", "work"]);
+    fixture.reacquire_sandbox();
+
+    let _outcome = fixture.resume(&memory).await;
+
+    assert_eq!(fixture.order(), ["prepare1", "prepare2", "work"]);
 }

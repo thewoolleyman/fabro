@@ -1,0 +1,59 @@
+# Throwaway measurement for plan fabro-currency (bd-ib-dpsiwz). One run proves
+# both legs: RED with the re-prepare carry's selection disabled, then GREEN with
+# it restored. It exists only on this branch and never lands.
+name: Probe authored prepare nodes
+
+on:
+  push:
+    branches:
+      - probe/authored-run-prepare-nodes
+
+permissions: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  RUSTC_WRAPPER: sccache
+
+jobs:
+  red-green:
+    name: Red then green
+    runs-on: ${{ fromJSON(vars.FORK_RUST_RUNNER_LABELS || '["fabro-k3s"]') }}
+    timeout-minutes: 90
+    container:
+      image: buildpack-deps:noble
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.97.1
+      - uses: taiki-e/install-action@773334c0e05d7e699e4d78234494308223f3a2cf # v2
+        with:
+          tool: nextest,sccache
+      - run: git config --system --add safe.directory "$GITHUB_WORKSPACE"
+      - run: apt-get update && apt-get install -y --no-install-recommends tini
+      - name: Red, selection disabled
+        shell: bash
+        run: |
+          sed -i 's/PrepareBlock::of(&graphs.graph),/None::<PrepareBlock>,/; s/PrepareBlock::of(root))/None::<PrepareBlock>)/' lib/components/fabro-petri/src/engine.rs
+          git diff --stat -- lib/components/fabro-petri/src/engine.rs
+          test "$(git diff --numstat -- lib/components/fabro-petri/src/engine.rs | cut -f1)" = 2
+          set +e
+          tini -s -- cargo nextest run --locked -p fabro-petri --test resume --profile ci --no-fail-fast -E 'test(authored_)' 2>&1 | tee red.log
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "red leg exit status: $status"
+          test "$status" -ne 0
+          grep -E 'FAIL .*authored_run_prepare_nodes_run_again_on_a_reacquired_sandbox' red.log
+          if grep -E 'FAIL .*(do_not_run_again_on_the_surviving_sandbox|under_another_name)' red.log; then
+            echo "a control failed under the mutation, so the red is not the expected one"
+            exit 1
+          fi
+          git checkout -- lib/components/fabro-petri/src/engine.rs
+      - name: Green, selection restored
+        run: tini -s -- cargo nextest run --locked -p fabro-petri --test resume --profile ci --no-fail-fast
+      - run: sccache --show-stats
