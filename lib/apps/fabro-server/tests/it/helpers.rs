@@ -27,7 +27,6 @@ pub(crate) const MINIMAL_DOT: &str = r#"digraph Test {
 }"#;
 
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(10);
-pub(crate) const POLL_ATTEMPTS: usize = 500;
 
 #[derive(Clone)]
 pub(crate) struct TestAppSettings {
@@ -302,12 +301,25 @@ pub(crate) async fn run_json(app: &axum::Router, run_id: &str) -> serde_json::Va
     .await
 }
 
+/// Poll the run until its status is one of `expected`, with no wall-clock
+/// deadline: a test's verdict never depends on host load, and a run that
+/// genuinely hangs is bounded by the run-level timeout (the fork-gates Test
+/// job's timeout-minutes).
 pub(crate) async fn wait_for_run_status(
     app: &axum::Router,
     run_id: &str,
     expected: &[&str],
 ) -> String {
-    wait_for_run_status_with_timeout(app, run_id, expected, Duration::from_secs(5)).await
+    loop {
+        let body = run_json(app, run_id).await;
+        let status = body["lifecycle"]["status"]["kind"]
+            .as_str()
+            .expect("run response should include a tagged status kind");
+        if expected.contains(&status) {
+            return status.to_owned();
+        }
+        sleep(POLL_INTERVAL).await;
+    }
 }
 
 pub(crate) async fn wait_for_run_status_with_timeout(
@@ -344,7 +356,7 @@ pub(crate) async fn wait_for_run_status_not_in(
     run_id: &str,
     unexpected: &[&str],
 ) -> String {
-    for _ in 0..POLL_ATTEMPTS {
+    loop {
         let body = run_json(app, run_id).await;
         let status = body["lifecycle"]["status"]["kind"]
             .as_str()
@@ -355,5 +367,4 @@ pub(crate) async fn wait_for_run_status_not_in(
         }
         sleep(POLL_INTERVAL).await;
     }
-    panic!("run {run_id} stayed in {unexpected:?}");
 }

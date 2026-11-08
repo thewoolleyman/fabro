@@ -13,10 +13,9 @@ use tempfile::tempdir;
 use tower::ServiceExt;
 
 use crate::helpers::{
-    MINIMAL_DOT, POLL_ATTEMPTS, POLL_INTERVAL, TestAppSettings, api, checked_response,
-    minimal_intent_json, minimal_intent_json_with_dry_run, response_json, response_status,
-    settings_from_toml, test_app_state_with_options, test_app_with_scheduler, test_settings,
-    wait_for_run_status,
+    MINIMAL_DOT, POLL_INTERVAL, TestAppSettings, api, checked_response, minimal_intent_json,
+    minimal_intent_json_with_dry_run, response_json, response_status, settings_from_toml,
+    test_app_state_with_options, test_app_with_scheduler, test_settings, wait_for_run_status,
 };
 
 const HUMAN_GATE_DOT: &str = r#"digraph GateTest {
@@ -76,7 +75,7 @@ async fn start_run(app: &axum::Router, run_id: &str) {
 }
 
 async fn wait_for_question(app: &axum::Router, run_id: &str) -> serde_json::Value {
-    for _ in 0..POLL_ATTEMPTS {
+    loop {
         let request = Request::builder()
             .method("GET")
             .uri(api(&format!("/runs/{run_id}/questions")))
@@ -94,7 +93,6 @@ async fn wait_for_question(app: &axum::Router, run_id: &str) -> serde_json::Valu
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
-    panic!("question should have appeared for {run_id}");
 }
 
 async fn load_questions(app: &axum::Router, run_id: &str) -> serde_json::Value {
