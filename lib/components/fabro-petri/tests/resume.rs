@@ -328,19 +328,29 @@ async fn resumed_stall_policy(persisted: &str, fallback: &str, expected: RunStat
 
 /// The paths one prepare test works with.
 struct PrepareFixture {
-    root:     tempfile::TempDir,
-    run_id:   String,
+    root:    tempfile::TempDir,
+    run_id:  String,
     /// The state the prepare steps leave outside the workspace.
-    sandbox:  std::path::PathBuf,
+    sandbox: std::path::PathBuf,
     /// Which scripts ran, one name per line, in order.
-    ledger:   std::path::PathBuf,
-    /// When set, the setup is authored as command nodes with this name
-    /// prefix in the graph, and the settings declare no `[run.prepare]`.
-    authored: Option<&'static str>,
+    ledger:  std::path::PathBuf,
+    /// The name prefix of the setup's command nodes, authored in the graph.
+    /// Petri no longer accepts `[run.prepare]` (Petri `a04dae73`), so setup
+    /// is always authored as nodes; the settings declare none.
+    prefix:  &'static str,
 }
 
 impl PrepareFixture {
+    /// Setup authored as `run_prepare_1` and `run_prepare_2` command nodes,
+    /// the names a run's prepare block is recognised by.
     fn new() -> Self {
+        Self::authored(prepare::PREPARE_NODE_PREFIX)
+    }
+
+    /// Setup authored in the graph as `<prefix>1` and `<prefix>2` command
+    /// nodes after `start`, the form upstream's removal of `run.prepare` asks
+    /// for.
+    fn authored(prefix: &'static str) -> Self {
         let root = tempfile::tempdir().expect("a temp dir");
         let sandbox = root.path().join("home/.claude/plugins");
         let ledger = root.path().join("order.log");
@@ -356,17 +366,8 @@ impl PrepareFixture {
             run_id,
             sandbox,
             ledger,
-            authored: None,
+            prefix,
         }
-    }
-
-    /// Setup authored in the graph as `<prefix>1` and `<prefix>2` command
-    /// nodes after `start`, the form upstream's removal of `run.prepare` asks
-    /// for.
-    fn authored(prefix: &'static str) -> Self {
-        let mut fixture = Self::new();
-        fixture.authored = Some(prefix);
-        fixture
     }
 
     fn run_dir(&self) -> std::path::PathBuf {
@@ -376,9 +377,9 @@ impl PrepareFixture {
     fn files(&self) -> Vec<(&str, String)> {
         let sandbox = self.sandbox.display();
         let ledger = self.ledger.display();
-        if let Some(prefix) = self.authored {
-            let graph = format!(
-                r#"digraph Authored {{
+        let prefix = self.prefix;
+        let graph = format!(
+            r#"digraph Authored {{
     graph [default_max_retries=0]
     start [shape=Mdiamond]
     exit [shape=Msquare]
@@ -387,29 +388,11 @@ impl PrepareFixture {
     work [shape=parallelogram, script="test -f {sandbox}/helper.py && test -f {sandbox}/cache/config.json && echo work >> {ledger} && printf 'WORK-%s' RAN"]
     start -> {prefix}1 -> {prefix}2 -> work -> exit
 }}"#
-            );
-            return vec![
-                ("workflow.fabro", graph),
-                ("workflow.toml", SETTINGS.to_owned()),
-            ];
-        }
-        let graph = format!(
-            r#"digraph Prepared {{
-    graph [default_max_retries=0]
-    start [shape=Mdiamond]
-    exit [shape=Msquare]
-    work [shape=parallelogram, script="test -f {sandbox}/helper.py && test -f {sandbox}/cache/config.json && echo work >> {ledger} && printf 'WORK-%s' RAN"]
-    start -> work -> exit
-}}"#
         );
-        let settings = format!(
-            "{SETTINGS}\n[[run.prepare.steps]]\nscript = \"mkdir -p {sandbox} && printf \
-             'helper' > {sandbox}/helper.py && echo prepare1 >> {ledger} && printf \
-             'PREPARE-ONE-%s' RAN\"\n\n[[run.prepare.steps]]\nscript = \"mkdir -p {sandbox}/cache && \
-             printf '{{}}' > {sandbox}/cache/config.json && echo prepare2 >> {ledger} && printf \
-             'PREPARE-TWO-%s' RAN\"\n"
-        );
-        vec![("workflow.fabro", graph), ("workflow.toml", settings)]
+        vec![
+            ("workflow.fabro", graph),
+            ("workflow.toml", SETTINGS.to_owned()),
+        ]
     }
 
     fn graphs(&self, runtime: &RuntimeSpec) -> AdmittedGraphs {

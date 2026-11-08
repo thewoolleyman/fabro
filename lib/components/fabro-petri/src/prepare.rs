@@ -1,7 +1,9 @@
 //! A run's prepare block on a resumed run's re-acquired sandbox.
 //!
-//! `[run.prepare]` steps lower to the root graph's `run_prepare_1..N`
-//! command nodes, which run once, first, in the root scope's sandbox. What
+//! A run's setup is authored as the root graph's `run_prepare_1..N`
+//! command nodes (Petri no longer accepts `[run.prepare]`, which once
+//! lowered to those same nodes), which run once, first, in the root scope's
+//! sandbox. What
 //! they leave outside the workspace (a plugin cache, helper scripts under
 //! the sandbox user's home) lives only as long as that sandbox. A resume
 //! brings the workspace back to its durable snapshot, but it replays the
@@ -27,13 +29,21 @@ use std::time::Duration;
 
 use petri_attractor_steps::command::{CommandConfig, DEFAULT_TIMEOUT_MS};
 use petri_execution::RunKey;
-use petri_frontend_attractor::PREPARE_NODE_PREFIX;
 use petri_frontend_attractor::kinds::COMMAND_KIND;
 use petri_runtime::executor::{ExecEnv, MapSecrets, SecretProvider};
 use petri_runtime::ir::{Graph, Node, ScopeId};
 use petri_runtime::steps::resolve_env_refs;
 
 use crate::checkpoint::RunWorkspaces;
+
+/// The node-name prefix a run's setup steps carry: `run_prepare_1..N`.
+///
+/// Petri lowered `[run.prepare]` to nodes under this prefix and exported it,
+/// until upstream removed the setting (Petri `a04dae73`, "Remove run.prepare
+/// authoring in favor of workflow commands"). A migrated workflow authors its
+/// setup as command nodes under the same names, so the prefix is now Fabro's
+/// own convention and is defined here.
+pub const PREPARE_NODE_PREFIX: &str = "run_prepare_";
 
 /// Where the markers live inside a sandbox: outside the workspace, in
 /// storage that goes with the sandbox.
