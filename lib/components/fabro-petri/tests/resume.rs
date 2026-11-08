@@ -328,12 +328,12 @@ async fn resumed_stall_policy(persisted: &str, fallback: &str, expected: RunStat
 
 /// The paths one prepare test works with.
 struct PrepareFixture {
-    root:    tempfile::TempDir,
-    run_id:  String,
+    root:     tempfile::TempDir,
+    run_id:   String,
     /// The state the prepare steps leave outside the workspace.
-    sandbox: std::path::PathBuf,
+    sandbox:  std::path::PathBuf,
     /// Which scripts ran, one name per line, in order.
-    ledger:  std::path::PathBuf,
+    ledger:   std::path::PathBuf,
     /// When set, the setup is authored as command nodes with this name
     /// prefix in the graph, and the settings declare no `[run.prepare]`.
     authored: Option<&'static str>,
@@ -361,7 +361,8 @@ impl PrepareFixture {
     }
 
     /// Setup authored in the graph as `<prefix>1` and `<prefix>2` command
-    /// nodes after `start`, the form upstream's removal of `run.prepare` asks for.
+    /// nodes after `start`, the form upstream's removal of `run.prepare` asks
+    /// for.
     fn authored(prefix: &'static str) -> Self {
         let mut fixture = Self::new();
         fixture.authored = Some(prefix);
@@ -387,7 +388,10 @@ impl PrepareFixture {
     start -> {prefix}1 -> {prefix}2 -> work -> exit
 }}"#
             );
-            return vec![("workflow.fabro", graph), ("workflow.toml", SETTINGS.to_owned())];
+            return vec![
+                ("workflow.fabro", graph),
+                ("workflow.toml", SETTINGS.to_owned()),
+            ];
         }
         let graph = format!(
             r#"digraph Prepared {{
@@ -818,7 +822,8 @@ async fn authored_run_prepare_nodes_run_again_on_a_reacquired_sandbox() {
     assert!(fixture.marker().exists(), "the resumed sandbox is marked");
 }
 
-/// A resume onto the surviving sandbox runs authored setup nodes no second time.
+/// A resume onto the surviving sandbox runs authored setup nodes no second
+/// time.
 #[tokio::test]
 async fn authored_run_prepare_nodes_do_not_run_again_on_the_surviving_sandbox() {
     let fixture = PrepareFixture::authored("run_prepare_");
