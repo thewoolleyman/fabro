@@ -10,8 +10,7 @@ use fabro_types::settings::run::{
     RunBranchSettings, RunCheckpointSettings, RunCloneSettings, RunExecutionSettings,
     RunGitSettings, RunGithubAppSource, RunGoal, RunIntegrationsGithubSettings,
     RunIntegrationsSettings, RunInterviewsSettings, RunModelControls, RunModelSettings,
-    RunNamespace, RunScmSettings,
-    ScmGitHubSettings, TlsMode,
+    RunNamespace, RunScmSettings, ScmGitHubSettings, TlsMode,
 };
 use fabro_util::workspace_glob::WorkspaceGlob;
 
