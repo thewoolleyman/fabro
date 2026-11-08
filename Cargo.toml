@@ -210,18 +210,18 @@ opt-level = 2
 # registered-provider resources PR on top. Remove once both land and the
 # internal-dependency update moves the `petri_*` pins past them.
 [patch."https://github.com/lithoscomputer/petri.git"]
-petri-attractor-steps = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
-petri-driver = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
-petri-engine = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
-petri-execution = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
-petri-executor = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
-petri-executor-sandbox = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
-petri-frontend = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
-petri-frontend-attractor = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
-petri-frontend-fabro = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
-petri-frontend-native = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
-petri-ir = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
-petri-runtime = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
-petri-steps = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
-petri-store = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
-petri-testkit = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-registered-20261023" }
+petri-attractor-steps = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-driver = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-engine = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-execution = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-executor = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-executor-sandbox = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-frontend = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-frontend-attractor = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-frontend-fabro = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-frontend-native = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-ir = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-runtime = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-steps = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-store = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-testkit = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
