@@ -13,11 +13,14 @@
  */
 
 
-// May contain unused imports in some cases
-// @ts-ignore
-import type { PreparedStep } from './prepared-step';
 
-export interface RunPrepareSettings {
-    'steps': Array<PreparedStep>;
-    'timeout_ms': number;
+export interface ProbeIncorrect {
+    'status': ProbeIncorrectStatusEnum;
+    'detail': string;
 }
+
+export const ProbeIncorrectStatusEnum = {
+    INCORRECT: 'incorrect'
+} as const;
+
+export type ProbeIncorrectStatusEnum = typeof ProbeIncorrectStatusEnum[keyof typeof ProbeIncorrectStatusEnum];

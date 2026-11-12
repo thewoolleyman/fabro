@@ -10,7 +10,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 license = "MIT"
 
 [workspace.dependencies]
@@ -24,7 +24,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "migrate", "macros"] }
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "query", "form", "multipart"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "query", "form", "multipart", "gzip", "brotli"] }
 ulid = "1"
 uuid = { version = "1", features = ["v4", "v7", "v8"] }
 rand = "0.9"
@@ -206,15 +206,33 @@ opt-level = 2
 [profile.dev.package.regex-syntax]
 opt-level = 2
 
-# Carried for the factory (thewoolleyman/fabro factory-integration only, never
-# upstream): Petri from the thewoolleyman/petri fork's factory-integration
-# branch, which carries the plugin sandbox backend and generic resources
-# (topic branch plugin-sandbox-backend) until lithoscomputer/petri merges it.
+# TEMPORARY, drop before merge: Petri main with lithoscomputer/petri#122 and the
+# registered-provider resources PR on top. Remove once both land and the
+# internal-dependency update moves the `petri_*` pins past them.
 [patch."https://github.com/lithoscomputer/petri.git"]
-petri_runtime = { git = "https://github.com/thewoolleyman/petri.git", branch = "factory-integration", package = "petri-runtime" }
-petri_execution = { git = "https://github.com/thewoolleyman/petri.git", branch = "factory-integration", package = "petri-execution" }
-petri_store = { git = "https://github.com/thewoolleyman/petri.git", branch = "factory-integration", package = "petri-store" }
-petri_attractor_steps = { git = "https://github.com/thewoolleyman/petri.git", branch = "factory-integration", package = "petri-attractor-steps" }
-petri_frontend_attractor = { git = "https://github.com/thewoolleyman/petri.git", branch = "factory-integration", package = "petri-frontend-attractor" }
-petri_frontend_fabro = { git = "https://github.com/thewoolleyman/petri.git", branch = "factory-integration", package = "petri-frontend-fabro" }
-petri_testkit = { git = "https://github.com/thewoolleyman/petri.git", branch = "factory-integration", package = "petri-testkit" }
+petri-attractor-steps = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-driver = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-engine = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-execution = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-executor = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-executor-sandbox = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-frontend = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-frontend-attractor = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-frontend-fabro = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-frontend-native = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-ir = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-runtime = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-steps = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-store = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+petri-testkit = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+
+# bd-ib-tcdmkr (RUSTSEC-2026-0459): sqlx main carries launchbadge/sqlx#4502, which lifts
+# sqlx-sqlite's libsqlite3-sys bound to <0.40; no sqlx release carries it yet.
+[patch.crates-io]
+sqlx = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-core = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-macros = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-macros-core = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-mysql = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-postgres = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-sqlite = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }

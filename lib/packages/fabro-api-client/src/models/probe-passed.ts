@@ -14,14 +14,12 @@
 
 
 
-export interface PreparedScriptStep {
-    'type': PreparedScriptStepTypeEnum;
-    'script': string;
-    'env'?: { [key: string]: string; };
+export interface ProbePassed {
+    'status': ProbePassedStatusEnum;
 }
 
-export const PreparedScriptStepTypeEnum = {
-    SCRIPT: 'script'
+export const ProbePassedStatusEnum = {
+    PASSED: 'passed'
 } as const;
 
-export type PreparedScriptStepTypeEnum = typeof PreparedScriptStepTypeEnum[keyof typeof PreparedScriptStepTypeEnum];
+export type ProbePassedStatusEnum = typeof ProbePassedStatusEnum[keyof typeof ProbePassedStatusEnum];

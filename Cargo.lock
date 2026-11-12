@@ -355,9 +355,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.16.3"
+version = "1.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ec6fb3fe69024a75fa7e1bfb48aa6cf59706a101658ea01bfd33b2b248a038f"
+checksum = "faac5829c2b74c28f830747e7818ccfb684261b5f48a1118b1e2a13d36dfab13"
 dependencies = [
  "aws-lc-sys",
  "untrusted 0.7.1",
@@ -366,14 +366,15 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.40.0"
+version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f50037ee5e1e41e7b8f9d161680a725bd1626cb6f8c7e901f91f942850852fe7"
+checksum = "f1622d8446a2d4b2ce0c7eefc73dd43a99779028d5ee5c2dd8073a658ba8a2bc"
 dependencies = [
  "cc",
  "cmake",
  "dunce",
  "fs_extra",
+ "pkg-config",
 ]
 
 [[package]]
@@ -1821,7 +1822,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1935,7 +1936,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1991,7 +1992,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-api"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "chrono",
  "fabro-automation",
@@ -2017,7 +2018,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-auth"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2042,7 +2043,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-automation"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2063,11 +2064,11 @@ dependencies = [
 
 [[package]]
 name = "fabro-build-support"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 
 [[package]]
 name = "fabro-checkpoint"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "fabro-config",
  "fabro-types",
@@ -2075,7 +2076,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-cli"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2175,7 +2176,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-client"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2185,6 +2186,7 @@ dependencies = [
  "fabro-static",
  "fabro-types",
  "fabro-util",
+ "flate2",
  "fs2",
  "futures",
  "httpmock",
@@ -2204,7 +2206,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-config"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2233,7 +2235,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-db"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2246,7 +2248,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-dev"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2265,7 +2267,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-dot"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "fabro-template",
  "fabro-types",
@@ -2277,7 +2279,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-dump"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2291,7 +2293,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-environment"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2313,7 +2315,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-github"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2338,7 +2340,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-graphviz"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "fabro-dot",
@@ -2348,7 +2350,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-http"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "fabro-static",
  "http 1.4.0",
@@ -2358,7 +2360,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-install"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "fabro-config",
@@ -2375,7 +2377,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-interview"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "async-trait",
  "fabro-types",
@@ -2387,7 +2389,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-llm"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2412,7 +2414,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-macros"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "clap",
  "fabro-options-metadata",
@@ -2423,7 +2425,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-manifest"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2452,7 +2454,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-mcp-server"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "fabro-client",
@@ -2472,7 +2474,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-mcp-store"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "chrono",
  "fabro-db",
@@ -2490,7 +2492,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-oauth"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2512,7 +2514,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-options-metadata"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2520,7 +2522,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-petri"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2565,6 +2567,7 @@ dependencies = [
  "sandbox-driver-daytona",
  "sandbox-driver-docker",
  "sandbox-driver-host",
+ "sandbox-driver-protocol",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2580,7 +2583,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-proc"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "libc",
  "tempfile",
@@ -2592,7 +2595,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-redact"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "aho-corasick",
  "pebble-coding-agent",
@@ -2604,12 +2607,13 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+ "ulid",
  "url",
 ]
 
 [[package]]
 name = "fabro-server"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2707,7 +2711,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-slack"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "fabro-http",
  "fabro-interview",
@@ -2728,18 +2732,18 @@ dependencies = [
 
 [[package]]
 name = "fabro-spa"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "rust-embed",
 ]
 
 [[package]]
 name = "fabro-static"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 
 [[package]]
 name = "fabro-store"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -2767,7 +2771,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-telemetry"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -2793,7 +2797,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-template"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "fabro-types",
@@ -2807,7 +2811,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-test"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2832,7 +2836,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-tool"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2856,7 +2860,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-tracker"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2870,7 +2874,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-types"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "chrono",
  "clap",
@@ -2897,7 +2901,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-util"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "console 0.15.11",
@@ -2920,7 +2924,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-variable"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2937,7 +2941,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-vault"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2956,7 +2960,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-workflow"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3001,7 +3005,7 @@ dependencies = [
 
 [[package]]
 name = "fabro-workflow-version"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "fabro-config",
  "fabro-dot",
@@ -3728,7 +3732,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots 1.0.6",
+ "webpki-roots 1.0.10",
 ]
 
 [[package]]
@@ -4277,9 +4281,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.37.0"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f111c8c41e7c61a49cd34e44c7619462967221a6443b0ec299e0ac30cfb9b1"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
@@ -4313,7 +4317,7 @@ checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 [[package]]
 name = "lithos-llm"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/lithos-llm?branch=main#b47b0065df903cb759a0911100d151bd04fc5546"
+source = "git+https://github.com/lithoscomputer/lithos-llm?branch=main#2e3d3b3ff7f72b121263651f3622e38ee34f47e4"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -4609,7 +4613,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4833,6 +4837,15 @@ dependencies = [
  "objc2",
  "objc2-core-foundation",
  "objc2-foundation",
+]
+
+[[package]]
+name = "objc2-system-configuration"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7216bd11cbda54ccabcab84d523dc93b858ec75ecfb3a7d89513fa22464da396"
+dependencies = [
+ "objc2-core-foundation",
 ]
 
 [[package]]
@@ -5178,7 +5191,7 @@ checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 [[package]]
 name = "pebble-agent"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/pebble?branch=main#68955515624540dc582636e377ddc3210dec8503"
+source = "git+https://github.com/lithoscomputer/pebble?branch=main#0f3614480b9c2bdf0a8e817b9cf1b9389f52380c"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -5195,7 +5208,7 @@ dependencies = [
 [[package]]
 name = "pebble-cli-core"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/pebble?branch=main#68955515624540dc582636e377ddc3210dec8503"
+source = "git+https://github.com/lithoscomputer/pebble?branch=main#0f3614480b9c2bdf0a8e817b9cf1b9389f52380c"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5224,7 +5237,7 @@ dependencies = [
 [[package]]
 name = "pebble-coding-agent"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/pebble?branch=main#68955515624540dc582636e377ddc3210dec8503"
+source = "git+https://github.com/lithoscomputer/pebble?branch=main#0f3614480b9c2bdf0a8e817b9cf1b9389f52380c"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -5266,7 +5279,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "petri-attractor-steps"
 version = "0.1.0"
-source = "git+https://github.com/thewoolleyman/petri.git?branch=factory-integration#902864141af160f4333bf4e8e2c1f4ceedc770fb"
+source = "git+https://github.com/thewoolleyman/petri.git?branch=fabro-integration-f30a12df-20261108#ac0b9fb39239d05398709adefec22c7e5e68a1d7"
 dependencies = [
  "async-trait",
  "globset",
@@ -5297,7 +5310,7 @@ dependencies = [
 [[package]]
 name = "petri-driver"
 version = "0.1.0"
-source = "git+https://github.com/thewoolleyman/petri.git?branch=factory-integration#902864141af160f4333bf4e8e2c1f4ceedc770fb"
+source = "git+https://github.com/thewoolleyman/petri.git?branch=fabro-integration-f30a12df-20261108#ac0b9fb39239d05398709adefec22c7e5e68a1d7"
 dependencies = [
  "async-trait",
  "getrandom 0.3.4",
@@ -5317,7 +5330,7 @@ dependencies = [
 [[package]]
 name = "petri-engine"
 version = "0.1.0"
-source = "git+https://github.com/thewoolleyman/petri.git?branch=factory-integration#902864141af160f4333bf4e8e2c1f4ceedc770fb"
+source = "git+https://github.com/thewoolleyman/petri.git?branch=fabro-integration-f30a12df-20261108#ac0b9fb39239d05398709adefec22c7e5e68a1d7"
 dependencies = [
  "petri-ir",
  "serde",
@@ -5329,7 +5342,7 @@ dependencies = [
 [[package]]
 name = "petri-execution"
 version = "0.1.0"
-source = "git+https://github.com/thewoolleyman/petri.git?branch=factory-integration#902864141af160f4333bf4e8e2c1f4ceedc770fb"
+source = "git+https://github.com/thewoolleyman/petri.git?branch=fabro-integration-f30a12df-20261108#ac0b9fb39239d05398709adefec22c7e5e68a1d7"
 dependencies = [
  "async-trait",
  "petri-driver",
@@ -5353,7 +5366,7 @@ dependencies = [
 [[package]]
 name = "petri-executor"
 version = "0.1.0"
-source = "git+https://github.com/thewoolleyman/petri.git?branch=factory-integration#902864141af160f4333bf4e8e2c1f4ceedc770fb"
+source = "git+https://github.com/thewoolleyman/petri.git?branch=fabro-integration-f30a12df-20261108#ac0b9fb39239d05398709adefec22c7e5e68a1d7"
 dependencies = [
  "async-trait",
  "libc",
@@ -5368,7 +5381,7 @@ dependencies = [
 [[package]]
 name = "petri-executor-sandbox"
 version = "0.1.0"
-source = "git+https://github.com/thewoolleyman/petri.git?branch=factory-integration#902864141af160f4333bf4e8e2c1f4ceedc770fb"
+source = "git+https://github.com/thewoolleyman/petri.git?branch=fabro-integration-f30a12df-20261108#ac0b9fb39239d05398709adefec22c7e5e68a1d7"
 dependencies = [
  "async-trait",
  "petri-executor",
@@ -5390,7 +5403,7 @@ dependencies = [
 [[package]]
 name = "petri-frontend"
 version = "0.1.0"
-source = "git+https://github.com/thewoolleyman/petri.git?branch=factory-integration#902864141af160f4333bf4e8e2c1f4ceedc770fb"
+source = "git+https://github.com/thewoolleyman/petri.git?branch=fabro-integration-f30a12df-20261108#ac0b9fb39239d05398709adefec22c7e5e68a1d7"
 dependencies = [
  "marked-yaml",
  "petri-ir",
@@ -5404,7 +5417,7 @@ dependencies = [
 [[package]]
 name = "petri-frontend-attractor"
 version = "0.1.0"
-source = "git+https://github.com/thewoolleyman/petri.git?branch=factory-integration#902864141af160f4333bf4e8e2c1f4ceedc770fb"
+source = "git+https://github.com/thewoolleyman/petri.git?branch=fabro-integration-f30a12df-20261108#ac0b9fb39239d05398709adefec22c7e5e68a1d7"
 dependencies = [
  "minijinja",
  "petri-frontend",
@@ -5421,15 +5434,15 @@ dependencies = [
 [[package]]
 name = "petri-frontend-fabro"
 version = "0.1.0"
-source = "git+https://github.com/thewoolleyman/petri.git?branch=factory-integration#902864141af160f4333bf4e8e2c1f4ceedc770fb"
+source = "git+https://github.com/thewoolleyman/petri.git?branch=fabro-integration-f30a12df-20261108#ac0b9fb39239d05398709adefec22c7e5e68a1d7"
 dependencies = [
  "petri-frontend",
  "petri-frontend-attractor",
  "petri-ir",
  "regex",
+ "sandbox-driver",
  "serde",
  "serde_json",
- "shlex",
  "smol_str",
  "toml 0.9.12+spec-1.1.0",
 ]
@@ -5437,7 +5450,7 @@ dependencies = [
 [[package]]
 name = "petri-frontend-native"
 version = "0.1.0"
-source = "git+https://github.com/thewoolleyman/petri.git?branch=factory-integration#902864141af160f4333bf4e8e2c1f4ceedc770fb"
+source = "git+https://github.com/thewoolleyman/petri.git?branch=fabro-integration-f30a12df-20261108#ac0b9fb39239d05398709adefec22c7e5e68a1d7"
 dependencies = [
  "petri-frontend",
  "petri-ir",
@@ -5448,7 +5461,7 @@ dependencies = [
 [[package]]
 name = "petri-ir"
 version = "0.1.0"
-source = "git+https://github.com/thewoolleyman/petri.git?branch=factory-integration#902864141af160f4333bf4e8e2c1f4ceedc770fb"
+source = "git+https://github.com/thewoolleyman/petri.git?branch=fabro-integration-f30a12df-20261108#ac0b9fb39239d05398709adefec22c7e5e68a1d7"
 dependencies = [
  "regex",
  "serde",
@@ -5461,7 +5474,7 @@ dependencies = [
 [[package]]
 name = "petri-runtime"
 version = "0.1.0"
-source = "git+https://github.com/thewoolleyman/petri.git?branch=factory-integration#902864141af160f4333bf4e8e2c1f4ceedc770fb"
+source = "git+https://github.com/thewoolleyman/petri.git?branch=fabro-integration-f30a12df-20261108#ac0b9fb39239d05398709adefec22c7e5e68a1d7"
 dependencies = [
  "async-trait",
  "petri-driver",
@@ -5482,7 +5495,7 @@ dependencies = [
 [[package]]
 name = "petri-steps"
 version = "0.1.0"
-source = "git+https://github.com/thewoolleyman/petri.git?branch=factory-integration#902864141af160f4333bf4e8e2c1f4ceedc770fb"
+source = "git+https://github.com/thewoolleyman/petri.git?branch=fabro-integration-f30a12df-20261108#ac0b9fb39239d05398709adefec22c7e5e68a1d7"
 dependencies = [
  "async-trait",
  "petri-executor",
@@ -5498,7 +5511,7 @@ dependencies = [
 [[package]]
 name = "petri-store"
 version = "0.1.0"
-source = "git+https://github.com/thewoolleyman/petri.git?branch=factory-integration#902864141af160f4333bf4e8e2c1f4ceedc770fb"
+source = "git+https://github.com/thewoolleyman/petri.git?branch=fabro-integration-f30a12df-20261108#ac0b9fb39239d05398709adefec22c7e5e68a1d7"
 dependencies = [
  "async-trait",
  "getrandom 0.3.4",
@@ -5513,7 +5526,7 @@ dependencies = [
 [[package]]
 name = "petri-testkit"
 version = "0.1.0"
-source = "git+https://github.com/thewoolleyman/petri.git?branch=factory-integration#902864141af160f4333bf4e8e2c1f4ceedc770fb"
+source = "git+https://github.com/thewoolleyman/petri.git?branch=fabro-integration-f30a12df-20261108#ac0b9fb39239d05398709adefec22c7e5e68a1d7"
 dependencies = [
  "async-trait",
  "petri-driver",
@@ -5525,6 +5538,7 @@ dependencies = [
  "petri-store",
  "sandbox-driver",
  "sandbox-driver-host",
+ "sandbox-driver-protocol",
  "serde",
  "serde_json",
  "smol_str",
@@ -5875,7 +5889,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6128,7 +6142,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams 0.4.2",
  "web-sys",
- "webpki-roots 1.0.6",
+ "webpki-roots 1.0.10",
 ]
 
 [[package]]
@@ -6323,7 +6337,7 @@ dependencies = [
  "errno 0.3.14",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6382,7 +6396,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6393,9 +6407,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.13"
+version = "0.103.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
+checksum = "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -6427,24 +6441,27 @@ dependencies = [
 [[package]]
 name = "sandbox-driver"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=main#4b35158b591337a9ac17295ca53158f9e8ce4029"
+source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=main#0fe4af55c9ddb3887cbcbf6e78d24490501df047"
 dependencies = [
  "async-trait",
+ "futures-util",
  "globset",
  "humantime",
+ "jsonschema",
  "rand 0.10.1",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "toml 0.8.23",
  "tracing",
 ]
 
 [[package]]
 name = "sandbox-driver-daytona"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=main#4b35158b591337a9ac17295ca53158f9e8ce4029"
+source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=main#0fe4af55c9ddb3887cbcbf6e78d24490501df047"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6472,7 +6489,7 @@ dependencies = [
 [[package]]
 name = "sandbox-driver-daytona-config"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=main#4b35158b591337a9ac17295ca53158f9e8ce4029"
+source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=main#0fe4af55c9ddb3887cbcbf6e78d24490501df047"
 dependencies = [
  "sandbox-driver-docker-config",
  "serde",
@@ -6482,7 +6499,7 @@ dependencies = [
 [[package]]
 name = "sandbox-driver-docker"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=main#4b35158b591337a9ac17295ca53158f9e8ce4029"
+source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=main#0fe4af55c9ddb3887cbcbf6e78d24490501df047"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6503,7 +6520,7 @@ dependencies = [
 [[package]]
 name = "sandbox-driver-docker-config"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=main#4b35158b591337a9ac17295ca53158f9e8ce4029"
+source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=main#0fe4af55c9ddb3887cbcbf6e78d24490501df047"
 dependencies = [
  "serde",
  "serde_json",
@@ -6512,7 +6529,7 @@ dependencies = [
 [[package]]
 name = "sandbox-driver-host"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=main#4b35158b591337a9ac17295ca53158f9e8ce4029"
+source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=main#0fe4af55c9ddb3887cbcbf6e78d24490501df047"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6530,7 +6547,7 @@ dependencies = [
 [[package]]
 name = "sandbox-driver-protocol"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=main#4b35158b591337a9ac17295ca53158f9e8ce4029"
+source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=main#0fe4af55c9ddb3887cbcbf6e78d24490501df047"
 dependencies = [
  "async-trait",
  "base64",
@@ -6547,11 +6564,13 @@ dependencies = [
 [[package]]
 name = "sandbox-driver-testing"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=main#4b35158b591337a9ac17295ca53158f9e8ce4029"
+source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=main#0fe4af55c9ddb3887cbcbf6e78d24490501df047"
 dependencies = [
  "async-trait",
  "sandbox-driver",
+ "serde_json",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -7030,7 +7049,7 @@ version = "1.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
 dependencies = [
- "errno 0.3.14",
+ "errno 0.2.8",
  "libc",
 ]
 
@@ -7114,8 +7133,7 @@ dependencies = [
 [[package]]
 name = "sqlx"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "378620ccc25c62c89d8be1c819e76a88d59bdcc3304733330788948e619bfd71"
+source = "git+https://github.com/launchbadge/sqlx?rev=10462fa4414c6c7f1ed1d39bb31678e3b726878c#10462fa4414c6c7f1ed1d39bb31678e3b726878c"
 dependencies = [
  "sqlx-core",
  "sqlx-macros",
@@ -7127,8 +7145,7 @@ dependencies = [
 [[package]]
 name = "sqlx-core"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05b44e85bf579a8eeb4ceaa77a3a523baf2bf0e9bac7e40f405d537b5d2d5ccb"
+source = "git+https://github.com/launchbadge/sqlx?rev=10462fa4414c6c7f1ed1d39bb31678e3b726878c#10462fa4414c6c7f1ed1d39bb31678e3b726878c"
 dependencies = [
  "base64",
  "bytes",
@@ -7149,7 +7166,7 @@ dependencies = [
  "percent-encoding",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "smallvec",
  "thiserror 2.0.18",
  "tokio",
@@ -7161,8 +7178,7 @@ dependencies = [
 [[package]]
 name = "sqlx-macros"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd2b84f2bc39a5705ef27ec785a11c934a41bbd4a24941e257927cddc26b60bf"
+source = "git+https://github.com/launchbadge/sqlx?rev=10462fa4414c6c7f1ed1d39bb31678e3b726878c#10462fa4414c6c7f1ed1d39bb31678e3b726878c"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7174,8 +7190,7 @@ dependencies = [
 [[package]]
 name = "sqlx-macros-core"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb8d96de5fdc85a5c4ec813432b523ec637e80ba98f046555f75f7908ddac7c3"
+source = "git+https://github.com/launchbadge/sqlx?rev=10462fa4414c6c7f1ed1d39bb31678e3b726878c#10462fa4414c6c7f1ed1d39bb31678e3b726878c"
 dependencies = [
  "cfg-if",
  "dotenvy",
@@ -7186,7 +7201,7 @@ dependencies = [
  "quote",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "sqlx-core",
  "sqlx-sqlite",
  "syn",
@@ -7198,8 +7213,7 @@ dependencies = [
 [[package]]
 name = "sqlx-mysql"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90b8020fe17c5f2c245bfa2505d7ef59c5604839527c740266ad2214acebea27"
+source = "git+https://github.com/launchbadge/sqlx?rev=10462fa4414c6c7f1ed1d39bb31678e3b726878c#10462fa4414c6c7f1ed1d39bb31678e3b726878c"
 dependencies = [
  "bitflags",
  "byteorder",
@@ -7224,8 +7238,7 @@ dependencies = [
 [[package]]
 name = "sqlx-postgres"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87a2bdd6e83f6b3ea525ca9fee568030508b58355a43d0b2c1674d5f79dcd65e"
+source = "git+https://github.com/launchbadge/sqlx?rev=10462fa4414c6c7f1ed1d39bb31678e3b726878c#10462fa4414c6c7f1ed1d39bb31678e3b726878c"
 dependencies = [
  "atoi",
  "base64",
@@ -7259,8 +7272,7 @@ dependencies = [
 [[package]]
 name = "sqlx-sqlite"
 version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "488e99c397a62007e4229aec669a179816339afc6d2620ca6fa420dbee2e982c"
+source = "git+https://github.com/launchbadge/sqlx?rev=10462fa4414c6c7f1ed1d39bb31678e3b726878c#10462fa4414c6c7f1ed1d39bb31678e3b726878c"
 dependencies = [
  "atoi",
  "flume",
@@ -7508,7 +7520,7 @@ dependencies = [
  "getrandom 0.4.1",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7543,7 +7555,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7901,6 +7913,7 @@ dependencies = [
  "futures-util",
  "http 1.4.0",
  "http-body 1.0.1",
+ "http-body-util",
  "iri-string",
  "pin-project-lite",
  "tokio",
@@ -8074,7 +8087,7 @@ dependencies = [
 
 [[package]]
 name = "twin-github"
-version = "0.389.0-nightly.0"
+version = "0.408.0-nightly.0"
 dependencies = [
  "axum",
  "base64",
@@ -8576,9 +8589,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-root-certs"
-version = "1.0.6"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "804f18a4ac2676ffb4e8b5b5fa9ae38af06df08162314f96a68d2a363e21a8ca"
+checksum = "58ec80e73fd8baf57bf0d9615554c75348bda990d6d5bbeab964dd068319fecb"
 dependencies = [
  "rustls-pki-types",
 ]
@@ -8589,23 +8602,29 @@ version = "0.26.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
 dependencies = [
- "webpki-roots 1.0.6",
+ "webpki-roots 1.0.10",
 ]
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.6"
+version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22cfaf3c063993ff62e73cb4311efde4db1efb31ab78a3e5c457939ad5cc0bed"
+checksum = "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9"
 dependencies = [
  "rustls-pki-types",
 ]
 
 [[package]]
 name = "whoami"
-version = "2.1.2"
+version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "998767ef88740d1f5b0682a9c53c24431453923962269c2db68ee43788c5a40d"
+checksum = "d6a5b12f9df4f978d2cfdb1bd3bac52433f44393342d7ee9c25f5a1c14c0f45d"
+dependencies = [
+ "libc",
+ "libredox",
+ "objc2-system-configuration",
+ "web-sys",
+]
 
 [[package]]
 name = "winapi"
@@ -8629,7 +8648,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

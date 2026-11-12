@@ -140,7 +140,15 @@ pub(crate) fn prepare_manifest_with_environment_defaults(
         .filter(|config| config.type_ == types::ManifestConfigType::User)
     {
         if let Some(source) = config.source.as_deref() {
-            workflow_settings_builder = workflow_settings_builder.user_toml(source)?;
+            workflow_settings_builder =
+                workflow_settings_builder
+                    .user_toml(source)
+                    .with_context(|| {
+                        format!(
+                            "Failed to parse user settings at {}",
+                            config.path.as_deref().unwrap_or("manifest user settings")
+                        )
+                    })?;
         }
     }
     let mut settings = workflow_settings_builder
@@ -474,7 +482,34 @@ async fn build_preflight_report(
     run_environment_capability_check(&mut checks, &resolved_run);
     let needs_github_credentials = sandbox_provider.clones_workspace()
         || resolved_run.integrations.github.is_token_requested();
-    let github_app = if needs_github_credentials {
+    let selected_app = resolved_run.integrations.github.app.as_ref();
+    let github_app = if let Some(source) = selected_app.filter(|_| needs_github_credentials) {
+        // A run that selects its own App is checked under that App alone; a
+        // selection the vault cannot satisfy fails the preflight instead of
+        // being checked under the server's integration.
+        match state.selected_github_app_credentials(source).await {
+            Ok(credentials) => Some(credentials),
+            Err(err) => {
+                checks.push(CheckResult {
+                    name:        "Selected GitHub App".into(),
+                    status:      CheckStatus::Error,
+                    summary:     "unresolvable".into(),
+                    details:     Vec::new(),
+                    remediation: Some(format!("{err:#}")),
+                });
+                return Ok((
+                    CheckReport {
+                        title:    "Run Preflight".into(),
+                        sections: vec![CheckSection {
+                            title: String::new(),
+                            checks,
+                        }],
+                    },
+                    false,
+                ));
+            }
+        }
+    } else if needs_github_credentials {
         match state.github_credentials(github_integration).await {
             Ok(credentials) => credentials,
             Err(err)
@@ -525,7 +560,6 @@ async fn build_preflight_report(
 }
 
 fn base_preflight_checks(prepared: &PreparedManifest, shape: &WorkflowShape) -> Vec<CheckResult> {
-    let setup_command_count = prepared.settings.run.prepare.steps.len();
     let repo_summary = prepared.git.as_ref().map_or_else(
         || "unknown".to_string(),
         |git| {
@@ -542,26 +576,23 @@ fn base_preflight_checks(prepared: &PreparedManifest, shape: &WorkflowShape) -> 
             name:        "Repository".into(),
             status:      CheckStatus::Pass,
             summary:     repo_summary,
-            details:     vec![
-                CheckDetail::new(format!("Setup commands: {setup_command_count}")),
-                CheckDetail {
-                    text: format!(
-                        "Git: {}",
-                        prepared
-                            .git
-                            .as_ref()
-                            .map_or("unknown", |git| match git.dirty {
-                                fabro_types::DirtyStatus::Clean => "clean",
-                                fabro_types::DirtyStatus::Dirty => "dirty",
-                                fabro_types::DirtyStatus::Unknown => "unknown",
-                            })
-                    ),
-                    warn: prepared
+            details:     vec![CheckDetail {
+                text: format!(
+                    "Git: {}",
+                    prepared
                         .git
                         .as_ref()
-                        .is_some_and(|git| git.dirty != fabro_types::DirtyStatus::Clean),
-                },
-            ],
+                        .map_or("unknown", |git| match git.dirty {
+                            fabro_types::DirtyStatus::Clean => "clean",
+                            fabro_types::DirtyStatus::Dirty => "dirty",
+                            fabro_types::DirtyStatus::Unknown => "unknown",
+                        })
+                ),
+                warn: prepared
+                    .git
+                    .as_ref()
+                    .is_some_and(|git| git.dirty != fabro_types::DirtyStatus::Clean),
+            }],
             remediation: None,
         },
         CheckResult {
@@ -2314,6 +2345,37 @@ override = "server"
     }
 
     #[test]
+    fn prepare_manifest_rejects_removed_preparation_in_supplied_sources() {
+        for kind in [
+            types::ManifestConfigType::User,
+            types::ManifestConfigType::Project,
+        ] {
+            let mut manifest = minimal_manifest();
+            manifest.configs.push(types::ManifestConfig {
+                path:   Some("retired.toml".into()),
+                source: Some("[run.prepare]\nsteps = []".into()),
+                type_:  kind,
+            });
+            let error = prepare_manifest(&RunLayer::default(), &manifest)
+                .err()
+                .expect("retired preparation must fail");
+            assert!(format!("{error:#}").contains("run.prepare"));
+        }
+        let mut manifest = minimal_manifest();
+        manifest.workflows.get_mut("workflow.fabro").unwrap().config =
+            Some(types::ManifestWorkflowConfig {
+                path:   "workflow.toml".into(),
+                source: "[run.prepare]\nsteps = []".into(),
+            });
+        let error = prepare_manifest(&RunLayer::default(), &manifest)
+            .err()
+            .expect("retired preparation must fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("run.prepare"));
+        assert!(message.contains("workflow.toml"));
+    }
+
+    #[test]
     fn prepare_manifest_prefers_bundled_settings_without_duplication() {
         let server_settings = manifest_run_defaults(Some(&server_settings_fixture(
             r#"
@@ -2322,8 +2384,8 @@ _version = 1
 [server.storage]
 root = "/srv/fabro"
 
-[[run.prepare.steps]]
-script = "cli-setup"
+[run.checkpoint]
+exclude_globs = ["cli-cache/**"]
 
 [server.integrations.github]
 app_id = "fixture-app-id"
@@ -2337,8 +2399,8 @@ app_id = "fixture-app-id"
                 source: r#"
 _version = 1
 
-[[run.prepare.steps]]
-script = "workflow-setup"
+[run.checkpoint]
+exclude_globs = ["workflow-cache/**"]
 "#
                 .to_string(),
             });
@@ -2351,8 +2413,8 @@ _version = 1
 [server.auth]
 methods = ["dev-token"]
 
-[[run.prepare.steps]]
-script = "cli-setup"
+[run.checkpoint]
+exclude_globs = ["cli-cache/**"]
 
 [server.integrations.github]
 app_id = "fixture-app-id"
@@ -2365,13 +2427,9 @@ app_id = "fixture-app-id"
         let prepared = prepare_manifest(&server_settings, &manifest).unwrap();
         let settings_json = serde_json::to_value(&prepared.settings).unwrap();
 
-        // run.prepare.steps replaces the whole list across layers, so the
-        // higher-precedence workflow layer wins over cli.
-        assert_eq!(prepared.settings.run.prepare.steps.len(), 1);
-        assert_eq!(
-            prepared.settings.run.prepare.steps[0].to_shell_command(),
-            "workflow-setup"
-        );
+        assert_eq!(prepared.settings.run.checkpoint.exclude_globs, [
+            "workflow-cache/**"
+        ]);
         assert!(settings_json.pointer("/server").is_none());
     }
 
@@ -3101,6 +3159,7 @@ dockerfile = { path = "Dockerfile" }
                     .iter()
                     .map(|value| value.parse().expect("test slug should parse"))
                     .collect(),
+                app:                     None,
             };
             (prepared, resolved)
         }

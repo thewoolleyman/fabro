@@ -8,6 +8,7 @@ import {
   commandOutcomeOf,
   commandScriptOf,
   debugRowsFromStream,
+  debugRowSearchText,
   deriveRunPhasesFromStream,
   extractPetriStageContext,
   findPetriEdgeForStage,
@@ -21,7 +22,6 @@ import {
   petriEventName,
   petriStageLabel,
   platformRecordKind,
-  platformRecordsOf,
   reducerTranscriptFromProjection,
   stagesFromProjection,
   streamItemName,
@@ -106,6 +106,81 @@ describe("questions", () => {
   test("a run without a gate asks nothing", () => {
     expect(parsePetriInterviewPairs(command.stream)).toEqual([]);
   });
+
+  function question(reference: unknown, id = "review#1", seq = 1): RunStreamItem {
+    return {
+      run_id: "run-review",
+      stream_seq: seq,
+      kind: "petri",
+      id: `execution 0/${seq}/0`,
+      recorded_at: 1_000 * seq,
+      item: {
+        record: { body: { event: "step.progress.recorded" } },
+        derived: {
+          parsed: {
+            kind: "question",
+            question: { id, text: "Review the document.", reference },
+          },
+        },
+      },
+    };
+  }
+
+  const reference = {
+    label: "Design review",
+    url: "https://example.com/review/%2Fdraft?revision=one&token=a%2Bb#feedback",
+    kind: "document",
+  };
+
+  test("each question keeps its original review target through answer and replay", () => {
+    const asked = question(reference);
+    const answered: RunStreamItem = {
+      ...asked,
+      stream_seq: 2,
+      id: "execution 0/2/0",
+      recorded_at: 2_000,
+      item: {
+        record: { body: { event: "control.requested" } },
+        derived: { deliverable: true, answer: { question: "review#1", choice: "Y" } },
+      },
+    };
+    const nextReference = { ...reference, label: "Revised design", url: "https://example.com/next" };
+    const stream = [asked, answered, question(nextReference, "review#2", 3)];
+    const pending = parsePetriInterviewPairs([asked]);
+    expect(pending[0].question.reviewTarget).toEqual(reference);
+    expect(pending[0].resolution).toBeNull();
+
+    const pairs = parsePetriInterviewPairs(stream);
+    expect(pairs.map((pair) => pair.question.reviewTarget)).toEqual([reference, nextReference]);
+    expect(pairs[0].resolution).toMatchObject({ kind: "answered", answer: "Y" });
+    expect(pairs[1].resolution).toBeNull();
+    // A fresh page reads serialized events, with no live question or context cache.
+    expect(parsePetriInterviewPairs(JSON.parse(JSON.stringify(stream)))).toEqual(pairs);
+  });
+
+  test.each([undefined, null])("a reference with kind %p is a document, like the pending projection", (kind) => {
+    const [pair] = parsePetriInterviewPairs([question({ ...reference, kind })]);
+    expect(pair.question.reviewTarget).toEqual(reference);
+  });
+
+  test.each([
+    undefined,
+    null,
+    "https://example.com/review",
+    [],
+    {},
+    { ...reference, kind: "pull_request" },
+    { ...reference, kind: "" },
+    { ...reference, kind: 42 },
+    { ...reference, label: 42 },
+    { ...reference, label: "  " },
+    { ...reference, url: 42 },
+    { ...reference, url: "  " },
+  ].map((value) => [value]))("a missing or malformed reference falls back to question text: %p", (value) => {
+    const [pair] = parsePetriInterviewPairs([question(value)]);
+    expect(pair.question.reviewTarget).toBeNull();
+    expect(pair.question.question).toBe("Review the document.");
+  });
 });
 
 describe("run phases", () => {
@@ -129,25 +204,22 @@ describe("run phases", () => {
 });
 
 describe("platform records", () => {
-  test("a notice recorded between the branches lists with its message", () => {
-    const records = platformRecordsOf(parallel.stream);
-    const notices = records.filter((record) => record.kind === "run.notice");
-    expect(notices).toHaveLength(1);
-    expect(notices[0].detail).toBe("recorded while both branches ran");
-    expect(notices[0].stageKey).toBeNull();
-  });
-
-  test("each stage's checkpoint lists with its commit and its stage", () => {
-    const records = platformRecordsOf(parallel.stream);
-    const checkpoints = records.filter((record) => record.kind === "checkpoint");
-    // start, fork, a, b, merge, exit, and the two branch delegates.
-    expect(checkpoints.length).toBeGreaterThanOrEqual(6);
-    for (const checkpoint of checkpoints) {
-      expect(checkpoint.detail).toMatch(/^[0-9a-f]{12}$/);
-      expect(checkpoint.stageKey).not.toBeNull();
-    }
-    const order = records.map((record) => record.kind);
-    expect(order.indexOf("checkpoint")).toBeLessThan(order.indexOf("run.notice"));
+  test("artifact size notices remain readable and searchable in persisted events", () => {
+    const record = {
+      kind: "run.notice",
+      level: "warn",
+      code: "artifact_size_limit_exceeded",
+      message: 'Skipped artifact "assets/report.bin": 10485761 bytes exceeds the 10 MiB limit (10485760 bytes).',
+    };
+    const item: RunStreamItem = {
+      run_id: "run", stream_seq: 1, kind: "platform", id: "1", recorded_at: 0,
+      item: { seq: 1, recorded_at: 0, record, position: { execution: 0, firing: 1 } },
+    };
+    const [row] = debugRowsFromStream([item]);
+    expect(row.event).toBe("run.notice");
+    expect(row.item.item.record).toEqual(record);
+    expect(debugRowSearchText(row)).toContain("assets/report.bin");
+    expect(debugRowSearchText(row)).toContain("10 mib limit");
   });
 
   test("the debug rows name every item and carry its stage", () => {
@@ -196,7 +268,7 @@ describe("stage renderers", () => {
     expect(findPetriEdgeForStage(gate.stream, "gate@1")).toEqual({
       fromNode: "gate",
       toNode: "no",
-      reason: "condition",
+      reason: "unknown",
       condition: null,
     });
     expect(findPetriEdgeForStage(gate.stream, "exit@1")).toBeNull();
@@ -221,6 +293,22 @@ describe("stage renderers", () => {
     const say = itemsForStage(command.stream, "say@1");
     expect(commandScriptOf(say)).toBe("echo hello from petri");
     expect(commandScriptOf(itemsForStage(command.stream, "start@1"))).toBeNull();
+  });
+
+  test("a command stage's script is its stage's invocation when the stream names the node without it", () => {
+    const say = itemsForStage(command.stream, "say@1").map((item) => {
+      const copy = structuredClone(item);
+      const node = (copy.item as { subject?: { node?: { meta?: Record<string, unknown> } } })
+        .subject?.node;
+      if (node?.meta) delete node.meta.script;
+      return copy;
+    });
+    expect(commandScriptOf(say)).toBeNull();
+    const stage = command.projection.stages["say@1"];
+    expect(stage).toBeDefined();
+    expect(
+      commandScriptOf(say, { ...stage!, script_invocation: { command: "echo hello from petri" } }),
+    ).toBe("echo hello from petri");
   });
 
   test("the condition an edge matched is read from the node's edge table", () => {

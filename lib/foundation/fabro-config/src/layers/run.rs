@@ -32,8 +32,6 @@ pub struct RunLayer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git:           Option<RunGitLayer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prepare:       Option<RunPrepareLayer>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution:     Option<RunExecutionLayer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint:    Option<RunCheckpointLayer>,
@@ -97,6 +95,24 @@ pub struct RunIntegrationsGithubLayer {
     /// one wholesale (`Some(vec![])` is an explicit clear); no `...` splice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub additional_repositories: Option<Vec<String>>,
+    /// `[run.integrations.github.app]` — the GitHub App this run
+    /// authenticates as instead of the server's global integration, named
+    /// by vault secret names. The higher-precedence table replaces the lower
+    /// one wholesale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app:                     Option<RunGithubAppSourceLayer>,
+}
+
+/// `[run.integrations.github.app]` — vault secret NAMES, never values.
+/// Kept as raw strings here; emptiness is rejected at resolve time so the
+/// diagnostic carries the field path.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunGithubAppSourceLayer {
+    #[serde(default)]
+    pub app_id_secret:      String,
+    #[serde(default)]
+    pub private_key_secret: String,
 }
 
 impl Combine for RunIntegrationsGithubLayer {
@@ -106,6 +122,7 @@ impl Combine for RunIntegrationsGithubLayer {
             additional_repositories: self
                 .additional_repositories
                 .or(other.additional_repositories),
+            app:                     self.app.or(other.app),
         }
     }
 }
@@ -268,30 +285,6 @@ pub struct GitAuthorLayer {
         value_type = "string"
     )]
     pub email: Option<String>,
-}
-
-/// `[run.prepare]` — ordered list of preparation steps. Whole list replaces
-/// across layers.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RunPrepareLayer {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub steps:   Vec<PrepareStep>,
-    /// Optional timeout applied to each prepare step.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout: Option<Duration>,
-}
-
-/// A single prepare step. Exactly one of `script` or `command` must be set.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PrepareStep {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub script:  Option<InterpString>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command: Option<Vec<InterpString>>,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub env:     HashMap<String, InterpString>,
 }
 
 /// `[run.execution]` — run posture knobs.

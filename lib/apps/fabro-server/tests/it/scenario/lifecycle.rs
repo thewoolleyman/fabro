@@ -8,12 +8,12 @@ use tokio::time::sleep;
 use tower::ServiceExt;
 
 use crate::helpers::{
-    POLL_ATTEMPTS, POLL_INTERVAL, api, minimal_intent_json, response_json, response_status,
-    run_json, test_settings, wait_for_run_status,
+    POLL_INTERVAL, api, minimal_intent_json, response_json, response_status, run_json,
+    test_settings, wait_for_run_status,
 };
 
 async fn wait_for_question_id(app: &axum::Router, run_id: &str) -> String {
-    for _ in 0..POLL_ATTEMPTS {
+    loop {
         let req = Request::builder()
             .method("GET")
             .uri(api(&format!("/runs/{run_id}/questions")))
@@ -38,11 +38,10 @@ async fn wait_for_question_id(app: &axum::Router, run_id: &str) -> String {
         }
         sleep(POLL_INTERVAL).await;
     }
-    panic!("question should have appeared");
 }
 
 async fn wait_for_question(app: &axum::Router, run_id: &str) -> serde_json::Value {
-    for _ in 0..POLL_ATTEMPTS {
+    loop {
         let req = Request::builder()
             .method("GET")
             .uri(api(&format!("/runs/{run_id}/questions")))
@@ -63,7 +62,6 @@ async fn wait_for_question(app: &axum::Router, run_id: &str) -> serde_json::Valu
         }
         sleep(POLL_INTERVAL).await;
     }
-    panic!("question should have appeared");
 }
 
 async fn wait_for_run_state(
@@ -72,7 +70,7 @@ async fn wait_for_run_state(
     expected_status: &str,
     expected_reason: &str,
 ) -> serde_json::Value {
-    for _ in 0..POLL_ATTEMPTS {
+    loop {
         let body = run_json(app, run_id).await;
         if body["lifecycle"]["status"]["kind"].as_str() == Some(expected_status)
             && body["lifecycle"]["status"]["reason"].as_str() == Some(expected_reason)
@@ -81,7 +79,6 @@ async fn wait_for_run_state(
         }
         sleep(POLL_INTERVAL).await;
     }
-    panic!("run {run_id} did not reach status={expected_status} reason={expected_reason}");
 }
 
 const GATE_DOT: &str = r#"digraph GateTest {

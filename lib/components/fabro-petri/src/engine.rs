@@ -66,7 +66,7 @@ use fabro_util::sync;
 use lithos_llm::types::Error as LlmError;
 use petri_execution::host::{self, HostError, HostRun};
 use petri_execution::inspect::{self, InspectError, RunInspection};
-use petri_execution::watchdog::{StallWatchdog, WatchdogTask};
+use petri_execution::watchdog::{StallWatchdog, TokioClock, WatchdogClock, WatchdogTask};
 use petri_execution::{
     Access, CancelReason, CoordinatorError, ExecutionObserver, InterviewDispatcher, Interviewer,
     RECEIPT_FILE, RunKey, RunStore,
@@ -86,6 +86,7 @@ use crate::admission::AdmittedGraphs;
 use crate::blobs::{Blobs, RunBlobs};
 use crate::controls::RunControls;
 use crate::hooks::{FabroHooks, HooksSpec};
+use crate::prepare::PrepareBlock;
 use crate::run_turn::RunTurns;
 use crate::runtime::RuntimeSpec;
 use crate::secrets::SharedSecrets;
@@ -171,16 +172,13 @@ pub struct RunOutcome {
 pub enum RunError {
     #[error("the run ID could not be applied to model request headers")]
     ModelHeaders(#[source] LlmError),
+    #[error("the run's sandbox provider `{provider}` is not one Petri serves")]
+    UnsupportedProvider { provider: SandboxProviderKind },
+    /// The run's provider is a third-party kind the server cannot register.
+    #[error("{message}")]
+    UnregisteredProvider { message: String },
     #[error("the Daytona CPU allocation must be a non-negative integer: {cpu}")]
     InvalidCpu { cpu: i32 },
-    /// The run's provider is a plugin the server has no enabled settings for.
-    #[error("sandbox provider `{provider}` is not an enabled plugin in server.sandbox.providers")]
-    UnconfiguredPlugin { provider: SandboxProviderKind },
-    #[error("sandbox provider `{provider}`'s plugin settings are invalid: {message}")]
-    InvalidPlugin {
-        provider: SandboxProviderKind,
-        message:  String,
-    },
     #[error("the run's record could not be opened")]
     Open(#[source] petri_store::StoreError),
     #[error("the run's record could not be read")]
@@ -225,13 +223,44 @@ fn network_policy(settings: &EnvironmentNetworkSettings) -> NetworkPolicy {
 }
 
 /// Execute the run to its end and report what the record says.
-pub async fn run(mut request: RunRequest) -> Result<RunOutcome, RunError> {
+pub async fn run(request: RunRequest) -> Result<RunOutcome, RunError> {
+    run_on(request, Arc::new(TokioClock), Vec::new()).await
+}
+
+/// [`run`], with the stall watchdog measuring inactivity on `clock` instead
+/// of tokio's, for tests whose stall verdict must not depend on how long the
+/// host takes. `after_watchdog` observe each record after the watchdog has,
+/// so a test that moves `clock` on a record cannot move it before the
+/// watchdog counted that record as activity.
+#[cfg(feature = "test-support")]
+pub async fn run_with_stall_clock(
+    request: RunRequest,
+    clock: Arc<dyn WatchdogClock>,
+    after_watchdog: Vec<Arc<dyn ExecutionObserver>>,
+) -> Result<RunOutcome, RunError> {
+    run_on(request, clock, after_watchdog).await
+}
+
+async fn run_on(
+    mut request: RunRequest,
+    stall_clock: Arc<dyn WatchdogClock>,
+    after_watchdog: Vec<Arc<dyn ExecutionObserver>>,
+) -> Result<RunOutcome, RunError> {
     let backend = if request.runtime.dry_run {
         // The dry-run admission pass puts every scope on the host. Keep the
         // real local workspace for Fabro's checkpoint and artifact hooks.
         SandboxBackend::Host
     } else {
-        backend(&request.provider)
+        if let Some(message) = request
+            .runtime
+            .sandbox
+            .registration_problem(&request.provider)
+        {
+            return Err(RunError::UnregisteredProvider { message });
+        }
+        backend(&request.provider).ok_or_else(|| RunError::UnsupportedProvider {
+            provider: request.provider.clone(),
+        })?
     };
     // Scope once before either start or resume; native steps, hooks and
     // subagents inherit this client through the runtime capability.
@@ -243,29 +272,32 @@ pub async fn run(mut request: RunRequest) -> Result<RunOutcome, RunError> {
         .transpose()
         .map_err(RunError::ModelHeaders)?;
     let key = RunKey::new(request.run_id.as_str());
-    let stall_timeout = match &request.execution {
-        Execution::Start(graphs) => graphs.graph.policy.stall_timeout,
+    // The root graph the run executes: the admitted one on a start, the
+    // stored one on a resume. Only a run with no root yet uses the graph
+    // that the resume-to-start fallback runs.
+    let (stall_timeout, prepare) = match &request.execution {
+        Execution::Start(graphs) => (
+            graphs.graph.policy.stall_timeout,
+            PrepareBlock::of(&graphs.graph),
+        ),
         Execution::Resume(graphs) => {
             let logs = request
                 .store
                 .open(&key, Access::Read)
                 .await
                 .map_err(RunError::Open)?;
-            // A persisted disabled policy stays disabled. Only a run with no
-            // root yet uses the graph that the resume-to-start fallback runs.
-            host::stored_root_graph(&*logs)
+            // A persisted disabled policy stays disabled.
+            let stored = host::stored_root_graph(&*logs)
                 .await
-                .map_err(RunError::Read)?
-                .map_or(graphs.graph.policy.stall_timeout, |graph| {
-                    graph.policy.stall_timeout
-                })
+                .map_err(RunError::Read)?;
+            let root = stored.as_ref().unwrap_or(&graphs.graph);
+            (root.policy.stall_timeout, PrepareBlock::of(root))
         }
     };
-    let watchdog = stall_timeout.map(StallWatchdog::new);
+    let watchdog = stall_timeout.map(|timeout| StallWatchdog::with_clock(timeout, stall_clock));
     let mut options = RunOptions::new(&request.run_dir);
     options.run_key = Some(key.clone());
     options.retention = RETENTION;
-    options.sandbox.backend = backend;
     // The host provider manages no networking and refuses any policy but its
     // default, so only container backends receive the run's policy.
     if backend != SandboxBackend::Host {
@@ -274,17 +306,12 @@ pub async fn run(mut request: RunRequest) -> Result<RunOutcome, RunError> {
     if backend == SandboxBackend::Daytona {
         options.sandbox.daytona_resources = daytona_resources(&request.resources)?;
     }
-    if backend == SandboxBackend::Plugin {
-        options.sandbox.plugin = Some(request.runtime.sandbox.plugin(&request.provider)?);
-    }
-    // Every container backend but Daytona, which sizes its snapshot above,
-    // receives the environment's resources on each sandbox it creates.
-    if matches!(backend, SandboxBackend::Docker | SandboxBackend::Plugin) {
-        options.sandbox.resources = Some(container_resources(&request.resources)?);
-    }
+    options.sandbox.resources = sandbox_resources(&backend, &request.resources)?;
+    options.sandbox.backend = backend.clone();
     // A normal resume requires its original sandbox to survive.
     options.sandbox.lost_sandbox = LostSandbox::Refuse;
     let resumed = matches!(request.execution, Execution::Resume(_));
+    let prepare_secrets = request.secrets.clone();
     let mut runtime = request
         .runtime
         .runtime(true)
@@ -338,6 +365,7 @@ pub async fn run(mut request: RunRequest) -> Result<RunOutcome, RunError> {
             resumed,
             request.blobs.clone(),
         );
+        let hooks = hooks.with_prepare(prepare, prepare_secrets);
         Arc::new(match &run_turns {
             Some(run_turns) => hooks.with_run_turns(Arc::clone(run_turns)),
             None => hooks,
@@ -387,6 +415,7 @@ pub async fn run(mut request: RunRequest) -> Result<RunOutcome, RunError> {
     if let Some(watchdog) = &watchdog {
         observers.push(Arc::new(watchdog.clone()));
     }
+    observers.extend(after_watchdog);
     let result = match request.execution {
         Execution::Start(graphs) => {
             info!(run_id = %request.run_id, backend = %backend, "Starting Petri run");
@@ -558,7 +587,26 @@ fn daytona_resources(
     })
 }
 
-fn container_resources(settings: &EnvironmentResourcesSettings) -> Result<Resources, RunError> {
+/// The environment's resources for a registered provider: each one given
+/// replaces the template's, and one left out keeps it.
+/// The size each sandbox of `backend` is created with, from the environment's
+/// resources. A registered provider sizes each sandbox over its template, and a
+/// Docker container sandbox takes the same size; without it a Docker sandbox
+/// runs with no CPU or memory limit at all. The host runs no container, and
+/// Daytona sizes its runner snapshot from `daytona_resources` instead.
+fn sandbox_resources(
+    backend: &SandboxBackend,
+    settings: &EnvironmentResourcesSettings,
+) -> Result<Option<Resources>, RunError> {
+    match backend {
+        SandboxBackend::Registered(_) | SandboxBackend::Docker => {
+            registered_resources(settings).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn registered_resources(settings: &EnvironmentResourcesSettings) -> Result<Resources, RunError> {
     let mut resources = Resources::default();
     resources.cpu_cores = settings
         .cpu
@@ -573,17 +621,18 @@ fn mebibytes(size: Size) -> u64 {
     size.as_bytes().div_ceil(1024 * 1024)
 }
 
-/// The sandbox backend for Fabro's provider kind: a bundled kind's own
-/// backend, and the plugin backend for any other kind.
-pub(crate) fn backend(provider: &SandboxProviderKind) -> SandboxBackend {
+/// The sandbox backend for Fabro's provider kind: a bundled kind's own,
+/// and for any other the provider registered under it from
+/// `server.sandbox.providers`. `None` for a name Petri reserves.
+pub(crate) fn backend(provider: &SandboxProviderKind) -> Option<SandboxBackend> {
     if *provider == SandboxProviderKind::LOCAL {
-        SandboxBackend::Host
+        Some(SandboxBackend::Host)
     } else if *provider == SandboxProviderKind::DOCKER {
-        SandboxBackend::Docker
+        Some(SandboxBackend::Docker)
     } else if *provider == SandboxProviderKind::DAYTONA {
-        SandboxBackend::Daytona
+        Some(SandboxBackend::Daytona)
     } else {
-        SandboxBackend::Plugin
+        provider.as_str().parse().ok()
     }
 }
 
@@ -692,6 +741,64 @@ async fn write_receipt(run_dir: &std::path::Path, receipt: &petri_execution::Int
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_third_party_kind_runs_on_the_provider_registered_under_it() {
+        let kind = SandboxProviderKind::try_new("kubernetes").expect("a valid kind");
+        assert_eq!(
+            backend(&kind).map(|backend| backend.to_string()),
+            Some("kubernetes".to_string())
+        );
+        assert!(matches!(
+            backend(&kind),
+            Some(SandboxBackend::Registered(_))
+        ));
+        assert_eq!(
+            backend(&SandboxProviderKind::LOCAL),
+            Some(SandboxBackend::Host)
+        );
+    }
+
+    #[test]
+    fn a_registered_providers_size_names_only_what_the_environment_set() {
+        let settings = EnvironmentResourcesSettings {
+            cpu: Some(2),
+            memory: Some("4GB".parse().expect("a size")),
+            ..EnvironmentResourcesSettings::default()
+        };
+        let resources = registered_resources(&settings).expect("valid resources");
+        assert_eq!(resources.cpu_cores, Some(2));
+        assert_eq!(resources.memory_mb, Some(3815));
+        assert_eq!(resources.disk_mb, None, "the template's disk is kept");
+    }
+
+    #[test]
+    fn docker_and_registered_sandboxes_are_sized_and_the_host_is_not() {
+        let settings = EnvironmentResourcesSettings {
+            cpu: Some(4),
+            memory: Some("8GB".parse().expect("a size")),
+            ..EnvironmentResourcesSettings::default()
+        };
+        let docker = sandbox_resources(&SandboxBackend::Docker, &settings)
+            .expect("valid resources")
+            .expect("a Docker sandbox is sized");
+        assert_eq!(docker.cpu_cores, Some(4));
+        assert_eq!(docker.memory_mb, Some(7630), "8GB is 7630 MiB, rounded up");
+        let kind = SandboxProviderKind::try_new("kubernetes").expect("a valid kind");
+        let registered = backend(&kind).expect("a registered backend");
+        assert!(
+            sandbox_resources(&registered, &settings)
+                .expect("valid resources")
+                .is_some(),
+            "a registered provider's sandbox is sized"
+        );
+        assert!(
+            sandbox_resources(&SandboxBackend::Host, &settings)
+                .expect("valid resources")
+                .is_none(),
+            "the host runs no container to size"
+        );
+    }
 
     fn outcome_with(status: RunStatus, failure: Option<&str>, complete: bool) -> RunOutcome {
         RunOutcome {

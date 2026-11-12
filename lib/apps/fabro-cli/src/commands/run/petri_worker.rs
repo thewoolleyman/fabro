@@ -216,14 +216,37 @@ pub(super) async fn execute(worker: PetriWorker<'_>) -> Result<()> {
     // A GitHub target is fetched into its sandbox with a read-only token and
     // published with a push token, each from a token source over the
     // server's credentials that the run keeps for its whole life.
-    let github = match publish::github_credentials(&*vault.read().await) {
+    // A run that selects its own App is served under that App or not at
+    // all: an unresolvable selection, or one whose App cannot reach the
+    // repository, fails the run here, before any checkout, renewal or push.
+    let github = match publish::run_github_credentials(&worker.run_state.spec, &*vault.read().await)
+    {
         Ok(credentials) => credentials,
-        Err(err) => {
+        Err(publish::RunCredentialsError::Server(err)) => {
             warn!(run_id = %run_id, error = %err, "GitHub credentials are unavailable to the worker");
             None
         }
+        Err(publish::RunCredentialsError::Selected(err)) => {
+            return refuse_selected_app(&records, run_id, err.to_string()).await;
+        }
     };
-    let read_tokens = publish::read_token_source(&worker.run_state.spec, github.as_ref());
+    let read_tokens = if worker
+        .run_state
+        .spec
+        .settings
+        .run
+        .integrations
+        .github
+        .app
+        .is_some()
+    {
+        match publish::selected_read_token_source(&worker.run_state.spec, github.as_ref()).await {
+            Ok(tokens) => tokens,
+            Err(message) => return refuse_selected_app(&records, run_id, message).await,
+        }
+    } else {
+        publish::read_token_source(&worker.run_state.spec, github.as_ref())
+    };
     runtime.stage_credentials =
         StageCredentials::for_run(&worker.run_state.spec, github.as_ref(), read_tokens.clone())?;
     let mut source = RunSource::for_run(
@@ -554,6 +577,31 @@ fn control_name(message: &WorkerControlMessage) -> &'static str {
 }
 
 /// One lifecycle transition of the run, recorded through the client.
+/// End a run whose selected GitHub App source cannot serve it, before any
+/// forge operation: the failure is recorded with the reason, which names
+/// the selected secret names and never a value, and the worker exits with
+/// it as the failed run's error.
+async fn refuse_selected_app(
+    records: &Arc<dyn PlatformRecords>,
+    run_id: RunId,
+    message: String,
+) -> Result<()> {
+    warn!(run_id = %run_id, error = %message, "the run's selected GitHub App cannot serve it");
+    let detail = format!("selected GitHub App source refused: {message}");
+    lifecycle(
+        records,
+        run_id,
+        RunLifecycleKind::Failed,
+        RunStatus::Failed {
+            reason: FailureReason::WorkflowError,
+        },
+        Some(detail.clone()),
+    )
+    .await?;
+    runner::set_worker_title(&run_id, WorkerTitlePhase::Failed);
+    Err(anyhow!("Petri run failed: {detail}"))
+}
+
 async fn lifecycle(
     records: &Arc<dyn PlatformRecords>,
     run_id: RunId,
@@ -684,6 +732,7 @@ async fn runtime_spec(
             &fabro_config::ServerSettingsBuilder::load_default_sandbox()
                 .context("loading the server's sandbox providers")?
                 .providers,
+            crate::process_env_var,
         ),
         settings_toml: None,
         mcp_catalog_toml: None,

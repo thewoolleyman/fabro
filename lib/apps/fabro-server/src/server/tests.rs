@@ -1730,6 +1730,85 @@ async fn resolve_llm_client_reads_openai_token_from_vault() {
 }
 
 #[tokio::test]
+async fn dotted_provider_starts_and_uses_its_vault_key_with_inferred_or_explicit_profile() {
+    for explicit_profile in [false, true] {
+        let upstream = MockServer::start_async().await;
+        let completion = upstream
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/v1/chat/completions")
+                    .header("authorization", "Bearer dotted-provider-test-key")
+                    .json_body_includes(r#"{"model":"wire-model"}"#);
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .json_body(json!({
+                        "id": "chatcmpl-dotted",
+                        "object": "chat.completion",
+                        "created": 1_700_000_000,
+                        "model": "wire-model",
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "OK"},
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                    }));
+            })
+            .await;
+        let mut overlay = r#"
+[providers."my.gw"]
+display_name = "Gateway"
+base_url = "http://unused.invalid"
+auth = { type = "bearer" }
+[providers."my.gw".models."model.v1"]
+display_name = "Model"
+api_model = "wire-model"
+capabilities = { text = true }
+"#
+        .to_string();
+        if explicit_profile {
+            overlay.push_str(
+                r#"
+[providers."my.gw".metadata.agent]
+profile = "openai"
+"#,
+            );
+        }
+        let state = TestAppStateBuilder::new()
+            .runtime_settings(default_test_server_settings(), RunLayer::default())
+            .env_lookup(|_| None)
+            .llm_overlay_toml(&overlay)
+            .provider_base_url("my.gw", upstream.base_url())
+            .build();
+        state
+            .stores
+            .vault
+            .set(
+                "MY_GW_API_KEY",
+                "dotted-provider-test-key",
+                SecretType::Token,
+                None,
+            )
+            .await
+            .unwrap();
+        let llm = state.resolve_llm_client().await.unwrap();
+        let response = llm
+            .client
+            .complete(
+                LlmRequest::builder()
+                    .model("my.gw/model.v1")
+                    .user("Hello")
+                    .build()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.text(), "OK");
+        completion.assert_async().await;
+    }
+}
+
+#[tokio::test]
 async fn resolve_llm_client_ignores_env_lookup_provider_tokens() {
     let state = test_app_state_with_env_lookup(
         default_test_server_settings(),
@@ -5135,7 +5214,7 @@ async fn pr_test_app_with_minimal_run(
 }
 
 #[tokio::test]
-async fn test_model_unknown_returns_404() {
+async fn test_model_unknown_returns_a_probe_finding() {
     let app = test_app_with();
 
     let req = Request::builder()
@@ -5146,11 +5225,14 @@ async fn test_model_unknown_returns_404() {
         .unwrap();
 
     let response = app.clone().oneshot(req).await.unwrap();
-    assert_status!(response, StatusCode::NOT_FOUND).await;
+    let body = response_json!(response, StatusCode::OK).await;
+    assert_eq!(body["outcome"]["status"], "failed");
+    assert_eq!(body["outcome"]["error"]["kind"], "model_selection");
+    assert!(body["route"].is_null());
 }
 
 #[tokio::test]
-async fn test_model_explicit_provider_alias_returns_canonical_model_id_when_unavailable() {
+async fn test_model_explicit_provider_unavailable_returns_a_probe_finding() {
     let state = test_app_state_with_env_lookup(
         default_test_server_settings(),
         RunLayer::default(),
@@ -5168,9 +5250,8 @@ async fn test_model_explicit_provider_alias_returns_canonical_model_id_when_unav
 
     let response = app.oneshot(req).await.unwrap();
     let body = response_json!(response, StatusCode::OK).await;
-    assert_eq!(body["model_id"], "claude-sonnet-5");
-    assert_eq!(body["provider"], "anthropic");
-    assert_eq!(body["status"], "skip");
+    assert_eq!(body["outcome"]["status"], "failed");
+    assert_eq!(body["outcome"]["error"]["kind"], "model_selection");
 }
 
 #[tokio::test]
@@ -5194,7 +5275,9 @@ async fn test_model_unqualified_known_alias_requires_a_ready_provider() {
         .await
         .unwrap();
 
-    assert_status!(response, StatusCode::BAD_REQUEST).await;
+    let body = response_json!(response, StatusCode::OK).await;
+    assert_eq!(body["outcome"]["status"], "failed");
+    assert_eq!(body["outcome"]["error"]["kind"], "model_selection");
 }
 
 #[tokio::test]
@@ -5329,30 +5412,118 @@ capabilities = {{ text = true }}
     assert_eq!(filtered["data"].as_array().unwrap().len(), 1);
     assert_eq!(filtered["data"][0]["provider"], "aggregator");
 
-    for (query, expected_provider) in [
-        ("?provider=direct", "direct"),
-        ("?provider=aggregator", "aggregator"),
-        ("", "direct"),
+    for (selector, query, expected_provider) in [
+        ("portable", "?provider=direct", "direct"),
+        ("portable", "?provider=aggregator", "aggregator"),
+        ("portable", "", "direct"),
+        (
+            "vendor%2Fportable-model",
+            "?provider=aggregator",
+            "aggregator",
+        ),
     ] {
         let response = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri(api(&format!("/models/portable/test{query}")))
+                    .uri(api(&format!("/models/{selector}/test{query}")))
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         let body = response_json!(response, StatusCode::OK).await;
-        assert_eq!(body["model_id"], "portable-model");
-        assert_eq!(body["provider"], expected_provider);
-        assert_eq!(body["status"], "ok");
+        assert_eq!(body["route"], format!("{expected_provider}/portable-model"));
+        assert_eq!(body["outcome"]["status"], "passed");
+        assert_eq!(body["usage"]["input"], 1);
     }
 
     direct_probe.assert_calls(2);
-    aggregator_probe.assert_calls(1);
+    aggregator_probe.assert_calls(2);
+}
+
+#[tokio::test]
+async fn test_model_preserves_error_classification_and_redacts_provider_details() {
+    let leaked_key = "sk-proj-abcdefghijklmnopqrstuvwxyz0123456789";
+    let upstream = MockServer::start();
+    let probe = upstream.mock(|when, then| {
+        when.method(POST).path("/v1/chat/completions");
+        then.status(401).json_body(json!({
+            "error": {
+                "message": format!("invalid api key {leaked_key}"),
+                "code": format!("invalid_key_{leaked_key}"),
+                "type": "invalid_request_error"
+            },
+            "private_detail": "must not cross the API boundary"
+        }));
+    });
+    let state = TestAppStateBuilder::new()
+        .llm_overlay_toml(&acme_overlay(&upstream.base_url()))
+        .vault_entries([("ACME_API_KEY", leaked_key)])
+        .build();
+    let app = crate::test_support::build_test_router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(api("/models/acme-large/test?provider=acme"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response_json!(response, StatusCode::OK).await;
+    assert_eq!(body["version"], 1);
+    assert_eq!(body["route"], "acme/acme-large");
+    assert_eq!(body["outcome"]["status"], "failed");
+    let error = &body["outcome"]["error"];
+    assert_eq!(error["kind"], "authentication");
+    assert_eq!(error["status"], 401);
+    assert_eq!(error["provider"], "acme");
+    assert!(error.get("raw_data").is_none());
+    assert!(error.get("source_message").is_none());
+    let serialized = body.to_string();
+    assert!(!serialized.contains(leaked_key));
+    assert!(!serialized.contains("must not cross"));
+    assert!(serialized.contains("REDACTED"));
+    probe.assert_calls(1);
+}
+
+#[tokio::test]
+async fn test_model_tool_probe_preserves_incorrect_outcome_and_usage() {
+    let upstream = MockServer::start();
+    let probe = upstream.mock(|when, then| {
+        when.method(POST).path("/v1/chat/completions");
+        then.status(200).json_body(json!({
+            "id": "chatcmpl-test", "model": "acme-large",
+            "choices": [{"message": {"role": "assistant", "content": "84 is even"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19}
+        }));
+    });
+    let state = TestAppStateBuilder::new()
+        .llm_overlay_toml(&acme_overlay(&upstream.base_url()))
+        .vault_entries([("ACME_API_KEY", "test-key")])
+        .build();
+    let app = crate::test_support::build_test_router(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(api("/models/acme-large/test?provider=acme&mode=deep"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = response_json!(response, StatusCode::OK).await;
+    assert_eq!(body["route"], "acme/acme-large");
+    assert_eq!(body["outcome"]["status"], "incorrect");
+    assert!(!body["outcome"]["detail"].as_str().unwrap().is_empty());
+    assert_eq!(body["usage"]["input"], 12);
+    assert_eq!(body["usage"]["output"], 7);
+    assert!(body["latency_ms"].is_u64());
+    probe.assert_calls(1);
 }
 
 #[tokio::test]
@@ -5457,7 +5628,7 @@ protocol_options = {{ reasoning_effort_levels = true }}
 
     let response = app.clone().oneshot(req).await.unwrap();
     let body = response_json!(response, StatusCode::OK).await;
-    assert_eq!(body["status"], "ok");
+    assert_eq!(body["outcome"]["status"], "passed");
 
     let unsupported = Request::builder()
         .method("POST")
@@ -5467,11 +5638,9 @@ protocol_options = {{ reasoning_effort_levels = true }}
         .body(Body::empty())
         .unwrap();
     let response = app.oneshot(unsupported).await.unwrap();
-    let body = response_json!(response, StatusCode::BAD_REQUEST).await;
-    assert_eq!(
-        body["errors"][0]["detail"],
-        "model 'acme-reasoner' does not support reasoning_effort 'medium'; allowed values: low, high"
-    );
+    let body = response_json!(response, StatusCode::OK).await;
+    assert_eq!(body["outcome"]["status"], "failed");
+    assert_eq!(body["outcome"]["error"]["kind"], "invalid_request");
     completion.assert_calls(1);
 }
 
@@ -8777,7 +8946,7 @@ async fn render_graph_from_manifest_accepts_fabro_dotted_attributes() {
     let dot_source = r#"digraph X {
   start [shape=Mdiamond]
   exit [shape=Msquare]
-  a [label="A", acp.command="codex"]
+  a [label="A", backend="acp", acp.command="codex"]
   start -> a -> exit
 }"#;
 

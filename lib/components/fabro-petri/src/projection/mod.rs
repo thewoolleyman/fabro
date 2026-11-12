@@ -41,8 +41,8 @@ pub(crate) use coordinator::{finished_status, stall_message};
 use fabro_store::StagePosition;
 use fabro_store::platform_records::StoredPlatformRecord;
 use fabro_types::{
-    FailureReason, RunControlAction, RunDiff, RunId, RunProjection, RunStatus, StageId,
-    StageProjection,
+    FailureCategory, FailureReason, RunControlAction, RunDiff, RunId, RunProjection, RunStatus,
+    StageId, StageProjection,
 };
 use petri_execution::events::{NodeRef, RunEvent, Subject};
 use petri_execution::{CancelReason, CoordinatorEvent, CoordinatorRecord, ExecutionId};
@@ -371,6 +371,96 @@ fn millis(recorded_at: u64) -> DateTime<Utc> {
         .unwrap_or_default()
 }
 
+/// Message fragments a sandbox provider's TRANSPORT failure carries.
+///
+/// A sandbox operation that could not reach its provider -- the Kubernetes API
+/// went away, or the sandbox-driver plugin's own pipe closed -- says nothing
+/// about the work item, so the run it ended is retryable. Measured 2026-11-02
+/// on gmktec (carrier 613add1): eight runs killed while the k3s server
+/// restarted all ended with "sandbox exec failed: ... reaching the Kubernetes
+/// API failed: ServiceError: client error (Connect)" and reported
+/// `deterministic` (livespec-orchestrator-beads-fabro bd-ib-6r3yax).
+const SANDBOX_TRANSPORT_FAILURE_FRAGMENTS: &[&str] = &[
+    "reaching the Kubernetes API failed",
+    "client error (Connect)",
+    "plugin response transport closed",
+    "plugin transport failed",
+];
+
+/// Whether a run's failure message names a sandbox provider transport fault.
+#[must_use]
+pub fn is_sandbox_transport_failure(message: &str) -> bool {
+    SANDBOX_TRANSPORT_FAILURE_FRAGMENTS
+        .iter()
+        .any(|fragment| message.contains(fragment))
+}
+
+/// Message fragments a failure of the Fabro server's OWN run store carries.
+///
+/// The server records "The run's store failed: ..." when a worker exits with
+/// `EX_TEMPFAIL` because a store write failed under it, and the resume that
+/// follows can fail again on the run's lease. Measured 2026-11-03 on gmktec
+/// main (carrier 613add1): run 01M6G8H472WGHVS94XFKWSEZHA ended "The run's
+/// store failed: exit status: 75; the run could not be resumed: releasing the
+/// Petri run's lease: could not release the run's lease in sqlite database ...
+/// (code: 5) database is locked" and reported `deterministic`
+/// (livespec-orchestrator-beads-fabro bd-ib-bpucez, during the bd-ib-h7kbco
+/// lock storm). None of it says anything about the work item.
+const RUN_STORE_FAILURE_FRAGMENTS: &[&str] = &[
+    "The run's store failed",
+    "could not release the run's lease",
+    "database is locked",
+];
+
+/// How a failure message names a worker exit status.
+const EXIT_STATUS_PREFIX: &str = "exit status: ";
+
+/// `EX_TEMPFAIL`, the exit status a worker uses when its run's store failed.
+const EX_TEMPFAIL: &str = "75";
+
+/// Whether a run's failure message names a fault of the server's own run
+/// store, or a worker exit with `EX_TEMPFAIL`.
+#[must_use]
+pub fn is_run_store_failure(message: &str) -> bool {
+    RUN_STORE_FAILURE_FRAGMENTS
+        .iter()
+        .any(|fragment| message.contains(fragment))
+        || names_tempfail_exit(message)
+}
+
+/// Whether the message names exit status 75 exactly, not 750 or 7.
+fn names_tempfail_exit(message: &str) -> bool {
+    message.match_indices(EXIT_STATUS_PREFIX).any(|(at, _)| {
+        let rest = &message[at + EXIT_STATUS_PREFIX.len()..];
+        rest.strip_prefix(EX_TEMPFAIL)
+            .is_some_and(|after| !after.starts_with(|c: char| c.is_ascii_digit()))
+    })
+}
+
+/// The category a failed run's conclusion reports.
+///
+/// The recorded reason decides first, because it is the run's own statement of
+/// why it ended. A failure with no more specific reason is `deterministic`
+/// unless its message names a sandbox provider transport fault or a fault of
+/// the server's own run store, which are `transient_infra`: the Dispatcher
+/// keys retryability on that category, and an infrastructure outage read as
+/// `deterministic` is charged to the work item.
+#[must_use]
+pub fn run_failure_category(reason: FailureReason, message: Option<&str>) -> FailureCategory {
+    match reason {
+        FailureReason::Cancelled => FailureCategory::Canceled,
+        FailureReason::TransientInfra => FailureCategory::TransientInfra,
+        FailureReason::BudgetExhausted => FailureCategory::BudgetExhausted,
+        _ if message.is_some_and(|message| {
+            is_sandbox_transport_failure(message) || is_run_store_failure(message)
+        }) =>
+        {
+            FailureCategory::TransientInfra
+        }
+        _ => FailureCategory::Deterministic,
+    }
+}
+
 /// The run id a Petri run key names.
 #[must_use]
 pub fn run_id_of(key: &str) -> Option<RunId> {
@@ -423,7 +513,176 @@ pub fn finished_run_result(record: &Record) -> Option<(RunStatus, Option<String>
 
 #[cfg(test)]
 mod tests {
-    use fabro_store::platform_records::{PlatformRecord, RunCreatedRecord};
+    #[test]
+    fn a_kubernetes_connect_failure_is_transient_infra() {
+        let message = "sandbox exec failed: exec in pod petri-01m6ehxa0pey-l0 failed: \
+                       reaching the Kubernetes API failed: ServiceError: client error (Connect)";
+        assert_eq!(
+            super::run_failure_category(fabro_types::FailureReason::WorkflowError, Some(message)),
+            fabro_types::FailureCategory::TransientInfra
+        );
+    }
+
+    #[test]
+    fn a_closed_plugin_transport_is_transient_infra() {
+        assert_eq!(
+            super::run_failure_category(
+                fabro_types::FailureReason::SandboxInitFailed,
+                Some("sandbox create failed: plugin response transport closed"),
+            ),
+            fabro_types::FailureCategory::TransientInfra
+        );
+    }
+
+    #[test]
+    fn a_failure_with_no_transport_cause_stays_deterministic() {
+        assert_eq!(
+            super::run_failure_category(
+                fabro_types::FailureReason::WorkflowError,
+                Some("stage implement failed: tests did not pass"),
+            ),
+            fabro_types::FailureCategory::Deterministic
+        );
+        assert_eq!(
+            super::run_failure_category(fabro_types::FailureReason::WorkflowError, None),
+            fabro_types::FailureCategory::Deterministic
+        );
+    }
+
+    #[test]
+    fn a_recorded_reason_decides_before_the_message() {
+        assert_eq!(
+            super::run_failure_category(fabro_types::FailureReason::BudgetExhausted, None),
+            fabro_types::FailureCategory::BudgetExhausted
+        );
+        assert_eq!(
+            super::run_failure_category(fabro_types::FailureReason::TransientInfra, None),
+            fabro_types::FailureCategory::TransientInfra
+        );
+        assert_eq!(
+            super::run_failure_category(
+                fabro_types::FailureReason::Cancelled,
+                Some("reaching the Kubernetes API failed"),
+            ),
+            fabro_types::FailureCategory::Canceled
+        );
+    }
+
+    /// The failure run 01M6G8H472WGHVS94XFKWSEZHA recorded on gmktec main.
+    const LOCKED_LEASE_FAILURE: &str = "The run's store failed: exit status: 75; the run could \
+                                        not be resumed: releasing the Petri run's lease: could \
+                                        not release the run's lease in sqlite database \
+                                        /var/lib/fabro/fabro.db (code: 5) database is locked";
+
+    #[test]
+    fn a_run_store_failure_is_transient_infra() {
+        for message in [
+            LOCKED_LEASE_FAILURE,
+            "The run's store failed 3 times; the last failure: disk I/O error",
+            "releasing the Petri run's lease: could not release the run's lease",
+            "appending the run's record: (code: 5) database is locked",
+        ] {
+            assert_eq!(
+                super::run_failure_category(fabro_types::FailureReason::Terminated, Some(message)),
+                fabro_types::FailureCategory::TransientInfra,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tempfail_worker_exit_is_transient_infra() {
+        assert_eq!(
+            super::run_failure_category(
+                fabro_types::FailureReason::WorkflowError,
+                Some("the run's worker ended: exit status: 75"),
+            ),
+            fabro_types::FailureCategory::TransientInfra
+        );
+        for message in [
+            "the run's worker ended: exit status: 750",
+            "the run's worker ended: exit status: 7",
+            "the run's worker ended: exit status: 1",
+        ] {
+            assert_eq!(
+                super::run_failure_category(
+                    fabro_types::FailureReason::WorkflowError,
+                    Some(message)
+                ),
+                fabro_types::FailureCategory::Deterministic,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_recorded_reason_still_decides_before_a_store_failure() {
+        assert_eq!(
+            super::run_failure_category(
+                fabro_types::FailureReason::Cancelled,
+                Some(LOCKED_LEASE_FAILURE),
+            ),
+            fabro_types::FailureCategory::Canceled
+        );
+        assert_eq!(
+            super::run_failure_category(
+                fabro_types::FailureReason::BudgetExhausted,
+                Some(LOCKED_LEASE_FAILURE),
+            ),
+            fabro_types::FailureCategory::BudgetExhausted
+        );
+    }
+
+    /// The conclusion `fabro inspect --json` prints carries the category in
+    /// `conclusion.failure.detail.category`, where the Dispatcher reads it.
+    #[test]
+    fn a_run_its_store_failed_concludes_transient_infra() {
+        let mut view = RunView::new();
+        let created = StoredPlatformRecord {
+            seq:         1,
+            recorded_at: 1_000,
+            record:      PlatformRecord::RunCreated(RunCreatedRecord {
+                spec:         types_support::test_run_spec(),
+                title:        Some("A run".to_string()),
+                parent_id:    None,
+                retried_from: None,
+                web_url:      None,
+            }),
+            position:    None,
+        };
+        view.fold(&Item::Platform(&created), 1);
+        let mut failed =
+            RunLifecycleRecord::new(RunLifecycleKind::Failed).with_status(RunStatus::Failed {
+                reason: FailureReason::Terminated,
+            });
+        failed.reason = Some(LOCKED_LEASE_FAILURE.to_string());
+        let failed = StoredPlatformRecord {
+            seq:         2,
+            recorded_at: 2_000,
+            record:      PlatformRecord::RunLifecycle(failed),
+            position:    None,
+        };
+        view.fold(&Item::Platform(&failed), 2);
+        let failure = view
+            .projection()
+            .expect("the run was created")
+            .conclusion
+            .as_ref()
+            .and_then(|conclusion| conclusion.failure.as_ref())
+            .expect("the failed run concludes with its failure")
+            .clone();
+        assert_eq!(failure.detail.message, LOCKED_LEASE_FAILURE);
+        assert_eq!(
+            failure.detail.category,
+            fabro_types::FailureCategory::TransientInfra
+        );
+        let json = serde_json::to_value(&failure).expect("the failure encodes");
+        assert_eq!(json["detail"]["category"], "transient_infra");
+    }
+
+    use fabro_store::platform_records::{
+        PlatformRecord, RunCreatedRecord, RunLifecycleKind, RunLifecycleRecord,
+    };
     use fabro_types::test_support as types_support;
     use petri_runtime::driver::BranchRole;
     use petri_runtime::ir::{FiringId, NodeId};
@@ -546,6 +805,67 @@ mod tests {
             .collect();
         assert_eq!(labels, vec!["build@1", "build/e2@1"]);
         assert_eq!(view.state.stages.len(), 2);
+    }
+
+    /// The stream names a node without its script, so the stage keeps it:
+    /// a command stage's `script_invocation` is the node's `meta.script`,
+    /// and a node without one leaves it unset.
+    #[test]
+    fn a_command_stage_keeps_its_script_as_its_invocation() {
+        let mut view = RunView::new();
+        let created = StoredPlatformRecord {
+            seq:         1,
+            recorded_at: 1_000,
+            record:      PlatformRecord::RunCreated(RunCreatedRecord {
+                spec:         types_support::test_run_spec(),
+                title:        Some("A run".to_string()),
+                parent_id:    None,
+                retried_from: None,
+                web_url:      None,
+            }),
+            position:    None,
+        };
+        view.fold(&Item::Platform(&created), 1);
+        let subject = |name: &str, firing: u64, meta: serde_json::Value| Subject {
+            node:       NodeRef {
+                id: NodeId::new(1),
+                name: name.into(),
+                kind: "attractor/command".into(),
+                meta,
+            },
+            firing:     Some(FiringId::new(firing)),
+            visit:      Some(1),
+            attempt:    None,
+            generation: None,
+            branch:     BranchRole::None,
+        };
+        view.start_visit(
+            ExecutionId::new(1),
+            &subject(
+                "build",
+                4,
+                serde_json::json!({ "kind": "command", "label": "Build", "script": "cargo build" }),
+            ),
+            millis(2_000),
+        );
+        view.start_visit(
+            ExecutionId::new(1),
+            &subject("plan", 5, serde_json::json!({ "kind": "agent" })),
+            millis(3_000),
+        );
+        let invocations: Vec<(String, Option<serde_json::Value>)> = view
+            .projection()
+            .expect("the run was created")
+            .iter_stages()
+            .map(|(id, stage)| (id.to_string(), stage.script_invocation.clone()))
+            .collect();
+        assert_eq!(invocations, vec![
+            (
+                "build@1".to_string(),
+                Some(serde_json::json!({ "command": "cargo build" }))
+            ),
+            ("plan@1".to_string(), None),
+        ]);
     }
 
     #[test]

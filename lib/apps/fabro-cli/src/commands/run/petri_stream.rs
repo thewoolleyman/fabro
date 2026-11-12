@@ -17,7 +17,7 @@
     reason = "sync CLI `run events` output: streams lines to std::io::stdout directly"
 )]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::time::Duration;
@@ -25,12 +25,13 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use chrono::{DateTime, TimeZone as _, Utc};
 use fabro_redact::redact_jsonl_line;
-use fabro_types::{RunId, RunStreamItem, RunStreamItemKind};
+use fabro_types::{RunId, RunStreamItem, RunStreamItemKind, StageOutcome};
 use fabro_util::terminal::Styles;
 use serde_json::Value;
 use tokio::time;
 use tracing::debug;
 
+use super::stage_presentation::StagePresentation;
 use crate::args::EventsArgs;
 use crate::server_client;
 use crate::shared::{format_duration_ms, format_usd_micros};
@@ -338,22 +339,29 @@ pub(crate) fn format_pretty(
             let status = outcome.get("status").and_then(Value::as_str).unwrap_or("?");
             let duration = format_duration_ms(elapsed.unwrap_or(0));
             if !executed || status == "skipped" {
+                let presentation = StagePresentation::new(StageOutcome::Skipped, styles);
                 return Some(format!(
                     "{ts} {} {}  {}",
-                    styles.dim.apply_to("\u{2298}"),
+                    presentation.glyph,
                     styles.bold.apply_to(label),
-                    styles.dim.apply_to("skipped"),
+                    presentation.label.unwrap_or_default(),
                 ));
             }
             match status {
                 "success" | "partial_success" => {
+                    let outcome_kind = if status == "partial_success" {
+                        StageOutcome::PartiallySucceeded
+                    } else {
+                        StageOutcome::Succeeded
+                    };
+                    let presentation = StagePresentation::new(outcome_kind, styles);
                     let mut line = format!(
                         "{ts} {} {}",
-                        styles.green.apply_to("\u{2713}"),
+                        presentation.glyph,
                         styles.bold.apply_to(label),
                     );
-                    if status == "partial_success" {
-                        let _ = write!(line, "  {}", styles.yellow.apply_to("partial"));
+                    if let Some(label) = presentation.label {
+                        let _ = write!(line, "  {label}");
                     }
                     let _ = write!(line, "  {duration}");
                     if let Some(usage) = usage_summary(outcome, styles) {
@@ -362,13 +370,19 @@ pub(crate) fn format_pretty(
                     Some(line)
                 }
                 other => {
+                    let presentation = StagePresentation::new(
+                        StageOutcome::Failed {
+                            retry_requested: false,
+                        },
+                        styles,
+                    );
                     let error = outcome
                         .pointer("/failure/message")
                         .and_then(Value::as_str)
                         .unwrap_or(other);
                     Some(format!(
                         "{ts} {} {}  {}",
-                        styles.red.apply_to("\u{2717}"),
+                        presentation.glyph,
                         styles.bold.apply_to(label),
                         styles.red.apply_to(error),
                     ))
@@ -905,6 +919,14 @@ fn millis(recorded_at: u64) -> DateTime<Utc> {
 
 /// `run events` for a Petri run: the stream, filtered by `--since` and
 /// `--tail`, raw or pretty, then followed live when asked.
+///
+/// The stream is read page by page and each page is written as it arrives,
+/// so a read stopped part-way has already printed every item it received.
+/// `--tail` alone reads only the pages that hold the newest items: the
+/// stream's newest item says where it ends, and the listing is read from
+/// that many items before it. With `--since` as well, which items are the
+/// last matching ones is known only at the end of the stream, so that read
+/// keeps the newest matching items as it pages and prints them last.
 pub(crate) async fn print_events(
     client: &server_client::Client,
     run_id: &RunId,
@@ -913,32 +935,155 @@ pub(crate) async fn print_events(
     pretty: bool,
     styles: &Styles,
 ) -> Result<()> {
-    let items = client
-        .list_run_stream(run_id, 0)
-        .await
-        .context("Failed to list the run's stream")?;
-    let last_seq = items.last().map_or(0, |item| item.stream_seq);
-    let mut selected: Vec<&RunStreamItem> = items
-        .iter()
-        .filter(|item| since.is_none_or(|cutoff| PetriItem::new(item).recorded_at() >= cutoff))
-        .collect();
-    if let Some(tail) = args.tail {
-        let start = selected.len().saturating_sub(tail);
-        selected.drain(..start);
-    }
-
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    let mut state = PrettyState::default();
-    for item in selected {
-        write_item(&mut out, item, pretty, styles, &mut state)?;
-    }
-    out.flush()?;
+    let mut printer = Printer {
+        out: &mut out,
+        pretty,
+        styles,
+        state: PrettyState::default(),
+    };
+    let last_seq = match (args.tail, since) {
+        (Some(tail), None) => print_tail(client, run_id, tail, &mut printer).await?,
+        (Some(tail), Some(cutoff)) => {
+            print_tail_since(client, run_id, tail, cutoff, &mut printer).await?
+        }
+        (None, since) => print_since(client, run_id, since, &mut printer).await?,
+    };
+    let state = printer.state;
 
     if args.follow {
         Box::pin(follow(client, run_id, last_seq, pretty, styles, state)).await?;
     }
     Ok(())
+}
+
+/// Where `run events` writes the items it read, and how.
+struct Printer<'a> {
+    out:    &'a mut dyn Write,
+    pretty: bool,
+    styles: &'a Styles,
+    state:  PrettyState,
+}
+
+impl Printer<'_> {
+    /// Write the items and flush them, so they are out before the next
+    /// page is asked for.
+    fn print<'i>(&mut self, items: impl IntoIterator<Item = &'i RunStreamItem>) -> Result<()> {
+        for item in items {
+            write_item(self.out, item, self.pretty, self.styles, &mut self.state)?;
+        }
+        self.out.flush()?;
+        Ok(())
+    }
+}
+
+/// The newest `tail` items, page by page from `tail` items before the
+/// stream's newest one. Returns the last `stream_seq` printed (the newest
+/// item's, when `tail` is zero), or 0 for an empty stream.
+async fn print_tail(
+    client: &server_client::Client,
+    run_id: &RunId,
+    tail: usize,
+    printer: &mut Printer<'_>,
+) -> Result<u64> {
+    let newest = client
+        .list_run_stream_tail_page(run_id, 1)
+        .await
+        .context("Failed to read the end of the run's stream")?;
+    let Some(end) = newest.items.last().map(|item| item.stream_seq) else {
+        return Ok(0);
+    };
+    // `stream_seq` is dense, so the newest `tail` items are the ones past
+    // `end - tail`, up to `end`: the ones that land meanwhile are left to
+    // `--follow`.
+    let mut cursor = end.saturating_sub(u64::try_from(tail).unwrap_or(u64::MAX));
+    while cursor < end {
+        let remaining = usize::try_from(end - cursor).unwrap_or(usize::MAX);
+        let page = client
+            .list_run_stream_page(run_id, cursor, Some(remaining))
+            .await
+            .context("Failed to list the run's stream")?;
+        let Some(last) = page.items.last().map(|item| item.stream_seq) else {
+            break;
+        };
+        printer.print(page.items.iter().filter(|item| item.stream_seq <= end))?;
+        cursor = last;
+        if !page.has_more {
+            break;
+        }
+    }
+    Ok(end)
+}
+
+/// Every item recorded at or after `since` (every item without it), page
+/// by page from the stream's first. Returns the last `stream_seq` read.
+async fn print_since(
+    client: &server_client::Client,
+    run_id: &RunId,
+    since: Option<DateTime<Utc>>,
+    printer: &mut Printer<'_>,
+) -> Result<u64> {
+    let mut cursor = 0;
+    loop {
+        let page = client
+            .list_run_stream_page(run_id, cursor, None)
+            .await
+            .context("Failed to list the run's stream")?;
+        let Some(last) = page.items.last().map(|item| item.stream_seq) else {
+            break;
+        };
+        printer.print(page.items.iter().filter(|item| recorded_since(item, since)))?;
+        cursor = last;
+        if !page.has_more {
+            break;
+        }
+    }
+    Ok(cursor)
+}
+
+/// The newest `tail` items recorded at or after `since`: the whole stream
+/// is read, keeping only those, and they are printed at its end. Returns
+/// the last `stream_seq` read.
+async fn print_tail_since(
+    client: &server_client::Client,
+    run_id: &RunId,
+    tail: usize,
+    since: DateTime<Utc>,
+    printer: &mut Printer<'_>,
+) -> Result<u64> {
+    let mut kept: VecDeque<RunStreamItem> = VecDeque::new();
+    let mut cursor = 0;
+    loop {
+        let page = client
+            .list_run_stream_page(run_id, cursor, None)
+            .await
+            .context("Failed to list the run's stream")?;
+        let Some(last) = page.items.last().map(|item| item.stream_seq) else {
+            break;
+        };
+        cursor = last;
+        let has_more = page.has_more;
+        for item in page.items {
+            if recorded_since(&item, Some(since)) {
+                if kept.len() == tail {
+                    kept.pop_front();
+                }
+                if tail > 0 {
+                    kept.push_back(item);
+                }
+            }
+        }
+        if !has_more {
+            break;
+        }
+    }
+    printer.print(&kept)?;
+    Ok(cursor)
+}
+
+fn recorded_since(item: &RunStreamItem, since: Option<DateTime<Utc>>) -> bool {
+    since.is_none_or(|cutoff| PetriItem::new(item).recorded_at() >= cutoff)
 }
 
 fn write_item(
@@ -1329,7 +1474,8 @@ mod tests {
     #[test]
     fn redacted_raw_lines_keep_the_typed_run_id() {
         let run_id = "01M5228EHCT0P73Z4BYGDRWJNS";
-        let mut event = petri(1, json!({"record": {"body": {"value": run_id}}}));
+        let secret = "xK9mZ2vL8nQ5rT1wY4bC7dF0gH3jE6p";
+        let mut event = petri(1, json!({"record": {"body": {"value": secret}}}));
         event.run_id = run_id.parse().expect("a valid run ID");
 
         let line = raw_line(&event).expect("a redacted line");
@@ -1337,5 +1483,26 @@ mod tests {
         assert_eq!(decoded.run_id, event.run_id);
         assert_eq!(decoded.stream_seq, event.stream_seq);
         assert_eq!(decoded.item["record"]["body"]["value"], "REDACTED");
+    }
+
+    #[test]
+    fn raw_lines_preserve_run_ids_that_cross_the_entropy_threshold() {
+        // This ID has enough distinct characters to read as a secret to the
+        // entropy scanner; the Web UI link and run branch must survive.
+        let run_id = "01M5228EHCT0P73Z4BYGDRWJNS";
+        for (kind, field, text) in [
+            (
+                "run.created",
+                "web_url",
+                format!("http://localhost:3000/runs/{run_id}"),
+            ),
+            ("run.branch", "run_branch", format!("fabro/run/{run_id}")),
+        ] {
+            let mut event = platform(1, &json!({"kind": kind, field: text, "content": run_id}));
+            event.run_id = run_id.parse().expect("a valid run ID");
+            let line = raw_line(&event).expect("a redacted line");
+            let decoded: RunStreamItem = serde_json::from_str(&line).expect("a valid stream item");
+            assert_eq!(decoded, event);
+        }
     }
 }

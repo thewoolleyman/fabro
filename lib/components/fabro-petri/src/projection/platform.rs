@@ -9,7 +9,7 @@ use fabro_store::platform_records::{
     PlatformRecord, RunLifecycleKind, RunLifecycleRecord, StoredPlatformRecord,
 };
 use fabro_types::{
-    CheckpointRecord as ViewCheckpoint, Conclusion, FailureCategory, FailureDetail, FailureReason,
+    CheckpointRecord as ViewCheckpoint, Conclusion, FailureDetail, FailureReason,
     PullRequestCreation, PullRequestCreationStatus, PullRequestLink, RunApproval, RunApprovalState,
     RunArtifact, RunControlAction, RunDiff, RunFailure, RunProjection, RunSandbox, RunStatus,
     StageOutcome, format_blob_ref,
@@ -306,7 +306,7 @@ fn fold_lifecycle(projection: &mut RunProjection, record: &RunLifecycleRecord, a
                                     .reason
                                     .clone()
                                     .unwrap_or_else(|| "the run failed".to_string()),
-                                FailureCategory::Deterministic,
+                                super::run_failure_category(reason, record.reason.as_deref()),
                             ),
                         }),
                     ),

@@ -204,10 +204,11 @@ pub struct SandboxPluginSettings {
     pub env:          BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inherit_env:  Vec<String>,
-    /// The host name or address the plugin's sandboxes use to reach
-    /// services on the Fabro host.
+    /// The sandbox every process scope on this provider is built from, in
+    /// sandbox-driver's `SandboxSpec` schema. Petri names each sandbox and
+    /// lays the run's environment and size over it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host_address: Option<String>,
+    pub process_spec: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

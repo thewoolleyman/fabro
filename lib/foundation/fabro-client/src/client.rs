@@ -20,6 +20,7 @@ use fabro_util::exit::{ErrorExt, ExitClass};
 use futures::future::BoxFuture;
 use futures::{Stream, StreamExt};
 use lithos_llm::catalog::ProviderId;
+use lithos_llm::client::ProbeReport;
 use lithos_llm::types::ReasoningEffort;
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -85,6 +86,9 @@ pub struct RewindRunResult {
 #[derive(Default)]
 struct ListStoreRunsOptions {
     parent_id: Option<RunId>,
+    /// Board columns to ask the server for. Empty asks for every run,
+    /// archived ones included.
+    columns:   Vec<types::BoardColumn>,
 }
 
 #[derive(Clone)]
@@ -912,7 +916,7 @@ impl Client {
         provider: Option<&ProviderId>,
         mode: Option<ModelTestMode>,
         reasoning_effort: Option<ReasoningEffort>,
-    ) -> Result<types::ModelTestResult> {
+    ) -> Result<ProbeReport> {
         let response = self
             .send_api(|client| async move {
                 let mut request = client.test_model().id(id.to_string());
@@ -1328,6 +1332,23 @@ impl Client {
     pub async fn list_store_runs_by_parent(&self, parent_id: RunId) -> Result<Vec<Run>> {
         self.list_store_runs_with_options(ListStoreRunsOptions {
             parent_id: Some(parent_id),
+            ..ListStoreRunsOptions::default()
+        })
+        .await
+    }
+
+    /// Lists only the runs in the given board columns, filtered on the
+    /// server through the list endpoint's `status` parameter, so the client
+    /// never downloads runs it would discard. An empty `columns` lists every
+    /// run, as [`Self::list_store_runs`] does.
+    pub async fn list_store_runs_in_columns(
+        &self,
+        parent_id: Option<RunId>,
+        columns: &[types::BoardColumn],
+    ) -> Result<Vec<Run>> {
+        self.list_store_runs_with_options(ListStoreRunsOptions {
+            parent_id,
+            columns: columns.to_vec(),
         })
         .await
     }
@@ -1340,17 +1361,20 @@ impl Client {
         let mut offset = 0_u64;
         let limit = 100_u64;
         let parent_id = options.parent_id.map(|run_id| run_id.to_string());
+        let columns = options.columns;
 
         loop {
             let response = self
                 .send_api(|client| {
                     let parent_id = parent_id.clone();
+                    let columns = columns.clone();
                     async move {
-                        let mut request = client
-                            .list_runs()
-                            .page_limit(limit)
-                            .page_offset(offset)
-                            .include_archived(true);
+                        let mut request = client.list_runs().page_limit(limit).page_offset(offset);
+                        request = if columns.is_empty() {
+                            request.include_archived(true)
+                        } else {
+                            request.status(columns)
+                        };
                         if let Some(parent_id) = parent_id {
                             request = request.parent_id(parent_id);
                         }
@@ -1727,6 +1751,31 @@ impl Client {
                 let mut request = client.list_run_events().id(run_id.to_string()).after(after);
                 let page_limit = limit.map(|limit| limit.min(1000));
                 if let Some(limit) = page_limit.and_then(non_zero_u64_from_usize) {
+                    request = request.limit(limit);
+                }
+                request.send().await
+            })
+            .await?;
+        let page = response.into_inner();
+        Ok(RunStreamPage {
+            items:                  page.data,
+            has_more:               page.meta.has_more,
+            event_contract_version: Some(page.event_contract_version),
+        })
+    }
+
+    /// The newest page of a Petri run's stream: its last `limit` items (at
+    /// most 1000), in order. `has_more` says whether older items precede
+    /// the page.
+    pub async fn list_run_stream_tail_page(
+        &self,
+        run_id: &RunId,
+        limit: usize,
+    ) -> Result<RunStreamPage> {
+        let response = self
+            .send_api(|client| async move {
+                let mut request = client.list_run_events().id(run_id.to_string()).tail(true);
+                if let Some(limit) = non_zero_u64_from_usize(limit.min(1000)) {
                     request = request.limit(limit);
                 }
                 request.send().await
@@ -2484,6 +2533,86 @@ mod tests {
             environments[0].settings.provider,
             SandboxProviderKind::DAYTONA
         );
+    }
+
+    fn run_summary_json(run_id: &str, goal: &str) -> serde_json::Value {
+        json!({
+            "id": run_id,
+            "title": "Compressed run",
+            "goal": goal,
+            "workflow": { "slug": "compressed", "name": "Compressed", "graph_name": null },
+            "repository": { "name": "repo", "origin_url": null, "provider": "unknown" },
+            "created_by": {
+                "kind": "user",
+                "identity": { "issuer": "fabro:test", "subject": "test-user" },
+                "login": "test",
+                "auth_method": "dev_token"
+            },
+            "origin": { "kind": "api" },
+            "labels": {},
+            "lifecycle": {
+                "status": { "kind": "running" },
+                "pending_control": null,
+                "queue_position": null,
+                "error": null,
+                "archived": false,
+                "archived_at": null
+            },
+            "models": [],
+            "source_directory": "/srv/repo",
+            "timestamps": {
+                "created_at": "2026-11-04T00:00:00Z",
+                "started_at": "2026-11-04T00:00:00Z",
+                "last_event_at": null,
+                "completed_at": null
+            },
+            "timing": null,
+            "usage": {"tokens": {"input": 0, "output": 0, "reasoning": 0, "cache_read": 0, "cache_write": 0}},
+            "diff": null,
+            "pull_request": null,
+            "current_question": null,
+            "superseded_by": null,
+            "links": { "web": null }
+        })
+    }
+
+    #[tokio::test]
+    async fn list_store_runs_requests_and_decodes_a_gzip_compressed_body() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+
+        let run_id = RunId::new().to_string();
+        let goal = "a long goal that compresses well ".repeat(64);
+        let body = json!({
+            "data": [run_summary_json(&run_id, &goal)],
+            "meta": { "has_more": false }
+        })
+        .to_string();
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        std::io::copy(&mut body.as_bytes(), &mut encoder).unwrap();
+        let compressed = encoder.finish().unwrap();
+        assert!(compressed.len() < body.len());
+
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/api/v1/runs")
+                    .header_includes("accept-encoding", "gzip");
+                then.status(200)
+                    .header("content-type", "application/json")
+                    .header("content-encoding", "gzip")
+                    .body(compressed);
+            })
+            .await;
+        let client = Client::new_no_proxy(&server.url("")).unwrap();
+
+        let runs = client.list_store_runs().await.unwrap();
+
+        mock.assert_async().await;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id.to_string(), run_id);
+        assert_eq!(runs[0].goal, goal);
     }
 
     #[tokio::test]

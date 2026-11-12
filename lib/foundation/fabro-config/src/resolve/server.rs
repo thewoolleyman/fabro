@@ -101,7 +101,7 @@ pub fn resolve_sandbox(
                 args:         layer.args.clone().unwrap_or_default(),
                 env:          layer.env.clone().unwrap_or_default(),
                 inherit_env:  layer.inherit_env.clone().unwrap_or_default(),
-                host_address: layer.host_address.clone(),
+                process_spec: layer.process_spec.clone(),
             }),
         });
     }
@@ -123,7 +123,7 @@ fn reject_plugin_fields_for_bundled(
         args,
         env,
         inherit_env,
-        host_address,
+        process_spec,
     } = layer;
     let set = [
         ("path", plugin_path.is_some()),
@@ -132,7 +132,7 @@ fn reject_plugin_fields_for_bundled(
         ("args", args.is_some()),
         ("env", env.is_some()),
         ("inherit_env", inherit_env.is_some()),
-        ("host_address", host_address.is_some()),
+        ("process_spec", process_spec.is_some()),
     ];
     for (field, is_set) in set {
         if is_set {

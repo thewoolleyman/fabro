@@ -44,9 +44,9 @@ use fabro_types::{GitIdentitySource, RunId, SandboxProviderKind};
 use object_store::local::LocalFileSystem;
 use petri_execution::inspect::{self, RunInspection};
 use petri_store::{Access, MemoryRunStore, RunKey, RunStore as _};
+use tokio::fs;
 use tokio::process::Command;
 use tokio::sync::{Notify, Semaphore};
-use tokio::{fs, time};
 use tokio_util::sync::CancellationToken;
 
 mod support;
@@ -456,6 +456,46 @@ async fn every_finish_is_committed_and_recorded() {
         .await
         .expect("the run-end hooks wrote their log");
     assert_eq!(run_end, "run_complete\nsandbox_cleanup\n");
+}
+
+#[tokio::test]
+async fn oversized_only_artifacts_warn_once_and_unmatched_or_disabled_capture_stays_quiet() {
+    for patterns in [vec!["assets/**"], vec!["reports/**"], vec![]] {
+        let should_warn = patterns == ["assets/**"];
+        let mut harness = Harness::new().await;
+        harness.artifacts = patterns.into_iter().map(str::to_string).collect();
+        let workflow = workflow(
+            r#"  write [shape=parallelogram, script="mkdir -p assets && dd if=/dev/zero of=assets/large.bin bs=1048576 count=10 && printf x >> assets/large.bin"]
+  keep [shape=parallelogram, script="test -f assets/large.bin"]"#,
+            "  start -> write -> keep -> exit",
+        );
+        let outcome = harness.run(&workflow, SETTINGS).await;
+        assert_eq!(outcome.status, RunStatus::Success, "{outcome:?}");
+        let records = harness.records.records(&harness.run_id);
+        assert!(
+            !records
+                .iter()
+                .any(|stored| matches!(stored.record, PlatformRecord::ArtifactCollected(_)))
+        );
+        let notices: Vec<_> = records
+            .iter()
+            .filter_map(|stored| match &stored.record {
+                PlatformRecord::RunNotice(notice)
+                    if notice.code == "artifact_size_limit_exceeded" =>
+                {
+                    Some(notice)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices.len(), usize::from(should_warn));
+        if should_warn {
+            assert_eq!(
+                notices[0].message,
+                "Skipped artifact \"assets/large.bin\": 10485761 bytes exceeds the 10 MiB limit (10485760 bytes)."
+            );
+        }
+    }
 }
 
 /// The files under `[run.artifacts] include` are collected once per
@@ -1704,12 +1744,11 @@ async fn required_publication_blocks_the_terminal_result_and_cleanup() {
                 )
                 .await
         });
-        time::timeout(
-            std::time::Duration::from_secs(15),
-            publisher.entered.notified(),
-        )
-        .await
-        .expect("publication reaches the gate");
+        // Wait on the event itself, with no deadline of our own: `entered` is
+        // notified with `notify_one`, whose permit outlives an early notify,
+        // and a publication that never reaches the gate is a hang for the
+        // test runner's timeout, never a verdict host load can decide.
+        publisher.entered.notified().await;
         let pending = harness.inspection().await;
         assert!(pending.required_finalization);
         assert!(

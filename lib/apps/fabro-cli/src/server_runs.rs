@@ -3,9 +3,23 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use fabro_api::types::BoardColumn;
 use fabro_types::{Run, RunId, RunStatus};
 
 use crate::server_client::Client;
+
+/// The board columns that hold every status [`RunStatus::is_active`] accepts:
+/// submitted and pending map to `pending`, starting to `initializing`, and
+/// paused to `running`. `fabro ps` without `-a` asks the server for only
+/// these columns instead of downloading the whole board.
+pub(crate) const ACTIVE_BOARD_COLUMNS: [BoardColumn; 6] = [
+    BoardColumn::Pending,
+    BoardColumn::Runnable,
+    BoardColumn::Initializing,
+    BoardColumn::Running,
+    BoardColumn::Blocked,
+    BoardColumn::Removing,
+];
 
 #[derive(Debug, Clone)]
 pub(crate) struct ServerRunInfo {
@@ -102,16 +116,23 @@ pub(crate) struct ServerRunLookup {
 }
 
 impl ServerRunLookup {
-    pub(crate) async fn from_client(client: Arc<Client>) -> Result<Self> {
-        let runs = client.list_store_runs().await?;
-        Ok(Self::from_runs(runs))
-    }
-
-    pub(crate) async fn from_client_by_parent(
+    /// Loads the runs `fabro ps` can display. With `active_only`, the server
+    /// is asked for only the board columns holding active statuses
+    /// ([`ACTIVE_BOARD_COLUMNS`]); otherwise every run is listed, archived
+    /// ones included.
+    pub(crate) async fn from_client(
         client: Arc<Client>,
-        parent_id: RunId,
+        parent_id: Option<RunId>,
+        active_only: bool,
     ) -> Result<Self> {
-        let runs = client.list_store_runs_by_parent(parent_id).await?;
+        let columns: &[BoardColumn] = if active_only {
+            &ACTIVE_BOARD_COLUMNS
+        } else {
+            &[]
+        };
+        let runs = client
+            .list_store_runs_in_columns(parent_id, columns)
+            .await?;
         Ok(Self::from_runs(runs))
     }
 

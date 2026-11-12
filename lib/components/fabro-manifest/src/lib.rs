@@ -13,6 +13,7 @@ mod workflow_version_packager;
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use fabro_api::types;
@@ -326,6 +327,9 @@ pub struct GitRunTargetObservation {
     pub run_target:         Option<GitRunTarget>,
     /// Whether the target's exact commit was proven available, and if not, why.
     pub exact_commit:       ExactCommitStatus,
+    /// The credential-redacted stderr of the last failed push of the attached
+    /// branch, when the best-effort push was attempted and failed.
+    pub push_stderr:        Option<String>,
     pub legacy_git_context: GitContext,
 }
 
@@ -353,30 +357,48 @@ pub enum ExactCommitStatus {
 /// returned observation with no target means Git facts were available but the
 /// effective origin or attached branch cannot be represented by a valid
 /// GitHub run target. For a valid target, this operation may contact the
-/// remote and may make one noninteractive best-effort push of the attached
-/// branch so clone-based execution can resolve the observed commit.
+/// remote and may make a noninteractive best-effort push of the attached
+/// branch so clone-based execution can resolve the observed commit; a push
+/// the origin rejects with a transient server-side failure is retried a
+/// bounded number of times with backoff.
 #[must_use]
 pub fn observe_git_run_target(
     repo_path: &Path,
     configured_repo_origin_url: Option<&str>,
+) -> Option<GitRunTargetObservation> {
+    observe_git_run_target_with_sleep(repo_path, configured_repo_origin_url, &mut blocking_sleep)
+}
+
+fn observe_git_run_target_with_sleep(
+    repo_path: &Path,
+    configured_repo_origin_url: Option<&str>,
+    sleep: &mut dyn FnMut(Duration),
 ) -> Option<GitRunTargetObservation> {
     let local = inspect_local_git(repo_path, configured_repo_origin_url)?;
     let legacy_git_context = local.legacy_git_context;
     let mut run_target =
         github_run_target(&legacy_git_context.origin_url, &legacy_git_context.branch);
     let mut exact_commit = ExactCommitStatus::Unpublished;
+    let mut push_stderr = None;
     if let Some(target) = run_target.as_mut() {
         let publish_status = publish_manifest_branch_best_effort(
             repo_path,
             &legacy_git_context.branch,
             local.push_origin_url.as_deref(),
             configured_repo_origin_url,
+            sleep,
         );
+        if let BranchPublishStatus::Unavailable {
+            push_stderr: Some(stderr),
+        } = &publish_status
+        {
+            push_stderr = Some(stderr.clone());
+        }
         let (sha, status) = remotely_available_sha(
             repo_path,
             &legacy_git_context.branch,
             legacy_git_context.sha.as_deref(),
-            publish_status,
+            &publish_status,
         );
         target.sha = sha;
         exact_commit = status;
@@ -385,6 +407,7 @@ pub fn observe_git_run_target(
     Some(GitRunTargetObservation {
         run_target,
         exact_commit,
+        push_stderr,
         legacy_git_context,
     })
 }
@@ -405,9 +428,13 @@ pub enum RunTargetDerivationError {
     #[error("the caller Git checkout cannot be represented as a canonical GitHub run target")]
     Unrepresentable,
     #[error(
-        "the exact local Git commit could not be made available from the canonical GitHub origin; push the commit and try again"
+        "the exact local Git commit could not be made available from the canonical GitHub origin; push the commit and try again{}",
+        push_stderr_detail(.push_stderr.as_deref())
     )]
-    Unpublished,
+    Unpublished {
+        /// The credential-redacted stderr of the last failed push attempt.
+        push_stderr: Option<String>,
+    },
     #[error(
         "the canonical GitHub origin could not be queried to confirm the exact local Git commit is available; check network access and credentials for the origin and try again"
     )]
@@ -463,6 +490,20 @@ pub fn derive_run_target_for_provider(
     canonical_cwd: &Path,
     configured_repo_origin_url: Option<&str>,
 ) -> std::result::Result<DerivedRunTarget, RunTargetDerivationError> {
+    derive_run_target_for_provider_with_sleep(
+        provider,
+        canonical_cwd,
+        configured_repo_origin_url,
+        &mut blocking_sleep,
+    )
+}
+
+fn derive_run_target_for_provider_with_sleep(
+    provider: &SandboxProviderKind,
+    canonical_cwd: &Path,
+    configured_repo_origin_url: Option<&str>,
+    sleep: &mut dyn FnMut(Duration),
+) -> std::result::Result<DerivedRunTarget, RunTargetDerivationError> {
     if !provider.clones_workspace() {
         let path = canonical_cwd
             .to_str()
@@ -476,7 +517,8 @@ pub fn derive_run_target_for_provider(
             dirty_worktree: false,
         });
     }
-    let Some(observation) = observe_git_run_target(canonical_cwd, configured_repo_origin_url)
+    let Some(observation) =
+        observe_git_run_target_with_sleep(canonical_cwd, configured_repo_origin_url, sleep)
     else {
         return Ok(DerivedRunTarget {
             target:         none_target_for_unversioned_directory(canonical_cwd)?,
@@ -494,7 +536,9 @@ pub fn derive_run_target_for_provider(
                 RunTargetDerivationError::ConfiguredOriginMismatch
             }
             ExactCommitStatus::Available | ExactCommitStatus::Unpublished => {
-                RunTargetDerivationError::Unpublished
+                RunTargetDerivationError::Unpublished {
+                    push_stderr: observation.push_stderr,
+                }
             }
         });
     }
@@ -619,6 +663,7 @@ fn build_legacy_git_context(
         &local.legacy_git_context.branch,
         local.push_origin_url.as_deref(),
         configured_repo_origin_url,
+        &mut blocking_sleep,
     );
     Some(local.legacy_git_context)
 }
@@ -725,28 +770,34 @@ fn detect_manifest_repo_info(repo_path: &Path) -> Option<ManifestRepoInfo> {
     })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum BranchPublishStatus {
     TrackingRefMatches,
     Pushed,
-    Unavailable,
+    /// The branch could not be published. `push_stderr` is the
+    /// credential-redacted stderr of the last push attempt, when one was made.
+    Unavailable {
+        push_stderr: Option<String>,
+    },
     /// The configured repository is not the checkout's origin, so the push
     /// is skipped entirely.
     OriginMismatch,
 }
 
 /// Best-effort publication of the local branch so clone-based execution can
-/// see local commits. A failed push must not fail manifest creation, and the
-/// discarded push error may contain raw Git stderr, so it is deliberately
-/// neither returned nor logged here.
+/// see local commits. A failed push must not fail manifest creation. A push
+/// the origin rejects with a transient server-side failure is retried; the
+/// last attempt's stderr is returned only after credential redaction, so the
+/// caller can say why the commit could not be published.
 fn publish_manifest_branch_best_effort(
     repo_path: &Path,
     branch: &str,
     origin_url: Option<&str>,
     configured_repo_origin_url: Option<&str>,
+    sleep: &mut dyn FnMut(Duration),
 ) -> BranchPublishStatus {
     let Some(origin_url) = origin_url else {
-        return BranchPublishStatus::Unavailable;
+        return BranchPublishStatus::Unavailable { push_stderr: None };
     };
 
     if let Some(repo_origin_url) = configured_repo_origin_url
@@ -763,18 +814,148 @@ fn publish_manifest_branch_best_effort(
         return BranchPublishStatus::TrackingRefMatches;
     }
 
-    if git::push_branch_noninteractive(repo_path, "origin", branch).is_ok() {
-        BranchPublishStatus::Pushed
-    } else {
-        BranchPublishStatus::Unavailable
+    let push = || {
+        git::push_branch_noninteractive(repo_path, "origin", branch).map_err(|err| match err {
+            fabro_workflow::Error::Engine { message, .. } => message
+                .strip_prefix("git push failed: ")
+                .map_or_else(|| message.clone(), str::to_owned),
+            other => other.to_string(),
+        })
+    };
+    match push_with_transient_retry(push, sleep) {
+        Ok(()) => BranchPublishStatus::Pushed,
+        Err(stderr) => BranchPublishStatus::Unavailable {
+            push_stderr: Some(redact_push_stderr(&stderr)),
+        },
     }
+}
+
+/// How many times the source-branch push is attempted when the origin keeps
+/// rejecting it with a transient server-side failure.
+const SOURCE_BRANCH_PUSH_ATTEMPTS: u32 = 3;
+/// The wait before the first retry; each later retry waits twice as long.
+const SOURCE_BRANCH_PUSH_INITIAL_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Run `push` until it succeeds, fails for a non-transient reason, or has been
+/// attempted [`SOURCE_BRANCH_PUSH_ATTEMPTS`] times. `push` returns the push
+/// stderr on failure; the last failure's stderr is returned.
+fn push_with_transient_retry(
+    mut push: impl FnMut() -> std::result::Result<(), String>,
+    sleep: &mut dyn FnMut(Duration),
+) -> std::result::Result<(), String> {
+    let mut backoff = SOURCE_BRANCH_PUSH_INITIAL_BACKOFF;
+    let mut attempt = 1;
+    loop {
+        match push() {
+            Ok(()) => return Ok(()),
+            Err(stderr)
+                if attempt < SOURCE_BRANCH_PUSH_ATTEMPTS
+                    && push_rejection_is_transient(&stderr) =>
+            {
+                tracing::warn!(
+                    attempt,
+                    max_attempts = SOURCE_BRANCH_PUSH_ATTEMPTS,
+                    backoff_secs = backoff.as_secs(),
+                    "Origin transiently rejected the source-branch push; retrying"
+                );
+                sleep(backoff);
+                backoff *= 2;
+                attempt += 1;
+            }
+            Err(stderr) => return Err(stderr),
+        }
+    }
+}
+
+/// Whether a failed push's stderr shows a transient server-side failure of the
+/// origin, which is worth retrying, rather than a refusal that would recur.
+fn push_rejection_is_transient(stderr: &str) -> bool {
+    stderr.lines().map(str::trim).any(|line| {
+        (line.contains("[remote rejected]")
+            && (line.ends_with("(Internal Server Error)") || line.ends_with("(failure)")))
+            || line.starts_with("remote: fatal error in commit_refs")
+            || line.starts_with("remote: Internal Server Error")
+            || line.contains("The requested URL returned error: 5")
+            || line.contains("RPC failed; HTTP 5")
+    })
+}
+
+const PUSH_STDERR_REDACTION: &str = "REDACTED";
+
+/// Remove credentials from push stderr before it is shown to the caller: the
+/// userinfo of any URL, GitHub token-shaped words, and `x-access-token` values.
+fn redact_push_stderr(stderr: &str) -> String {
+    let mut redacted = strip_url_userinfo(stderr);
+    for prefix in ["github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_"] {
+        redacted = mask_after(&redacted, prefix, false, |c| {
+            c.is_ascii_alphanumeric() || c == '_'
+        });
+    }
+    mask_after(&redacted, "x-access-token:", true, |c| {
+        !c.is_whitespace() && !matches!(c, '@' | '\'' | '"')
+    })
+}
+
+fn strip_url_userinfo(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(scheme_end) = rest.find("://") {
+        let authority_start = scheme_end + "://".len();
+        out.push_str(&rest[..authority_start]);
+        let after = &rest[authority_start..];
+        let authority_len = after
+            .find(|c: char| c == '/' || c.is_whitespace() || matches!(c, '\'' | '"' | '<' | '>'))
+            .unwrap_or(after.len());
+        let authority = &after[..authority_len];
+        out.push_str(
+            authority
+                .rfind('@')
+                .map_or(authority, |at| &authority[at + 1..]),
+        );
+        rest = &after[authority_len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Replace every `marker` and the run of `is_secret` characters after it with
+/// the redaction marker, keeping `marker` itself when `keep_marker` is set.
+fn mask_after(text: &str, marker: &str, keep_marker: bool, is_secret: fn(char) -> bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(marker) {
+        let after = &rest[start + marker.len()..];
+        let secret_len = after.find(|c: char| !is_secret(c)).unwrap_or(after.len());
+        out.push_str(&rest[..start]);
+        if keep_marker {
+            out.push_str(marker);
+        }
+        out.push_str(PUSH_STDERR_REDACTION);
+        rest = &after[secret_len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn push_stderr_detail(push_stderr: Option<&str>) -> String {
+    match push_stderr
+        .map(str::trim_end)
+        .filter(|stderr| !stderr.is_empty())
+    {
+        Some(stderr) => format!("\ngit push stderr from the last attempt:\n{stderr}"),
+        None => String::new(),
+    }
+}
+
+fn blocking_sleep(duration: Duration) {
+    std::thread::sleep(duration);
 }
 
 fn remotely_available_sha(
     repo_path: &Path,
     branch: &str,
     local_sha: Option<&str>,
-    publish_status: BranchPublishStatus,
+    publish_status: &BranchPublishStatus,
 ) -> (Option<String>, ExactCommitStatus) {
     let Some(local_sha) = local_sha else {
         return (None, ExactCommitStatus::Unpublished);
@@ -792,7 +973,7 @@ fn remotely_available_sha(
                 Err(_) => (None, ExactCommitStatus::Unverified),
             }
         }
-        BranchPublishStatus::Unavailable => (None, ExactCommitStatus::Unpublished),
+        BranchPublishStatus::Unavailable { .. } => (None, ExactCommitStatus::Unpublished),
         BranchPublishStatus::OriginMismatch => (None, ExactCommitStatus::ConfiguredOriginMismatch),
     }
 }
@@ -2217,6 +2398,273 @@ exit 1
 
         run_git(&workspace, &["checkout", "--detach", "--quiet"]);
         assert!(observe_git_run_target(&workspace, None).is_none());
+    }
+
+    #[test]
+    fn push_rejection_classifier_retries_only_server_side_failures() {
+        let transient = [
+            "remote: Internal Server Error\nremote: Request ID EBCA:245F99:1311D0:306A1F:6AEB05BC\nTo https://github.com/acme/widgets\n ! [remote rejected]   livespec/source/abc -> livespec/source/abc (Internal Server Error)\nerror: failed to push some refs",
+            "remote: fatal error in commit_refs\nTo https://github.com/acme/widgets\n ! [remote rejected]   livespec/source/abc -> livespec/source/abc (failure)\n",
+            " ! [remote rejected] feature -> feature (failure)",
+            "error: RPC failed; HTTP 500 curl 22 The requested URL returned error: 500\nfatal: the remote end hung up unexpectedly",
+            "fatal: unable to access 'https://github.com/acme/widgets/': The requested URL returned error: 502",
+        ];
+        for stderr in transient {
+            assert!(push_rejection_is_transient(stderr), "{stderr}");
+        }
+
+        let non_transient = [
+            "error: failed to push some refs to 'https://github.com/acme/widgets'",
+            "To https://github.com/acme/widgets\n ! [rejected]        feature -> feature (fetch first)\nhint: Updates were rejected because the remote contains work",
+            " ! [rejected]        feature -> feature (non-fast-forward)",
+            " ! [remote rejected] feature -> feature (pre-receive hook declined)",
+            "remote: Permission to acme/widgets.git denied to bot.\nfatal: unable to access 'https://github.com/acme/widgets/': The requested URL returned error: 403",
+            "pre-push refused: lint failed\nerror: failed to push some refs",
+            "fatal: 'origin' does not appear to be a git repository",
+            "",
+        ];
+        for stderr in non_transient {
+            assert!(!push_rejection_is_transient(stderr), "{stderr}");
+        }
+    }
+
+    #[test]
+    fn push_stderr_redaction_removes_credentials_and_keeps_the_diagnosis() {
+        let stderr = "fatal: unable to access 'https://bot:ghp_abcDEF123456@github.com/acme/widgets/': The requested URL returned error: 500\n\
+                      remote: token x-access-token:s3cr3t-value was used\n\
+                      remote: also ghs_SERVERTOKEN99 and github_pat_11ABC_def and gho_x\n\
+                      To https://x-access-token:tok@github.com/acme/widgets.git\n \
+                      ! [remote rejected] feature -> feature (Internal Server Error)";
+
+        let redacted = redact_push_stderr(stderr);
+
+        for secret in [
+            "bot:",
+            "ghp_abcDEF123456",
+            "s3cr3t-value",
+            "SERVERTOKEN99",
+            "github_pat_11ABC_def",
+            "gho_x",
+            ":tok@",
+        ] {
+            assert!(!redacted.contains(secret), "{secret} leaked: {redacted}");
+        }
+        assert!(
+            redacted.contains("'https://github.com/acme/widgets/'"),
+            "{redacted}"
+        );
+        assert!(
+            redacted.contains("x-access-token:REDACTED was used"),
+            "{redacted}"
+        );
+        assert!(
+            redacted.contains("To https://github.com/acme/widgets.git"),
+            "{redacted}"
+        );
+        assert!(
+            redacted.contains("! [remote rejected] feature -> feature (Internal Server Error)"),
+            "{redacted}"
+        );
+        assert_eq!(
+            redact_push_stderr("remote: Internal Server Error\n"),
+            "remote: Internal Server Error\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transiently_rejected_source_push_is_retried_until_the_origin_accepts_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let (workspace, bare_origin) = github_workspace_with_local_origin(temp.path());
+        let attempts = temp.path().join("attempts");
+        install_counting_hook(
+            &bare_origin.join("hooks/pre-receive"),
+            &attempts,
+            "if [ \"$n\" -le 2 ]; then\n  echo 'Internal Server Error' >&2\n  echo 'Request ID EBCA:245F99:1311D0:306A1F:6AEB05BC' >&2\n  exit 1\nfi\nexit 0",
+        );
+
+        let mut sleeps = Vec::new();
+        let derived = derive_run_target_for_provider_with_sleep(
+            &SandboxProviderKind::DAYTONA,
+            &workspace,
+            Some("https://github.com/acme/widgets"),
+            &mut |duration| sleeps.push(duration),
+        )
+        .expect("a push that succeeds on retry should yield an exact target");
+
+        let local_head = head_sha(&workspace).unwrap();
+        let RunTarget::Git(target) = derived.target else {
+            panic!("expected a Git target, got {:?}", derived.target);
+        };
+        assert_eq!(target.sha.as_deref(), Some(local_head.trim()));
+        assert_eq!(
+            bare_remote_branch_sha(&bare_origin, "feature").as_deref(),
+            Some(local_head.trim())
+        );
+        assert_eq!(read_attempts(&attempts), 3);
+        assert_eq!(sleeps, vec![Duration::from_secs(2), Duration::from_secs(4)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exhausted_transient_push_retries_report_the_last_attempt_stderr_redacted() {
+        let temp = tempfile::tempdir().unwrap();
+        let (workspace, bare_origin) = github_workspace_with_local_origin(temp.path());
+        let attempts = temp.path().join("attempts");
+        install_counting_hook(
+            &bare_origin.join("hooks/pre-receive"),
+            &attempts,
+            "echo 'Internal Server Error' >&2\necho \"fatal error in commit_refs attempt-$n via https://x-access-token:ghs_SECRETVALUE123@github.com/acme/widgets\" >&2\nexit 1",
+        );
+
+        let mut sleeps = Vec::new();
+        let err = derive_run_target_for_provider_with_sleep(
+            &SandboxProviderKind::DAYTONA,
+            &workspace,
+            Some("https://github.com/acme/widgets"),
+            &mut |duration| sleeps.push(duration),
+        )
+        .expect_err("a push the origin always rejects must not yield a target");
+
+        assert!(matches!(err, RunTargetDerivationError::Unpublished { .. }));
+        let message = err.to_string();
+        assert!(
+            message.starts_with(
+                "the exact local Git commit could not be made available from the canonical GitHub origin; push the commit and try again"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("remote: Internal Server Error"),
+            "{message}"
+        );
+        assert!(
+            message.contains(
+                "remote: fatal error in commit_refs attempt-3 via https://github.com/acme/widgets"
+            ),
+            "{message}"
+        );
+        assert!(!message.contains("attempt-2"), "{message}");
+        assert!(!message.contains("SECRETVALUE"), "{message}");
+        assert!(!message.contains("ghs_"), "{message}");
+        assert_eq!(read_attempts(&attempts), 3);
+        assert_eq!(sleeps, vec![Duration::from_secs(2), Duration::from_secs(4)]);
+        assert_eq!(bare_remote_branch_sha(&bare_origin, "feature"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pre_push_hook_refusal_is_attempted_once_and_reported() {
+        let temp = tempfile::tempdir().unwrap();
+        let (workspace, bare_origin) = github_workspace_with_local_origin(temp.path());
+        let attempts = temp.path().join("attempts");
+        install_counting_hook(
+            &workspace.join(".git/hooks/pre-push"),
+            &attempts,
+            "echo 'pre-push refused: lint failed' >&2\nexit 1",
+        );
+
+        let mut sleeps = Vec::new();
+        let err = derive_run_target_for_provider_with_sleep(
+            &SandboxProviderKind::DAYTONA,
+            &workspace,
+            Some("https://github.com/acme/widgets"),
+            &mut |duration| sleeps.push(duration),
+        )
+        .expect_err("a refused push must not yield a target");
+
+        let message = err.to_string();
+        assert!(
+            message.starts_with(
+                "the exact local Git commit could not be made available from the canonical GitHub origin"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("pre-push refused: lint failed"),
+            "{message}"
+        );
+        assert_eq!(read_attempts(&attempts), 1);
+        assert!(sleeps.is_empty(), "{sleeps:?}");
+        assert_eq!(bare_remote_branch_sha(&bare_origin, "feature"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_fast_forward_rejection_is_attempted_once_and_reported() {
+        let temp = tempfile::tempdir().unwrap();
+        let (workspace, bare_origin) = github_workspace_with_local_origin(temp.path());
+        let other = temp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        init_git_repo(&other, "feature", bare_origin.to_str().unwrap());
+        run_git(&other, &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "--quiet",
+            "-m",
+            "remote-only",
+        ]);
+        run_git(&other, &["push", "origin", "feature"]);
+        let diverged = bare_remote_branch_sha(&bare_origin, "feature");
+        let attempts = temp.path().join("attempts");
+        install_counting_hook(&workspace.join(".git/hooks/pre-push"), &attempts, "exit 0");
+
+        let mut sleeps = Vec::new();
+        let err = derive_run_target_for_provider_with_sleep(
+            &SandboxProviderKind::DAYTONA,
+            &workspace,
+            Some("https://github.com/acme/widgets"),
+            &mut |duration| sleeps.push(duration),
+        )
+        .expect_err("a non-fast-forward push must not yield a target");
+
+        let message = err.to_string();
+        assert!(message.contains("! [rejected]"), "{message}");
+        assert!(message.contains("feature -> feature"), "{message}");
+        assert_eq!(read_attempts(&attempts), 1);
+        assert!(sleeps.is_empty(), "{sleeps:?}");
+        assert_eq!(bare_remote_branch_sha(&bare_origin, "feature"), diverged);
+    }
+
+    /// A checkout whose origin is the GitHub URL of `acme/widgets`, rewritten
+    /// to a local bare repository so pushes reach a real Git server.
+    fn github_workspace_with_local_origin(root: &Path) -> (PathBuf, PathBuf) {
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let bare_origin = init_bare_origin(root);
+        init_git_repo(&workspace, "feature", "https://github.com/acme/widgets");
+        let local_url = format!("file://{}", bare_origin.display());
+        run_git(&workspace, &[
+            "config",
+            &format!("url.{local_url}.insteadOf"),
+            "https://github.com/acme/widgets",
+        ]);
+        (workspace, bare_origin)
+    }
+
+    /// Install an executable hook that bumps the attempt counter in `attempts`
+    /// into `$n` and then runs `body`.
+    #[cfg(unix)]
+    fn install_counting_hook(hook: &Path, attempts: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = format!(
+            "#!/bin/sh\nn=$(cat '{counter}' 2>/dev/null || echo 0)\nn=$((n + 1))\necho \"$n\" > '{counter}'\n{body}\n",
+            counter = attempts.display(),
+        );
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(hook, script).unwrap();
+        let mut permissions = std::fs::metadata(hook).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(hook, permissions).unwrap();
+    }
+
+    fn read_attempts(attempts: &Path) -> u32 {
+        std::fs::read_to_string(attempts).map_or(0, |count| count.trim().parse().unwrap())
     }
 
     fn init_git_repo(path: &Path, branch: &str, origin_url: &str) {

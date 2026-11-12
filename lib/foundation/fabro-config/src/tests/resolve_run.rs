@@ -106,7 +106,6 @@ fn resolves_run_defaults_from_empty_settings() {
 
     assert_eq!(settings.execution.mode, RunMode::Normal);
     assert_eq!(settings.execution.approval, ApprovalMode::Prompt);
-    assert_eq!(settings.prepare.timeout_ms, 300_000);
     assert_eq!(settings.environment.id, "default");
     assert_eq!(settings.environment.provider, SandboxProviderKind::DOCKER);
     assert_eq!(
@@ -822,6 +821,68 @@ issues = "read"
             permissions.get("issues"),
             Some(&InterpString::parse("read"))
         );
+    }
+
+    #[test]
+    fn a_selected_github_app_resolves_to_its_secret_names() {
+        let resolved = super::workflow_settings_from_layer(parse_settings(
+            r#"
+_version = 1
+
+[run.integrations.github.app]
+app_id_secret = "HOMELAB_APP_ID"
+private_key_secret = "HOMELAB_APP_KEY"
+"#,
+        ))
+        .expect("a selected App source should resolve")
+        .run;
+        let app = resolved
+            .integrations
+            .github
+            .app
+            .expect("the selected source survives resolution");
+        assert_eq!(app.app_id_secret, "HOMELAB_APP_ID");
+        assert_eq!(app.private_key_secret, "HOMELAB_APP_KEY");
+    }
+
+    #[test]
+    fn no_selected_github_app_keeps_the_server_integration() {
+        let resolved = super::workflow_settings_from_layer(parse_settings("_version = 1\n"))
+            .expect("empty settings resolve")
+            .run;
+        assert!(resolved.integrations.github.app.is_none());
+    }
+
+    #[test]
+    fn a_selected_github_app_missing_a_secret_name_fails_naming_the_field() {
+        let errors = super::workflow_settings_from_layer(parse_settings(
+            r#"
+_version = 1
+
+[run.integrations.github.app]
+app_id_secret = "HOMELAB_APP_ID"
+"#,
+        ))
+        .expect_err("a selected source must name both secrets");
+        let message = errors.to_string();
+        assert!(
+            message.contains("run.integrations.github.app.private_key_secret"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_selected_github_app_rejects_an_unknown_key() {
+        let result = r#"
+_version = 1
+
+[run.integrations.github.app]
+app_id_secret = "HOMELAB_APP_ID"
+private_key_secret = "HOMELAB_APP_KEY"
+private_key = "-----BEGIN RSA PRIVATE KEY-----"
+"#
+        .parse::<SettingsLayer>();
+        assert!(result.is_err(), "a raw key value is not an accepted field");
     }
 
     #[test]

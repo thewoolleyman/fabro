@@ -189,7 +189,7 @@ impl RunView {
                         failure_message
                             .clone()
                             .unwrap_or_else(|| "the run failed".to_string()),
-                        FailureCategory::Deterministic,
+                        super::run_failure_category(reason, failure_message.as_deref()),
                     ),
                 }),
             ),

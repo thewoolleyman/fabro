@@ -26,8 +26,9 @@
 //! daemon.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -50,7 +51,7 @@ use sandbox_driver::{
 };
 use sandbox_driver_host::HostProvider;
 use sandbox_driver_protocol::{PluginConfig, PluginSupervisor};
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex, OnceCell};
 use tokio::time;
 
 /// The label Petri stamps on every sandbox it creates for a run, carrying
@@ -190,15 +191,69 @@ pub(crate) async fn connect_provider(
             })?;
             // The supervisor is the provider: it launches the executable now,
             // so a misconfigured plugin fails at connect time, and relaunches
-            // it after a crash for new work only.
-            Arc::new(
-                PluginSupervisor::launch(PLUGIN_BINARY_PREFIX, plugin_config(driver_kind, plugin))
+            // it after a crash for new work only. It is SHARED for the
+            // process's life, never one per call: see `PluginProviders`.
+            let key = format!("{kind}\u{0}{plugin:?}");
+            PLUGIN_PROVIDERS
+                .get_or_launch(key, || async {
+                    let supervisor = PluginSupervisor::launch(
+                        PLUGIN_BINARY_PREFIX,
+                        plugin_config(driver_kind, plugin),
+                    )
                     .await
-                    .map_err(driver)?,
-            )
+                    .map_err(driver)?;
+                    Ok(Arc::new(supervisor) as Arc<dyn SandboxProvider>)
+                })
+                .await?
         }
     })
 }
+
+/// The plugin providers this server process shares: one supervisor per
+/// provider kind and launch configuration, kept for the process's life.
+///
+/// WHY ONE IS KEPT. A sandbox handle a plugin supervisor returns holds only
+/// the plugin's protocol client. The plugin PROCESS belongs to the
+/// supervisor's generation and is spawned `kill_on_drop`. A supervisor
+/// built for one call and dropped when that call returned therefore
+/// SIGKILLed the plugin under the handle it had just returned, and the
+/// handle's next call failed with "plugin response transport closed". Every
+/// server-side access to a plugin-backed run's sandbox (file copy, ssh,
+/// describe) failed that way, while run workers, which keep their provider
+/// for the run's life, did not (bd-ib-m7lxgn). The supervisor's own contract
+/// is "Share one for the application's lifetime"; it relaunches a closed
+/// plugin before the next call, so a kept supervisor stays usable.
+///
+/// The key carries the whole launch configuration, so a changed plugin path,
+/// digest, argument or environment launches a new supervisor rather than
+/// reusing one built from settings that no longer apply. A launch that
+/// fails is not kept, so the next call tries again.
+#[derive(Default)]
+struct PluginProviders {
+    entries: Mutex<BTreeMap<String, Arc<dyn SandboxProvider>>>,
+}
+
+impl PluginProviders {
+    async fn get_or_launch<F, Fut>(
+        &self,
+        key: String,
+        launch: F,
+    ) -> Result<Arc<dyn SandboxProvider>, ConnectError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Arc<dyn SandboxProvider>, ConnectError>>,
+    {
+        let mut entries = self.entries.lock().await;
+        if let Some(provider) = entries.get(&key) {
+            return Ok(Arc::clone(provider));
+        }
+        let provider = launch().await?;
+        entries.insert(key, Arc::clone(&provider));
+        Ok(provider)
+    }
+}
+
+static PLUGIN_PROVIDERS: LazyLock<PluginProviders> = LazyLock::new(PluginProviders::default);
 
 fn plugin_config(kind: ProviderKind, settings: &SandboxPluginSettings) -> PluginConfig {
     PluginConfig {
@@ -1246,6 +1301,51 @@ mod tests {
         assert_eq!(sandbox.id(), &derived);
     }
 
+    /// A plugin provider is launched once per configuration and the same
+    /// one answers every later call, so a handle it returned is never left
+    /// over a killed plugin; a failed launch is not kept (bd-ib-m7lxgn).
+    #[tokio::test]
+    async fn a_plugin_provider_is_launched_once_and_kept_for_later_calls() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let providers = PluginProviders::default();
+        let launches = AtomicUsize::new(0);
+        let launch = || async {
+            launches.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(HostProvider::new()) as Arc<dyn SandboxProvider>)
+        };
+        let first = providers
+            .get_or_launch("k8s\u{0}a".to_owned(), launch)
+            .await
+            .expect("the first call launches");
+        let second = providers
+            .get_or_launch("k8s\u{0}a".to_owned(), launch)
+            .await
+            .expect("the second call reuses");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a later call must get the provider that is still alive, not a fresh one"
+        );
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        drop(first);
+        assert!(
+            Arc::strong_count(&second) >= 2,
+            "the shared provider outlives every caller's reference"
+        );
+
+        let failed = providers
+            .get_or_launch("k8s\u{0}b".to_owned(), || async {
+                Err(ConnectError::Disabled { kind: kind("k8s") })
+            })
+            .await;
+        assert!(failed.is_err());
+        let retried = providers
+            .get_or_launch("k8s\u{0}b".to_owned(), launch)
+            .await;
+        assert!(retried.is_ok(), "a failed launch is not kept");
+        assert_eq!(launches.load(Ordering::SeqCst), 2);
+    }
+
     #[test]
     fn plugin_config_carries_every_launch_setting() {
         let config = plugin_config(
@@ -1257,7 +1357,7 @@ mod tests {
                 args:         vec!["--flag".to_string()],
                 env:          BTreeMap::from([("A".to_string(), "1".to_string())]),
                 inherit_env:  vec!["PATH".to_string()],
-                host_address: None,
+                process_spec: None,
             },
         );
         assert_eq!(

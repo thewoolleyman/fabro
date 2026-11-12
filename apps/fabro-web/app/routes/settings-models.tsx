@@ -31,6 +31,7 @@ import { formatContextWindow, formatTokensPerSecond } from "../lib/format";
 import {
   modelOfferingKey,
   modelOfferingTestArgs,
+  providerNamesById,
 } from "../lib/model-offerings";
 import { useDebouncedValue } from "../hooks/effects";
 
@@ -244,11 +245,7 @@ function ModelsSection({ providers }: { providers: Provider[] }) {
 
   const { data, isLoading } = useModels(providerFilter, debouncedSearch);
 
-  const providerNameById = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const p of providers) map.set(p.id, p.display_name || p.id);
-    return map;
-  }, [providers]);
+  const providerNameById = useMemo(() => providerNamesById(providers), [providers]);
 
   const rows = useMemo(() => {
     const all = (data?.data ?? []).filter((m) => m.configured);
@@ -313,22 +310,19 @@ function ModelsSection({ providers }: { providers: Provider[] }) {
             modelsApi.testModel(...modelOfferingTestArgs(offering)),
           );
           if (
-            result.provider !== offering.provider ||
-            result.model_id !== offering.id
+            result.route !== null &&
+            result.route !== `${offering.provider}/${offering.id}`
           ) {
             outcome = {
-              phase:   "error",
-              message: `Server tested unexpected offering ${result.provider}/${result.model_id}`,
+              phase: "error",
+              message: `Server tested unexpected offering ${result.route}`,
             };
-          } else if (result.status === "ok") {
+          } else if (result.outcome.status === "passed") {
             outcome = { phase: "ok" };
-          } else if (result.status === "error") {
-            outcome = {
-              phase:   "error",
-              message: result.error_message ?? "Failed",
-            };
+          } else if (result.outcome.status === "failed") {
+            outcome = { phase: "error", message: result.outcome.error.message };
           } else {
-            outcome = { phase: "error", message: "provider not configured" };
+            outcome = { phase: "error", message: result.outcome.detail };
           }
         } catch (err) {
           outcome = {

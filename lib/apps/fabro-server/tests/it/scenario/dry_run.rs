@@ -58,7 +58,7 @@ async fn dry_run_serve_starts_and_runs_workflow() {
 }
 
 #[tokio::test]
-async fn test_model_known_but_unavailable_returns_bad_request() {
+async fn test_model_known_but_unavailable_returns_a_probe_finding() {
     let app = test_app_with_no_providers();
 
     let req = Request::builder()
@@ -71,15 +71,12 @@ async fn test_model_known_but_unavailable_returns_bad_request() {
     let response = app.oneshot(req).await.unwrap();
     let body = response_json(
         response,
-        StatusCode::BAD_REQUEST,
+        StatusCode::OK,
         "POST /api/v1/models/claude-opus-4.6/test",
     )
     .await;
-    assert!(
-        body["errors"][0]["detail"]
-            .as_str()
-            .is_some_and(|detail| detail.contains("no offering on an eligible provider"))
-    );
+    assert_eq!(body["outcome"]["status"], "failed");
+    assert_eq!(body["outcome"]["error"]["kind"], "model_selection");
 }
 
 #[tokio::test]
@@ -94,12 +91,13 @@ async fn test_model_unknown_via_full_router() {
         .unwrap();
 
     let response = app.oneshot(req).await.unwrap();
-    response_status(
+    let body = response_json(
         response,
-        StatusCode::NOT_FOUND,
+        StatusCode::OK,
         "POST /api/v1/models/nonexistent-model-xyz/test",
     )
     .await;
+    assert_eq!(body["outcome"]["error"]["kind"], "model_selection");
 }
 
 #[tokio::test]
@@ -165,6 +163,48 @@ async fn completion_non_streaming_returns_valid_json() {
     assert!(body["content"].is_array());
     assert!(body["usage"]["input"].is_number());
     assert!(body["usage"]["output"].is_number());
+}
+
+/// A provider name in the model field, or a selector the catalog does not
+/// know, is refused before any provider is called. Neither may pass through
+/// to whichever ready provider wins priority.
+#[tokio::test]
+async fn completion_with_a_bare_provider_or_unknown_selector_is_rejected_before_any_call() {
+    let mock_server = MockServer::start_async().await;
+    let anthropic = mock_server
+        .mock_async(|when, then| {
+            when.method("POST").path("/v1/messages");
+            then.status(500);
+        })
+        .await;
+    let app = test_app_with_mock_anthropic(&format!("{}/v1", mock_server.url("")));
+
+    for (model, expected_detail) in [
+        ("gemini", "set provider = \"gemini\""),
+        ("anthropic", "set provider = \"anthropic\""),
+        (
+            "not-a-real-model",
+            "unknown model selector 'not-a-real-model'",
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(completion_request_with_model(false, model))
+            .await
+            .unwrap();
+        let body = response_json(
+            response,
+            StatusCode::BAD_REQUEST,
+            &format!("POST /api/v1/completions with model {model}"),
+        )
+        .await;
+        let detail = body["errors"][0]["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains(expected_detail),
+            "model {model}: unexpected detail {detail:?}"
+        );
+    }
+    assert_eq!(anthropic.calls_async().await, 0);
 }
 
 #[tokio::test]

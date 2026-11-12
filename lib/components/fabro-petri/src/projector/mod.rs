@@ -64,7 +64,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use fabro_db::DbPool;
+use fabro_db::{BatchedDelete, DbPool, DeleteBatches};
 use fabro_store::platform_records::{PlatformRecordStore, now_ms};
 use fabro_store::{RunProjection, RunSummaryStore};
 use fabro_types::{RunId, RunStreamItem};
@@ -283,44 +283,68 @@ impl Projector {
         stream::stream_after(&self.pool, run_id, after, limit).await
     }
 
+    /// The newest end of the run's stream past the cursor: the last
+    /// `limit` items with `stream_seq > after`, in `stream_seq` order, each
+    /// in Fabro's envelope.
+    pub async fn stream_tail(
+        &self,
+        run_id: RunId,
+        after: u64,
+        limit: usize,
+    ) -> Result<Vec<RunStreamItem>, ProjectError> {
+        stream::stream_tail(&self.pool, run_id, after, limit).await
+    }
+
     /// Delete everything the store and the view tables hold for the run:
     /// its Petri records and lease, its platform records, its projection
     /// and its stream. The caller has ended the run's worker, so no writer
     /// holds the lease.
+    ///
+    /// The rows go in short batches, each its own write transaction
+    /// ([`fabro_db::delete_in_batches`] with [`DeleteBatches::DEFAULT`]): a
+    /// run with many records on a large store would otherwise hold the
+    /// database's write lock past the busy timeout, and every other run's
+    /// record append would fail with "database is locked" meanwhile.
     pub async fn delete_run(&self, run_id: RunId) -> Result<(), ProjectError> {
+        self.delete_run_in_batches(run_id, DeleteBatches::DEFAULT)
+            .await
+            .map(|_| ())
+    }
+
+    /// [`Self::delete_run`] with the batch pacing named, reporting the rows
+    /// deleted and the write transactions committed.
+    ///
+    /// The projection row goes first, so the read side stops serving the
+    /// view before its stream thins out, and the run's lease row goes last,
+    /// so a delete cut short between batches leaves a run that still exists
+    /// and that a repeated delete finishes.
+    pub async fn delete_run_in_batches(
+        &self,
+        run_id: RunId,
+        batches: DeleteBatches,
+    ) -> Result<BatchedDelete, ProjectError> {
         // Under the run's pass lock: no pass reads the rows being deleted,
         // and no cache outlives them.
         let pass = self.caches.pass_of(run_id);
         let mut cache = pass.lock().await;
         *cache = None;
         let id = run_id.to_string();
-        let mut views = self.pool.begin().await.map_err(ProjectError::Database)?;
-        for delete in [
-            "DELETE FROM petri_stream WHERE run_id = ?",
-            "DELETE FROM petri_projection WHERE run_id = ?",
-            "DELETE FROM platform_records WHERE run_id = ?",
+        let mut done = BatchedDelete::default();
+        for (pool, table) in [
+            (&self.pool, "petri_projection"),
+            (&self.pool, "petri_stream"),
+            (&self.pool, "platform_records"),
+            (&self.records, "petri_records"),
+            (&self.records, "petri_runs"),
         ] {
-            sqlx::query(delete)
-                .bind(&id)
-                .execute(&mut *views)
+            let deleted = fabro_db::delete_in_batches(pool, table, "run_id", &id, batches)
                 .await
                 .map_err(ProjectError::Database)?;
+            done.rows += deleted.rows;
+            done.transactions += deleted.transactions;
         }
-        views.commit().await.map_err(ProjectError::Database)?;
-        let mut records = self.records.begin().await.map_err(ProjectError::Database)?;
-        for delete in [
-            "DELETE FROM petri_records WHERE run_id = ?",
-            "DELETE FROM petri_runs WHERE run_id = ?",
-        ] {
-            sqlx::query(delete)
-                .bind(&id)
-                .execute(&mut *records)
-                .await
-                .map_err(ProjectError::Database)?;
-        }
-        records.commit().await.map_err(ProjectError::Database)?;
         sync::lock(&self.slots).remove(&run_id);
-        Ok(())
+        Ok(done)
     }
 
     /// The last delivery sequence the run's view holds, or `None` when no

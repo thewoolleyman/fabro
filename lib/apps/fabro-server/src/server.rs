@@ -87,7 +87,7 @@ use fabro_store::{
 #[cfg(test)]
 use fabro_types::BlockedReason;
 use fabro_types::settings::RunNamespace;
-use fabro_types::settings::run::NotificationRouteSettings;
+use fabro_types::settings::run::{NotificationRouteSettings, RunGithubAppSource};
 use fabro_types::settings::server::{
     GithubIntegrationSettings, GithubIntegrationStrategy, LogDestination,
 };
@@ -1576,7 +1576,9 @@ impl AppState {
             daytona_api_key.map(|key| self.daytona_credentials(key)),
             |name| self.config_env_lookup(name),
         )
-        .with_plugins(&self.server_settings().server.sandbox.providers)
+        .with_plugins(&self.server_settings().server.sandbox.providers, |name| {
+            self.config_env_lookup(name)
+        })
     }
 
     /// [`Self::sandbox_provider_config`] for a server-side prune of
@@ -1688,6 +1690,40 @@ impl AppState {
     pub(crate) fn session_key(&self) -> Option<Key> {
         self.server_secret(EnvVars::SESSION_SECRET)
             .and_then(|value| auth::derive_cookie_key(value.as_bytes()).ok())
+    }
+
+    /// The App credentials a run's `[run.integrations.github.app]` selects,
+    /// read from this server's vault by the secret names it carries. An
+    /// absent or empty secret is an error naming the secret, never a
+    /// fallback to the server's own integration.
+    pub(crate) async fn selected_github_app_credentials(
+        &self,
+        source: &RunGithubAppSource,
+    ) -> anyhow::Result<fabro_github::GitHubCredentials> {
+        let read = |name: String| async move {
+            self.vault_secret(&name)
+                .await
+                .map_err(anyhow::Error::new)?
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "the run selects GitHub App secret `{name}`, which is absent or empty in \
+                         the server's vault"
+                    )
+                })
+        };
+        let app_id = read(source.app_id_secret.clone()).await?;
+        let raw = read(source.private_key_secret.clone()).await?;
+        let private_key_pem =
+            decode_secret_pem(&source.private_key_secret, &raw).map_err(anyhow::Error::msg)?;
+        Ok(fabro_github::GitHubCredentials::App(
+            fabro_github::GitHubAppCredentials {
+                app_id,
+                private_key_pem,
+                slug: None,
+            },
+        ))
     }
 
     pub(crate) async fn github_credentials(
