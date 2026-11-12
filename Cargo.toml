@@ -225,3 +225,14 @@ petri-runtime = { git = "https://github.com/thewoolleyman/petri.git", branch = "
 petri-steps = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
 petri-store = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
 petri-testkit = { git = "https://github.com/thewoolleyman/petri.git", branch = "fabro-integration-f30a12df-20261108" }
+
+# bd-ib-tcdmkr (RUSTSEC-2026-0459): sqlx main carries launchbadge/sqlx#4502, which lifts
+# sqlx-sqlite's libsqlite3-sys bound to <0.40; no sqlx release carries it yet.
+[patch.crates-io]
+sqlx = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-core = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-macros = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-macros-core = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-mysql = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-postgres = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
+sqlx-sqlite = { git = "https://github.com/launchbadge/sqlx", rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c" }
