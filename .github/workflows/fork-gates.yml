@@ -139,4 +139,7 @@ jobs:
       # (run 42130472837). tini -s makes the test run its own subreaper.
       - run: apt-get update && apt-get install -y --no-install-recommends tini
       - run: tini -s -- cargo nextest run --locked --workspace --status-level slow --profile ci
-      - run: sccache --show-stats
+      # Print the stats even when a test fails, so the job always reports its
+      # sccache hit fraction (ci-cache-optimization, m5m2dl, run 43488425688).
+      - if: always()
+        run: sccache --show-stats
