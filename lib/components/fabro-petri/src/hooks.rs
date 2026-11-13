@@ -127,6 +127,7 @@ use crate::prepare::{self, PrepareBlock};
 use crate::projection;
 use crate::recovery::{self, Plan, RecoveryError, RestoreTarget};
 use crate::run_turn::RunTurns;
+use crate::sandbox_loss::{self, SandboxLoss};
 use crate::source::RunSource;
 use crate::workspace::{self, WorkspaceLookup, WorkspaceLookupError};
 
@@ -486,6 +487,10 @@ pub struct FabroHooks {
     prepare:            Option<PrepareBlock>,
     /// Where the prepare steps' secret references resolve from.
     secrets:            Option<Arc<dyn SecretProvider>>,
+    /// The run lifetime's lost sandbox, which fences the run's store: a
+    /// checkpoint commit that meets a lost sandbox trips it rather than
+    /// failing the run ([`crate::sandbox_loss`]). `None` fails the run.
+    sandbox_loss:       Option<Arc<SandboxLoss>>,
 }
 
 impl FabroHooks {
@@ -553,6 +558,7 @@ impl FabroHooks {
             run_key,
             prepare: None,
             secrets: None,
+            sandbox_loss: None,
         }
     }
 
@@ -638,6 +644,16 @@ impl FabroHooks {
     #[must_use]
     pub fn with_run_turns(mut self, run_turns: Arc<RunTurns>) -> Self {
         self.run_turns = Some(run_turns);
+        self
+    }
+
+    /// The lost sandbox the run's store is fenced by: a checkpoint commit
+    /// whose sandbox the provider no longer has trips it, which ends the
+    /// run's lifetime before the stage's finish is recorded, so the server
+    /// resumes the run onto a re-acquired sandbox.
+    #[must_use]
+    pub fn with_sandbox_loss(mut self, sandbox_loss: Arc<SandboxLoss>) -> Self {
+        self.sandbox_loss = Some(sandbox_loss);
         self
     }
 

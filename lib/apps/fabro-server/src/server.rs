@@ -280,6 +280,11 @@ struct ManagedRun {
     /// life. Each time, the run resumes, up to
     /// `petri_runs::MAX_STORE_INTERRUPTIONS`.
     store_interruptions: u32,
+    /// How many times a stage's sandbox was lost under the run in this
+    /// server's life, counted apart from `store_interruptions`. Each time,
+    /// the run resumes onto a re-acquired sandbox, up to
+    /// `petri_runs::MAX_SANDBOX_LOSSES`.
+    sandbox_losses: u32,
 }
 
 impl ManagedRun {
@@ -3679,6 +3684,7 @@ fn managed_run(
         run_dir: Some(run_dir),
         execution_mode,
         store_interruptions: 0,
+        sandbox_losses: 0,
     }
 }
 

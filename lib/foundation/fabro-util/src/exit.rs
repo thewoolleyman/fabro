@@ -7,6 +7,11 @@ pub enum ExitClass {
     /// can get past: a run worker whose run's store failed, which leaves
     /// the run for the server to resume. `EX_TEMPFAIL` from `sysexits.h`.
     Interrupted,
+    /// A run worker whose stage's sandbox was lost under it: the provider
+    /// no longer has the sandbox, and the run is left for the server to
+    /// resume onto a re-acquired one, counted apart from a failed store.
+    /// `EX_UNAVAILABLE` from `sysexits.h`.
+    SandboxLost,
 }
 
 impl ExitClass {
@@ -16,6 +21,7 @@ impl ExitClass {
         match self {
             Self::AuthRequired => 4,
             Self::Interrupted => 75,
+            Self::SandboxLost => 69,
         }
     }
 }

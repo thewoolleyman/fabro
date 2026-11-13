@@ -86,6 +86,7 @@ pub mod run_graph;
 pub mod run_store;
 pub mod run_turn;
 pub mod runtime;
+pub mod sandbox_loss;
 pub mod secrets;
 pub mod source;
 pub mod stage_credentials;

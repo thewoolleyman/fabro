@@ -83,6 +83,13 @@ impl WorkerExit {
     pub(crate) fn interrupted(&self) -> bool {
         self.code == Some(ExitClass::Interrupted.code())
     }
+
+    /// Whether the worker ended the run's lifetime and not the run because
+    /// a stage's sandbox was lost, and the run resumes onto a re-acquired
+    /// sandbox ([`ExitClass::SandboxLost`]).
+    pub(crate) fn sandbox_lost(&self) -> bool {
+        self.code == Some(ExitClass::SandboxLost.code())
+    }
 }
 
 #[derive(Default)]

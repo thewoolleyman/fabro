@@ -34,7 +34,11 @@
 //! way back ([`resume_after_interruption`]): its worker exits with
 //! `EX_TEMPFAIL` and records no end, since a failed store write ends the
 //! run's lifetime and not the run, and the server resumes it, at most
-//! [`MAX_STORE_INTERRUPTIONS`] times.
+//! [`MAX_STORE_INTERRUPTIONS`] times. A run a stage's sandbox was lost under
+//! takes it too ([`resume_after_sandbox_loss`]): its worker exits with
+//! `EX_UNAVAILABLE`, the stage the loss interrupted has no end, and the
+//! server resumes the run onto a re-acquired sandbox, at most
+//! [`MAX_SANDBOX_LOSSES`] times, counted apart.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -535,6 +539,14 @@ pub(crate) async fn execute(state: Arc<AppState>, run_id: RunId) {
                 Err(failure) => failed(FailureReason::WorkflowError, failure),
             }
         }
+        // A stage's sandbox was lost: the run resumes onto a re-acquired
+        // sandbox, under its own count of losses.
+        Conclusion::SandboxLost { message } => {
+            match resume_after_sandbox_loss(&state, run_id, &message).await {
+                Ok(()) => return,
+                Err(failure) => failed(FailureReason::WorkflowError, failure),
+            }
+        }
         Conclusion::Succeeded => {
             info!(run_id = %run_id, "Petri run completed");
             (
@@ -566,6 +578,62 @@ pub(crate) async fn execute(state: Arc<AppState>, run_id: RunId) {
 /// Each interruption resumes the run; one more fails it, since a store that
 /// keeps failing is not a glitch a resume gets past.
 pub(crate) const MAX_STORE_INTERRUPTIONS: u32 = 3;
+
+/// How many times a stage's sandbox may be lost under a run in one server's
+/// life, counted apart from [`MAX_STORE_INTERRUPTIONS`]. Each loss resumes
+/// the run onto a re-acquired sandbox; one more fails it, since a sandbox
+/// lost again on every re-acquire is not a loss a resume gets past.
+pub(crate) const MAX_SANDBOX_LOSSES: u32 = 3;
+
+/// Why a run's lifetime ended short of the run's end, with nothing recorded
+/// after it: each cause resumes the run under its own count.
+#[derive(Clone, Copy, Debug)]
+enum Interruption {
+    /// A write to the run's store failed.
+    Store,
+    /// A stage's sandbox was lost: the provider no longer has it.
+    SandboxLost,
+}
+
+impl Interruption {
+    /// How many of these the run resumes from in one server's life.
+    fn limit(self) -> u32 {
+        match self {
+            Self::Store => MAX_STORE_INTERRUPTIONS,
+            Self::SandboxLost => MAX_SANDBOX_LOSSES,
+        }
+    }
+
+    /// Count one more on the run, and return the count.
+    fn count(self, managed_run: &mut super::ManagedRun) -> u32 {
+        let count = match self {
+            Self::Store => &mut managed_run.store_interruptions,
+            Self::SandboxLost => &mut managed_run.sandbox_losses,
+        };
+        *count += 1;
+        *count
+    }
+
+    /// The failure to record when the run does not resume.
+    fn failure(self, message: &str) -> String {
+        match self {
+            Self::Store => format!("The run's store failed: {message}"),
+            Self::SandboxLost => format!("The run's sandbox was lost: {message}"),
+        }
+    }
+
+    /// The failure to record past [`limit`](Self::limit).
+    fn repeated(self, count: u32, message: &str) -> String {
+        match self {
+            Self::Store => {
+                format!("The run's store failed {count} times; the last failure: {message}")
+            }
+            Self::SandboxLost => {
+                format!("The run's sandbox was lost {count} times; the last loss: {message}")
+            }
+        }
+    }
+}
 
 /// Bring a Petri run the server left in flight back to its worker after a
 /// restart: the run continues from its records, as Petri's own resume does,
@@ -622,25 +690,51 @@ pub(crate) async fn resume_after_interruption(
     run_id: RunId,
     message: &str,
 ) -> Result<(), String> {
-    let interrupted = format!("The run's store failed: {message}");
+    resume_interrupted(state, run_id, Interruption::Store, message).await
+}
+
+/// Resume a run a stage's sandbox was lost under, onto a re-acquired
+/// sandbox: its worker (or the in-process engine) ended the run's lifetime
+/// before the stage's finish was recorded, so the stage runs again and the
+/// stages finished before the loss do not. The run goes back to the
+/// scheduler through the same [`relaunch`] a restart takes.
+///
+/// `Err` with the failure to record when the run does not resume, as for
+/// [`resume_after_interruption`], or once its sandbox was lost more than
+/// [`MAX_SANDBOX_LOSSES`] times, counted apart from its store's
+/// interruptions.
+pub(crate) async fn resume_after_sandbox_loss(
+    state: &Arc<AppState>,
+    run_id: RunId,
+    message: &str,
+) -> Result<(), String> {
+    resume_interrupted(state, run_id, Interruption::SandboxLost, message).await
+}
+
+/// Resume a run whose lifetime `cause` ended short of its end.
+async fn resume_interrupted(
+    state: &Arc<AppState>,
+    run_id: RunId,
+    cause: Interruption,
+    message: &str,
+) -> Result<(), String> {
+    let interrupted = cause.failure(message);
     let interruptions = {
         let mut runs = state.runs.lock().expect("runs lock poisoned");
         let Some(managed_run) = runs.get_mut(&run_id) else {
             return Err(interrupted);
         };
-        managed_run.store_interruptions += 1;
-        managed_run.store_interruptions
+        cause.count(managed_run)
     };
-    if interruptions > MAX_STORE_INTERRUPTIONS {
+    if interruptions > cause.limit() {
         warn!(
             run_id = %run_id,
             interruptions,
+            ?cause,
             error = message,
-            "the run's store keeps failing; reporting the run failed"
+            "the run keeps being interrupted; reporting the run failed"
         );
-        return Err(format!(
-            "The run's store failed {interruptions} times; the last failure: {message}"
-        ));
+        return Err(cause.repeated(interruptions, message));
     }
     if state.is_shutting_down() {
         return Err(interrupted);
@@ -668,9 +762,10 @@ pub(crate) async fn resume_after_interruption(
     warn!(
         run_id = %run_id,
         interruptions,
+        ?cause,
         error = message,
         mode = super::worker_mode_arg(mode),
-        "the run's store interrupted it; resuming it as after a crash"
+        "the run was interrupted; resuming it as after a crash"
     );
     {
         let mut runs = state.runs.lock().expect("runs lock poisoned");

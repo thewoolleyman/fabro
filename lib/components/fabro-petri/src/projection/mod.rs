@@ -395,6 +395,24 @@ pub fn is_sandbox_transport_failure(message: &str) -> bool {
         .any(|fragment| message.contains(fragment))
 }
 
+/// Message fragments a run that ended on a LOST sandbox carries: the engine's
+/// and the server's own words for it. A stage's sandbox the provider no
+/// longer has says nothing about the work item; the run resumes onto a
+/// re-acquired sandbox, and one that still ends on a loss is released for a
+/// retry rather than charged to the item (Scenario 367,
+/// livespec-orchestrator-beads-fabro bd-ib-gngz5d).
+const LOST_SANDBOX_FRAGMENTS: &[&str] =
+    &["the run's sandbox was lost", "The run's sandbox was lost"];
+
+/// Whether a run's failure message says the run's sandbox was lost.
+#[must_use]
+pub fn is_lost_sandbox_failure(message: &str) -> bool {
+    LOST_SANDBOX_FRAGMENTS
+        .iter()
+        .any(|fragment| message.contains(fragment))
+        || crate::sandbox_loss::names_lost_sandbox(message)
+}
+
 /// Message fragments a failure of the Fabro server's OWN run store carries.
 ///
 /// The server records "The run's store failed: ..." when a worker exits with
@@ -584,6 +602,26 @@ mod tests {
         ] {
             assert_eq!(
                 super::run_failure_category(fabro_types::FailureReason::Terminated, Some(message)),
+                fabro_types::FailureCategory::TransientInfra,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_that_ends_on_a_lost_sandbox_is_transient_infra() {
+        for message in [
+            "The run's sandbox was lost 4 times; the last loss: the run's sandbox was lost: the \
+             checkpoint commit of `implement` failed: git rev-parse failed (wait failed): sandbox \
+             exec failed: Sandbox \"petri-01m7a7g3aprtwpmsas30myab7k-l0\" was not found",
+            "the checkpoint commit of `implement` failed: git rev-parse failed (wait failed): \
+             sandbox exec failed: Sandbox \"petri-01m7a7g3aprtwpmsas30myab7k-l0\" was not found",
+        ] {
+            assert_eq!(
+                super::run_failure_category(
+                    fabro_types::FailureReason::WorkflowError,
+                    Some(message)
+                ),
                 fabro_types::FailureCategory::TransientInfra,
                 "{message}"
             );

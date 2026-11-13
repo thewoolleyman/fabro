@@ -25,6 +25,14 @@
 //! [`Conclusion::Interrupted`]: the caller records no end for the run, and
 //! the run resumes from its records, as after a crash.
 //!
+//! A stage whose sandbox the provider no longer has ends the lifetime the
+//! same way ([`sandbox_loss`](crate::sandbox_loss)): Fabro's hooks fence the
+//! run's store before the stage's finish is recorded, so the stage has no
+//! end and runs again on the resume. [`run`] returns
+//! [`RunError::SandboxLost`], and [`conclusion`] says
+//! [`Conclusion::SandboxLost`], which the server resumes under its own count
+//! of losses.
+//!
 //! What the caller supplies beyond the runtime: the interviewer its
 //! questions go to ([`interview`](crate::interview) in the worker and the
 //! server), the secret provider over the vault ([`secrets`](crate::secrets))
@@ -89,6 +97,7 @@ use crate::hooks::{FabroHooks, HooksSpec};
 use crate::prepare::PrepareBlock;
 use crate::run_turn::RunTurns;
 use crate::runtime::RuntimeSpec;
+use crate::sandbox_loss::SandboxLoss;
 use crate::secrets::SharedSecrets;
 use crate::{git_identity, projection};
 
@@ -192,6 +201,12 @@ pub enum RunError {
     /// from its records.
     #[error("the run's store failed: {0}")]
     StoreFailed(String),
+    /// A stage's sandbox was lost under it: the provider no longer has it.
+    /// The lifetime ended before the stage's finish was recorded; the run
+    /// did not end, and resumes from its records onto a re-acquired
+    /// sandbox.
+    #[error("the run's sandbox was lost: {0}")]
+    SandboxLost(String),
 }
 
 /// How Fabro reports the run: what its read side records as the run's
@@ -210,6 +225,11 @@ pub enum Conclusion {
     /// the run: the caller records no terminal event, and the run resumes
     /// from its records, as after a crash.
     Interrupted { message: String },
+    /// A stage's sandbox was lost, which ended this lifetime of the run and
+    /// not the run: the caller records no terminal event, and the run
+    /// resumes from its records onto a re-acquired sandbox. Counted apart
+    /// from [`Conclusion::Interrupted`].
+    SandboxLost { message: String },
 }
 
 fn network_policy(settings: &EnvironmentNetworkSettings) -> NetworkPolicy {
@@ -312,10 +332,14 @@ async fn run_on(
     options.sandbox.lost_sandbox = LostSandbox::Refuse;
     let resumed = matches!(request.execution, Execution::Resume(_));
     let prepare_secrets = request.secrets.clone();
+    // Every write of this lifetime goes through the fence Fabro's hooks
+    // close when a stage's sandbox is lost.
+    let sandbox_loss = Arc::new(SandboxLoss::default());
+    let store = sandbox_loss.fence(Arc::clone(&request.store));
     let mut runtime = request
         .runtime
         .runtime(true)
-        .store(Arc::clone(&request.store))
+        .store(Arc::clone(&store))
         .options(options);
     if let Some(secrets) = request.secrets {
         runtime = runtime.secrets(SharedSecrets(secrets));
@@ -361,11 +385,13 @@ async fn run_on(
             run_id,
             key.clone(),
             request.run_dir.clone(),
-            Arc::clone(&request.store),
+            Arc::clone(&store),
             resumed,
             request.blobs.clone(),
         );
-        let hooks = hooks.with_prepare(prepare, prepare_secrets);
+        let hooks = hooks
+            .with_prepare(prepare, prepare_secrets)
+            .with_sandbox_loss(Arc::clone(&sandbox_loss));
         Arc::new(match &run_turns {
             Some(run_turns) => hooks.with_run_turns(Arc::clone(run_turns)),
             None => hooks,
@@ -460,6 +486,14 @@ async fn run_on(
         Ok(report) => debug!(status = %report.status, "Petri run ended"),
         Err(error) => warn!(error = %error, "Petri run ended with a host error"),
     }
+    // A lost sandbox fenced the store, and whatever the lifetime ended on
+    // follows from that: the stage it interrupted has no end, and the run is
+    // not over.
+    if result.is_err() {
+        if let Some(lost) = sandbox_loss.lost() {
+            return Err(RunError::SandboxLost(lost.to_owned()));
+        }
+    }
     // The store holds what it held at the failure, and the run is not over:
     // there is no outcome to read back.
     if let Err(HostError::Coordinator(CoordinatorError::StoreFailed(message))) = result {
@@ -535,6 +569,9 @@ pub fn conclusion(result: &Result<RunOutcome, RunError>) -> Conclusion {
             }
         }
         Err(error @ RunError::StoreFailed(_)) => Conclusion::Interrupted {
+            message: error.to_string(),
+        },
+        Err(error @ RunError::SandboxLost(_)) => Conclusion::SandboxLost {
             message: error.to_string(),
         },
         Err(error) => Conclusion::Failed {
