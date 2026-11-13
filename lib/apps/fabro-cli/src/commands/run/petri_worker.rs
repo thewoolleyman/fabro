@@ -332,6 +332,17 @@ pub(super) async fn execute(worker: PetriWorker<'_>) -> Result<()> {
             warn!(run_id = %run_id, error = %message, "Petri run interrupted; the server resumes it");
             return Err(anyhow!("{message}").classify(ExitClass::Interrupted));
         }
+        Conclusion::SandboxLost { message } => {
+            // The run is not over either: the server resumes it onto a
+            // re-acquired sandbox, counting the loss apart from a failed
+            // store.
+            warn!(
+                run_id = %run_id,
+                error = %message,
+                "Petri run's sandbox was lost; the server resumes it onto a re-acquired sandbox"
+            );
+            return Err(anyhow!("{message}").classify(ExitClass::SandboxLost));
+        }
         Conclusion::Succeeded => {
             info!(run_id = %run_id, "Petri run completed");
             (

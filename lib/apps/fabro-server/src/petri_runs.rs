@@ -187,7 +187,7 @@ mod tests {
     use tower::ServiceExt as _;
 
     use super::*;
-    use crate::server::petri_runs::MAX_STORE_INTERRUPTIONS;
+    use crate::server::petri_runs::{MAX_SANDBOX_LOSSES, MAX_STORE_INTERRUPTIONS};
     use crate::server::{
         AppState, reconcile_incomplete_runs_on_startup, run_records, spawn_scheduler,
     };
@@ -928,6 +928,48 @@ mod tests {
             message.contains(&format!(
                 "The run's store failed {} times",
                 MAX_STORE_INTERRUPTIONS + 1
+            )),
+            "{message}"
+        );
+    }
+
+    /// A worker whose stage's sandbox was lost exits with `EX_UNAVAILABLE`:
+    /// the run is not over, and goes back to a worker in resume mode, onto a
+    /// re-acquired sandbox. Losses are counted apart from the store's
+    /// interruptions: a run its store interrupted as often as it may still
+    /// resumes after each of its first sandbox losses, and the next loss
+    /// fails it with a lost-sandbox cause.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_its_sandbox_was_lost_under_resumes_up_to_its_own_limit() {
+        let runtime = Arc::new(HeldWorkerRuntime::default());
+        let (state, app, run_id, token) = held_worker_run(&runtime).await;
+        run_to_running_as_worker(&app, run_id, &token).await;
+
+        for _ in 0..MAX_STORE_INTERRUPTIONS {
+            runtime.end_worker_with(Some(ExitClass::Interrupted.code()));
+            runtime.wait_for_start().await;
+            assert_eq!(runtime.launched_mode(), Some("resume"));
+        }
+        for _ in 0..MAX_SANDBOX_LOSSES {
+            runtime.end_worker_with(Some(ExitClass::SandboxLost.code()));
+            runtime.wait_for_start().await;
+            assert_eq!(
+                runtime.launched_mode(),
+                Some("resume"),
+                "a lost sandbox resumes the run"
+            );
+        }
+        runtime.end_worker_with(Some(ExitClass::SandboxLost.code()));
+
+        let (status, message) = terminal_status(&state, run_id).await;
+        assert_eq!(status, RunStatus::Failed {
+            reason: FailureReason::Terminated,
+        });
+        let message = message.expect("the failure has a message");
+        assert!(
+            message.contains(&format!(
+                "The run's sandbox was lost {} times",
+                MAX_SANDBOX_LOSSES + 1
             )),
             "{message}"
         );

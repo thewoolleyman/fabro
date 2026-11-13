@@ -26,7 +26,7 @@ use fabro_petri::checkpoint::{
     CHECKPOINT_FAILED_CLASS, CheckpointKey, RunGitSettings, RunWorkspaces, Site,
 };
 use fabro_petri::controls::RunControls;
-use fabro_petri::engine::{self, Execution, RunRequest, RunStatus};
+use fabro_petri::engine::{self, Conclusion, Execution, RunError, RunRequest, RunStatus};
 use fabro_petri::fork;
 use fabro_petri::hooks::{HooksSpec, Publication, RunPublisher};
 use fabro_petri::platform_records::{PlatformRecordError, PlatformRecords};
@@ -179,6 +179,19 @@ impl Harness {
         settings: &str,
         resumed: bool,
     ) -> engine::RunOutcome {
+        self.try_execute_on(provider, workflow, settings, resumed)
+            .await
+            .expect("the run executes")
+    }
+
+    /// [`execute_on`](Self::execute_on), with what the engine returned.
+    async fn try_execute_on(
+        &self,
+        provider: SandboxProviderKind,
+        workflow: &str,
+        settings: &str,
+        resumed: bool,
+    ) -> Result<engine::RunOutcome, RunError> {
         let (interviewer, observers) = no_questions();
         let hooks = self.hooks(&provider);
         let daytona = (provider == SandboxProviderKind::DAYTONA).then(|| {
@@ -212,7 +225,7 @@ impl Harness {
             blobs: Some(Arc::clone(&self.blobs) as Arc<dyn Blobs>),
             hooks: Some(hooks),
         };
-        engine::run(request).await.expect("the run executes")
+        engine::run(request).await
     }
 
     async fn inspection(&self) -> RunInspection {
@@ -800,6 +813,116 @@ async fn a_failed_checkpoint_ends_the_run_with_no_route() {
     assert!(
         matches!(&recovery, Recovery::Failed { reason } if reason.contains("checkpoint of wreck")),
         "{recovery:?}"
+    );
+}
+
+/// A stage's sandbox is lost under it: the provider no longer has the
+/// sandbox, so the stage's checkpoint commit fails with the provider's
+/// not-found (`Sandbox "<id>" was not found`, here the `git` the commit runs
+/// reporting it). The run's lifetime ends as a lost sandbox, before the
+/// stage's finish is recorded and with no end for the run, rather than as a
+/// failed checkpoint. The workspace survived, as a Kubernetes sandbox's does
+/// when its pod is deleted, and a resume runs the interrupted stage again
+/// and finishes the run; the stage that finished before the loss does not
+/// run again.
+#[tokio::test]
+async fn a_lost_sandbox_interrupts_the_run_and_a_resume_finishes_it() {
+    let harness = Harness::new().await;
+    let scratch_dir = tempfile::tempdir().expect("a temp dir");
+    let scratch = scratch_dir.path();
+    let before_runs = scratch.join("before.runs");
+    let saved_git = scratch.join("saved.git");
+    let lost_once = scratch.join("lost.once");
+    let lose = scratch.join("lose.sh");
+    // The first time, the stage leaves `.git` naming a Git directory whose
+    // path reads as the provider's not-found, so every Git command of the
+    // checkpoint fails as it does in a deleted pod; the real one is kept
+    // aside. Run again after the resume, it does its work.
+    std::fs::write(
+        &lose,
+        format!(
+            "if [ -e {once} ]; then echo back > out.txt; else touch {once} && mv .git {saved} && \
+             printf 'gitdir: Sandbox \"gone\" was not found\\n' > .git; fi\n",
+            once = lost_once.display(),
+            saved = saved_git.display(),
+        ),
+    )
+    .expect("the stage script is written");
+    let workflow = workflow(
+        &format!(
+            "  before [shape=parallelogram, script=\"echo once >> {}\"]\n  lose \
+             [shape=parallelogram, script=\"sh {}\"]",
+            before_runs.display(),
+            lose.display(),
+        ),
+        "  start -> before -> lose -> exit",
+    );
+
+    let first = harness
+        .try_execute_on(SandboxProviderKind::LOCAL, &workflow, SETTINGS, false)
+        .await;
+
+    assert!(
+        matches!(&first, Err(RunError::SandboxLost(message))
+            if message.contains("Sandbox \"gone\" was not found")),
+        "{first:?}"
+    );
+    assert!(
+        matches!(engine::conclusion(&first), Conclusion::SandboxLost { .. }),
+        "{first:?}"
+    );
+    let stored = engine::outcome_of(&*harness.store, &harness.run_id.to_string()).await;
+    assert!(
+        matches!(stored, Err(RunError::Unfinished(_))),
+        "nothing ended the run: {stored:?}"
+    );
+    let interrupted = stages(&harness.inspection().await);
+    assert!(
+        interrupted.contains(&("before".to_string(), "success".to_string())),
+        "the stage before the loss finished: {interrupted:?}"
+    );
+    assert!(
+        interrupted.iter().all(|(node, _)| node != "lose"),
+        "the stage the loss interrupted has no finish: {interrupted:?}"
+    );
+
+    // The pod is re-created over the surviving workspace.
+    let path = harness.workspace_path(&harness.workspace().await);
+    fs::remove_file(path.join(".git"))
+        .await
+        .expect("the stand-in is removed");
+    fs::rename(&saved_git, path.join(".git"))
+        .await
+        .expect("the workspace's repository is back");
+
+    let outcome = harness
+        .execute_on(SandboxProviderKind::LOCAL, &workflow, SETTINGS, true)
+        .await;
+
+    assert_eq!(outcome.status, RunStatus::Success, "{outcome:?}");
+    assert!(outcome.complete, "{:?}", outcome.incomplete);
+    assert_eq!(
+        fs::read_to_string(&before_runs)
+            .await
+            .expect("the first stage ran"),
+        "once\n",
+        "the stage finished before the loss did not run again"
+    );
+    assert_eq!(
+        fs::read_to_string(path.join("out.txt"))
+            .await
+            .expect("the interrupted stage ran again")
+            .trim(),
+        "back"
+    );
+    let finished = stages(&harness.inspection().await);
+    assert_eq!(
+        finished
+            .iter()
+            .filter(|(node, status)| node == "lose" && status == "success")
+            .count(),
+        1,
+        "{finished:?}"
     );
 }
 
