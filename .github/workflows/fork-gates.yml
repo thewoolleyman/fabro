@@ -103,6 +103,12 @@ jobs:
     # (bd-ib-adrhkf), so a hung test is stopped here. A cold build plus the full
     # suite measured about 17 minutes on 2026-11-06 (run 42195909423).
     timeout-minutes: 120
+    env:
+      # The job's own sccache server would idle out after its 600 s default
+      # during the test phase (about 717 s measured), so --show-stats and the
+      # hook's preStop job summary read a fresh, empty server (ci-cache-
+      # optimization, m5m2dl, run 43472471910). 0 keeps it alive for the job.
+      SCCACHE_IDLE_TIMEOUT: "0"
     container:
       image: buildpack-deps:noble
     permissions:
