@@ -4437,6 +4437,13 @@ async fn execute_run_subprocess(state: Arc<AppState>, run_id: RunId) {
             Ok(()) => return,
             Err(failure) => failure,
         }
+    } else if worker_exit.sandbox_lost() {
+        // A stage's sandbox was lost: the run resumes onto a re-acquired
+        // sandbox, under its own count of losses.
+        match petri_runs::resume_after_sandbox_loss(&state, run_id, &worker_exit.detail).await {
+            Ok(()) => return,
+            Err(failure) => failure,
+        }
     } else {
         format!(
             "Worker exited before emitting a terminal run event: {}",

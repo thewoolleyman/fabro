@@ -39,9 +39,11 @@ const NOT_FOUND_SUFFIX: &str = "\" was not found";
 /// sandbox a command ran in.
 #[must_use]
 pub fn names_lost_sandbox(message: &str) -> bool {
-    // RED stub: no failure names a lost sandbox yet.
-    let _ = (message, NOT_FOUND_PREFIX, NOT_FOUND_SUFFIX);
-    false
+    message.match_indices(NOT_FOUND_PREFIX).any(|(at, _)| {
+        let rest = &message[at + NOT_FOUND_PREFIX.len()..];
+        rest.find(NOT_FOUND_SUFFIX)
+            .is_some_and(|end| end > 0 && !rest[..end].contains('"'))
+    })
 }
 
 /// One run lifetime's lost sandbox: the first loss Fabro's hooks met, once
@@ -101,14 +103,14 @@ impl FencedLogs {
     /// The refusal of a write once the sandbox is lost: a backend failure,
     /// which ends the lifetime as any failed store write does.
     fn refuse(&self, action: &'static str) -> Result<(), StoreError> {
-        match self.loss.lost() {
-            Some(lost) => Err(StoreError::backend(
+        if let Some(lost) = self.loss.lost() {
+            return Err(StoreError::backend(
                 self.inner.locator(),
                 action,
                 format!("the run's sandbox was lost: {lost}"),
-            )),
-            None => Ok(()),
+            ));
         }
+        Ok(())
     }
 }
 
