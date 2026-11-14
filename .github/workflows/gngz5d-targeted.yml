@@ -51,5 +51,10 @@ jobs:
       # in this job container nothing does, so "the worker did not die"
       # (run 42130472837). tini -s makes the test run its own subreaper.
       - run: apt-get update && apt-get install -y --no-install-recommends tini
-      - run: tini -s -- cargo nextest run --locked -p fabro-petri -p fabro-server --status-level all --profile ci --no-fail-fast -E 'test(a_lost_sandbox_interrupts_the_run_and_a_resume_finishes_it) | test(a_run_its_sandbox_was_lost_under_resumes_up_to_its_own_limit) | test(/^sandbox_loss::tests::/) | test(a_run_that_ends_on_a_lost_sandbox_is_transient_infra) | test(a_failed_checkpoint_ends_the_run_with_no_route) | test(a_failed_store_write_interrupts_the_run_and_a_resume_finishes_it) | test(a_run_its_store_keeps_interrupting_fails)'
-      - run: sccache --show-stats
+      # Full workspace, --no-fail-fast: PR #41's gate run 43534718052 stopped at
+      # 2891/4439 on bd-ib-4vdmtj (a tracked test the diff cannot reach), so 1548
+      # tests got no verdict. This run gives every test one; it is not a rerun to
+      # clear that failure, whose verdict here is recorded as it falls.
+      - run: tini -s -- cargo nextest run --locked --workspace --status-level slow --profile ci --no-fail-fast
+      - if: always()
+        run: sccache --show-stats || true
