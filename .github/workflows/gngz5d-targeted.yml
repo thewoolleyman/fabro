@@ -1,0 +1,56 @@
+# THROWAWAY targeted RED/GREEN evidence for livespec-orchestrator-beads-fabro
+# bd-ib-gngz5d (fork PR #41). Deleted when the item closes.
+name: gngz5d targeted
+
+on:
+  push:
+    branches:
+      - red/gngz5d-targeted
+      - green/gngz5d-targeted
+
+jobs:
+  test:
+    name: Test (Linux, no Docker)
+    # Self-hosted runners never run a pull request from another repository.
+        runs-on: ${{ fromJSON(vars.FORK_RUST_RUNNER_LABELS || '["fabro-k3s"]') }}
+    # The run-level bound. nextest's `ci` profile kills no test for being slow
+    # (bd-ib-adrhkf), so a hung test is stopped here. A cold build plus the full
+    # suite measured about 17 minutes on 2026-11-06 (run 42195909423).
+    timeout-minutes: 120
+    env:
+      # The job's own sccache server would idle out after its 600 s default
+      # during the test phase (about 717 s measured), so --show-stats and the
+      # hook's preStop job summary read a fresh, empty server (ci-cache-
+      # optimization, m5m2dl, run 43472471910). 0 keeps it alive for the job.
+      SCCACHE_IDLE_TIMEOUT: "0"
+    container:
+      image: buildpack-deps:noble
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.97.1
+      - uses: taiki-e/install-action@773334c0e05d7e699e4d78234494308223f3a2cf # v2
+        with:
+          tool: nextest,sccache
+      # The workflow pod runs as root inside a user namespace, while the
+      # checkout's files keep the runner's ownership, so libgit2 refuses the
+      # workspace ("repository path ... is not owned by current user") and the
+      # fabro-cli tests that observe a local workflow's Git worktree fail.
+      # Measured on the first fabro-k3s run (run 42124630229, 2026-11-05).
+      # It goes in the SYSTEM config: the fabro-cli test harness runs each
+      # command with env_clear() and a temporary HOME, so a --global entry is
+      # never read (run 42128065950 failed the same way with one).
+      - run: git config --system --add safe.directory "$GITHUB_WORKSPACE"
+      # The Petri crash scenarios SIGKILL a worker whose parent server they
+      # killed first, then poll fabro_proc::process_running, which counts a
+      # zombie as running. On a GitHub-hosted runner PID 1 reaps the orphan;
+      # in this job container nothing does, so "the worker did not die"
+      # (run 42130472837). tini -s makes the test run its own subreaper.
+      - run: apt-get update && apt-get install -y --no-install-recommends tini
+      - run: tini -s -- cargo nextest run --locked -p fabro-petri -p fabro-server --status-level all --profile ci --no-fail-fast -E 'test(a_lost_sandbox_interrupts_the_run_and_a_resume_finishes_it) | test(a_run_its_sandbox_was_lost_under_resumes_up_to_its_own_limit) | test(/^sandbox_loss::tests::/) | test(a_run_that_ends_on_a_lost_sandbox_is_transient_infra) | test(a_failed_checkpoint_ends_the_run_with_no_route) | test(a_failed_store_write_interrupts_the_run_and_a_resume_finishes_it) | test(a_run_its_store_keeps_interrupting_fails)'
+      - run: sccache --show-stats
