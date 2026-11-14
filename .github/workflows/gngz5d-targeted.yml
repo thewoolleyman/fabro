@@ -11,8 +11,7 @@ on:
 jobs:
   test:
     name: Test (Linux, no Docker)
-    # Self-hosted runners never run a pull request from another repository.
-        runs-on: ${{ fromJSON(vars.FORK_RUST_RUNNER_LABELS || '["fabro-k3s"]') }}
+    runs-on: ${{ fromJSON(vars.FORK_RUST_RUNNER_LABELS || '["fabro-k3s"]') }}
     # The run-level bound. nextest's `ci` profile kills no test for being slow
     # (bd-ib-adrhkf), so a hung test is stopped here. A cold build plus the full
     # suite measured about 17 minutes on 2026-11-06 (run 42195909423).
