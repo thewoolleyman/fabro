@@ -53,6 +53,7 @@ use serde_json::Value;
 use tracing::debug;
 
 use crate::checkpoint::CHECKPOINT_FAILED_CLASS;
+use crate::sandbox_loss;
 
 /// One item the projector hands the fold, with its delivery sequence.
 pub enum Item<'a> {
@@ -410,7 +411,7 @@ pub fn is_lost_sandbox_failure(message: &str) -> bool {
     LOST_SANDBOX_FRAGMENTS
         .iter()
         .any(|fragment| message.contains(fragment))
-        || crate::sandbox_loss::names_lost_sandbox(message)
+        || sandbox_loss::names_lost_sandbox(message)
 }
 
 /// Message fragments a failure of the Fabro server's OWN run store carries.
@@ -470,7 +471,9 @@ pub fn run_failure_category(reason: FailureReason, message: Option<&str>) -> Fai
         FailureReason::TransientInfra => FailureCategory::TransientInfra,
         FailureReason::BudgetExhausted => FailureCategory::BudgetExhausted,
         _ if message.is_some_and(|message| {
-            is_sandbox_transport_failure(message) || is_run_store_failure(message)
+            is_sandbox_transport_failure(message)
+                || is_lost_sandbox_failure(message)
+                || is_run_store_failure(message)
         }) =>
         {
             FailureCategory::TransientInfra

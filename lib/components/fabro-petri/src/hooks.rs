@@ -1751,6 +1751,26 @@ impl ExecutionHooks for FabroHooks {
             Ok(None) => {}
             Err(error) => {
                 let message = error.render();
+                if let Some(loss) = &self.sandbox_loss {
+                    if sandbox_loss::names_lost_sandbox(&message) {
+                        // Trip before returning: the stage's finish is the
+                        // first write the fenced store refuses, so it is
+                        // never recorded and the stage runs again on the
+                        // resume.
+                        warn!(
+                            run_id = %self.run_id,
+                            node,
+                            execution = key.execution,
+                            firing = key.firing,
+                            attempt = key.attempt,
+                            error = %message,
+                            "the stage's sandbox was lost; the run's lifetime ends and the \
+                             server resumes it onto a re-acquired sandbox"
+                        );
+                        loss.trip(message);
+                        return Ok(prepared);
+                    }
+                }
                 warn!(
                     run_id = %self.run_id,
                     node,
