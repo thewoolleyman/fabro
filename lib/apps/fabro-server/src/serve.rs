@@ -37,6 +37,7 @@ use crate::server::{
     self, AppState, AppStateConfig, ResolvedAppStateSettings, RouterOptions, build_app_state,
     build_router_with_options, reconcile_incomplete_runs_on_startup, shutdown_active_workers,
     spawn_automation_scheduler, spawn_pull_request_creation_supervisor, spawn_scheduler,
+    stop_ended_run_sandboxes,
 };
 use crate::server_secrets::{ServerSecrets, process_env_snapshot};
 use crate::startup::{resolve_startup, validate_startup_configuration};
@@ -761,6 +762,15 @@ where
         .startup_pass()
         .await
         .context("catching Petri projections up at startup")?;
+    // Ended runs whose sandboxes are still running hold quota for nothing.
+    // Stop them off the startup path, since each run costs a provider call.
+    let sweep_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        match stop_ended_run_sandboxes(&sweep_state).await {
+            Ok(runs) => info!(runs, "Stopped the sandboxes of ended runs"),
+            Err(error) => tracing::warn!(error = ?error, "Ended-run sandbox sweep failed"),
+        }
+    });
     spawn_scheduler(Arc::clone(&state));
     spawn_automation_scheduler(Arc::clone(&state));
     let pull_request_creation_supervisor =

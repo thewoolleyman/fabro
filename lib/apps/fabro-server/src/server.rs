@@ -3410,6 +3410,50 @@ pub(crate) async fn reconcile_incomplete_runs_on_startup(
     Ok(reconciled)
 }
 
+/// Stops the sandboxes of runs that already ended without releasing them: a
+/// run a restart cancelled, or an ended run whose sandbox a read started
+/// again. A stop is not a deletion, so records and workspaces stay. Each run
+/// is bounded and a failure is logged, never fatal. Returns how many runs it
+/// asked the provider to stop for.
+pub(crate) async fn stop_ended_run_sandboxes(state: &Arc<AppState>) -> anyhow::Result<usize> {
+    let summaries = state
+        .stores
+        .run_summaries
+        .list_by_statuses(
+            &[RunStatusKind::Succeeded, RunStatusKind::Failed, RunStatusKind::Dead],
+            chrono::Utc::now(),
+        )
+        .await?;
+    let access = state.provider_access().await?;
+    let mut attempted = 0usize;
+    for summary in summaries {
+        let Some(run_state) = run_records::projection(state, summary.id).await? else {
+            continue;
+        };
+        if run_state.sandbox.is_none() {
+            continue;
+        }
+        attempted += 1;
+        let stop = sandbox_access::stop_run_sandboxes(
+            &access,
+            &run_state.spec.settings.run.environment,
+            summary.id,
+        );
+        match timeout(Duration::from_secs(30), stop).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(
+                run_id = %summary.id, error = ?error,
+                "Failed to stop the sandboxes of an ended run"
+            ),
+            Err(error) => tracing::warn!(
+                run_id = %summary.id, error = ?error,
+                "Timed out stopping the sandboxes of an ended run"
+            ),
+        }
+    }
+    Ok(attempted)
+}
+
 /// Whether a run the server finds in flight at startup is one a Petri
 /// worker can continue: it was runnable or running (blocked or paused
 /// count), no cancel was pending, and it was not being removed.
@@ -4476,10 +4520,11 @@ async fn execute_run_subprocess(state: Arc<AppState>, run_id: RunId) {
         }
     };
 
-    // Normal release is Petri's. An abnormal exit can leave its scopes
-    // running forever; the surviving supervisor must enforce the terminal
-    // stop policy after deciding that this execution will not be resumed.
-    if !worker_exit.succeeded() && final_state.status.is_terminal() {
+    // Normal release is Petri's, but a sandbox can be running again by the
+    // time the run is terminal (an abnormal exit, or a read that re-acquired
+    // it). The surviving supervisor enforces the terminal stop policy for
+    // every ended run, whatever the worker's exit; stopping is idempotent.
+    if final_state.status.is_terminal() {
         let cleanup = async {
             let access = state.provider_access().await?;
             sandbox_access::stop_run_sandboxes(
