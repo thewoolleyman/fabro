@@ -3415,7 +3415,11 @@ pub(crate) async fn stop_ended_run_sandboxes(state: &Arc<AppState>) -> anyhow::R
         .stores
         .run_summaries
         .list_by_statuses(
-            &[RunStatusKind::Succeeded, RunStatusKind::Failed, RunStatusKind::Dead],
+            &[
+                RunStatusKind::Succeeded,
+                RunStatusKind::Failed,
+                RunStatusKind::Dead,
+            ],
             chrono::Utc::now(),
         )
         .await?;
