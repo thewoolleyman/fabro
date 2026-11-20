@@ -1041,6 +1041,26 @@ mod tests {
         }
     }
 
+    /// A restarted sandbox of an ended run can be a pod that never leaves
+    /// Pending, and it still holds quota: the stop covers every state, not
+    /// only Running.
+    #[tokio::test]
+    async fn worker_cleanup_stops_an_ended_runs_sandbox_that_never_started() {
+        let run_id = RunId::new();
+        let pending = Arc::new(
+            ScriptedSandbox::with_id_and_working_dir("pending", "/workspace")
+                .state(SandboxState::Starting)
+                .label(PETRI_RUN_LABEL, &run_id.to_string()),
+        );
+        let provider = scripted_provider("kubernetes", vec![Arc::clone(&pending)]);
+
+        stop_run_sandboxes_on(provider, run_id).await.unwrap();
+
+        assert_eq!(pending.stop_count(), 1);
+        assert_eq!(pending.current_state(), SandboxState::Stopped);
+        assert_eq!(pending.delete_count(), 0);
+    }
+
     #[tokio::test]
     async fn a_read_of_an_ended_runs_stopped_sandbox_does_not_start_it() {
         let run_id = RunId::new();
