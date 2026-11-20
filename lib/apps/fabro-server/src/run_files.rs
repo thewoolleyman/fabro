@@ -1259,8 +1259,8 @@ async fn reconnect_run_sandbox(
         *run_id,
         projection.status.is_terminal(),
     )
-        .await
-        .map_err(|err| ApiError::new(StatusCode::CONFLICT, format!("{err:#}")))?;
+    .await
+    .map_err(|err| ApiError::new(StatusCode::CONFLICT, format!("{err:#}")))?;
     Ok(SandboxCheckout::new(
         handle,
         record.runtime.working_directory.clone(),
