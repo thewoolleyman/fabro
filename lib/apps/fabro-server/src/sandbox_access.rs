@@ -1051,7 +1051,10 @@ mod tests {
             .await
             .expect_err("a stopped sandbox of an ended run is not read");
 
-        assert!(format!("{error:#}").contains("does not start it"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("does not start it"),
+            "{error:#}"
+        );
         assert_eq!(sandbox.start_count(), 0);
         assert_eq!(sandbox.current_state(), SandboxState::Stopped);
     }
