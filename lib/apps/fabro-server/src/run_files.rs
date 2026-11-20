@@ -1253,7 +1253,12 @@ async fn reconnect_run_sandbox(
         .provider_access()
         .await
         .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
-    let handle = sandbox_access::attach_running_run_sandbox(&access, record, *run_id)
+    let handle = sandbox_access::attach_run_sandbox_for_read(
+        &access,
+        record,
+        *run_id,
+        projection.status.is_terminal(),
+    )
         .await
         .map_err(|err| ApiError::new(StatusCode::CONFLICT, format!("{err:#}")))?;
     Ok(SandboxCheckout::new(

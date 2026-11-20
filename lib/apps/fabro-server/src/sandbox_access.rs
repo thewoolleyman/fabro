@@ -471,6 +471,46 @@ pub(crate) async fn attach_running_run_sandbox(
     Ok(sandbox)
 }
 
+/// Attaches to a run's sandbox for a READ. A run still in flight gets
+/// [`attach_running_run_sandbox`]. An ended run's sandbox is only described:
+/// a read must not start a stopped sandbox, because nothing stops it again
+/// and its pod then holds quota until a reaper collects it. A stopped sandbox
+/// of an ended run is an error the caller answers from the run's stored state.
+pub(crate) async fn attach_run_sandbox_for_read(
+    access: &ProviderAccess,
+    record: &RunSandboxInstance,
+    run_id: RunId,
+    run_ended: bool,
+) -> anyhow::Result<Arc<dyn Sandbox>> {
+    if !run_ended {
+        return attach_running_run_sandbox(access, record, run_id).await;
+    }
+    let sandbox = attach_run_sandbox(access, record, run_id).await?;
+    if record.provider.bundled() == Some(BundledProvider::Local) {
+        return Ok(sandbox);
+    }
+    require_running_for_read(sandbox.as_ref(), &record.provider).await?;
+    Ok(sandbox)
+}
+
+/// Refuses, without starting it, an attached sandbox that is not running.
+async fn require_running_for_read(
+    sandbox: &dyn Sandbox,
+    provider: &SandboxProviderKind,
+) -> anyhow::Result<()> {
+    let status = sandbox
+        .describe()
+        .await
+        .with_context(|| format!("Failed to describe {provider} sandbox"))?;
+    if status.state != SandboxState::Running {
+        anyhow::bail!(
+            "The run has ended and its {provider} sandbox is {:?}; a read does not start it",
+            status.state
+        );
+    }
+    Ok(())
+}
+
 /// Whether the backend behind `kind` is reachable and the configured
 /// credential accepted, for preflight. A connection failure is the
 /// error; an unhealthy provider is an `Ok` report that says why.
@@ -999,6 +1039,33 @@ mod tests {
             assert_eq!(sandbox.stop_count(), 0);
             assert_eq!(sandbox.delete_count(), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn a_read_of_an_ended_runs_stopped_sandbox_does_not_start_it() {
+        let run_id = RunId::new();
+        let sandbox = petri_scripted_sandbox("root", &run_id.to_string());
+        sandbox.stop().await.unwrap();
+
+        let error = require_running_for_read(sandbox.as_ref(), &kind("docker"))
+            .await
+            .expect_err("a stopped sandbox of an ended run is not read");
+
+        assert!(format!("{error:#}").contains("does not start it"), "{error:#}");
+        assert_eq!(sandbox.start_count(), 0);
+        assert_eq!(sandbox.current_state(), SandboxState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn a_read_of_an_ended_runs_running_sandbox_reads_it_as_before() {
+        let run_id = RunId::new();
+        let sandbox = petri_scripted_sandbox("root", &run_id.to_string());
+
+        require_running_for_read(sandbox.as_ref(), &kind("docker"))
+            .await
+            .expect("a running sandbox is readable");
+
+        assert_eq!(sandbox.start_count(), 0);
     }
 
     #[tokio::test]
