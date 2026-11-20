@@ -232,7 +232,14 @@ async fn terminal_websocket(mut socket: WebSocket, state: Arc<AppState>, id: Run
     // driver's Pty facet, on the sandbox brought back to running. The
     // session is the driver's own; it is closed below.
     let session = async {
-        let sandbox = sandbox_access::attach_running_run_sandbox(&access, &record, id).await?;
+        let run_ended = state
+            .load_run_projection(&id)
+            .await
+            .map_err(|err| anyhow::anyhow!("{err:?}"))?
+            .status
+            .is_terminal();
+        let sandbox =
+            sandbox_access::attach_run_sandbox_for_read(&access, &record, id, run_ended).await?;
         let pty = sandbox
             .pty()
             .ok_or_else(|| anyhow::anyhow!("Sandbox provider does not support terminals."))?;
@@ -753,7 +760,8 @@ async fn put_sandbox_file(
     }
 }
 
-/// The run's sandbox record and its handle, attached and running.
+/// The run's sandbox record and its handle, attached and running. An ended
+/// run's sandbox is never started by a read.
 async fn reconnect_run_sandbox(
     state: &Arc<AppState>,
     run_id: &RunId,
@@ -763,14 +771,21 @@ async fn reconnect_run_sandbox(
     Ok((record, sandbox))
 }
 
-/// Reconnects a run's sandbox and brings it to running.
+/// Reconnects a run's sandbox for a read: a run in flight has it brought to
+/// running, an ended run's stopped sandbox stays stopped and the read is a 409.
 async fn reconnect_run_sandbox_instance(
     state: &Arc<AppState>,
     run_id: &RunId,
     record: &RunSandboxInstance,
 ) -> Result<Arc<dyn Sandbox>, Response> {
     let access = load_provider_access(state).await?;
-    sandbox_access::attach_running_run_sandbox(&access, record, *run_id)
+    let run_ended = state
+        .load_run_projection(run_id)
+        .await
+        .map_err(IntoResponse::into_response)?
+        .status
+        .is_terminal();
+    sandbox_access::attach_run_sandbox_for_read(&access, record, *run_id, run_ended)
         .await
         .map_err(|err| ApiError::new(StatusCode::CONFLICT, format!("{err:#}")).into_response())
 }
