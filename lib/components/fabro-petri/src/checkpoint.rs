@@ -1068,7 +1068,7 @@ where
     let mut left = retries;
     loop {
         match attempt().await {
-            Err(error) if false && left > 0 && head_moved(&error) => {
+            Err(error) if left > 0 && head_moved(&error) => {
                 left -= 1;
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
