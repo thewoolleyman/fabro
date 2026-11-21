@@ -1050,7 +1050,7 @@ mod tests {
         let pending = Arc::new(
             ScriptedSandbox::with_id_and_working_dir("pending", "/workspace")
                 .state(SandboxState::Starting)
-                .label(PETRI_RUN_LABEL, &run_id.to_string()),
+                .label(PETRI_RUN_LABEL, run_id.to_string()),
         );
         let provider = scripted_provider("kubernetes", vec![Arc::clone(&pending)]);
 
