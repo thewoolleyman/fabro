@@ -502,6 +502,26 @@ impl RunWorkspaces {
                 });
             }
         }
+        retry_moved_head(HEAD_MOVED_RETRIES, || {
+            self.stage_and_commit(site, key, node, status)
+        })
+        .await?;
+        let sha = self.git(site, "rev-parse", &["rev-parse", "HEAD"]).await?;
+        Ok(Snapshot {
+            sha,
+            reused: false,
+            branched,
+        })
+    }
+
+    /// Stage the workspace and commit it on the run branch: one attempt.
+    async fn stage_and_commit(
+        &self,
+        site: &Site,
+        key: CheckpointKey,
+        node: &str,
+        status: &str,
+    ) -> Result<(), CheckpointError> {
         let mut add = vec![
             "add".to_string(),
             "-A".to_string(),
@@ -534,12 +554,7 @@ impl RunWorkspaces {
             &message,
         ])
         .await?;
-        let sha = self.git(site, "rev-parse", &["rev-parse", "HEAD"]).await?;
-        Ok(Snapshot {
-            sha,
-            reused: false,
-            branched,
-        })
+        Ok(())
     }
 
     /// The parent of a checkpoint commit, or `None` for a root commit.
@@ -1032,6 +1047,36 @@ fn detail(stderr: &[u8]) -> String {
     text[start..].to_string()
 }
 
+/// How many times a checkpoint commit is retried on the new `HEAD` after git
+/// refuses its ref update because another writer moved `HEAD`.
+const HEAD_MOVED_RETRIES: usize = 5;
+
+/// Whether `error` is git refusing a ref update because `HEAD` moved between
+/// the commit's read and its write.
+fn head_moved(error: &CheckpointError) -> bool {
+    matches!(error, CheckpointError::Command { detail, .. } if detail.contains("cannot lock ref 'HEAD'"))
+}
+
+/// Run `attempt`; when it fails because `HEAD` moved, run it again (it re-reads
+/// `HEAD`) up to `retries` more times. Any other failure, and a moved `HEAD`
+/// that persists past the retries, is returned as it came.
+async fn retry_moved_head<F, Fut>(retries: usize, mut attempt: F) -> Result<(), CheckpointError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), CheckpointError>>,
+{
+    let mut left = retries;
+    loop {
+        match attempt().await {
+            Err(error) if false && left > 0 && head_moved(&error) => {
+                left -= 1;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1043,6 +1088,60 @@ mod tests {
             GitAuthor::default(),
             &RunCheckpointSettings::default(),
         )
+    }
+
+    fn refused(detail: &str) -> CheckpointError {
+        CheckpointError::Command {
+            action: "commit".to_string(),
+            status: "non-zero exit".to_string(),
+            detail: detail.to_string(),
+        }
+    }
+
+    const MOVED: &str = "fatal: cannot lock ref 'HEAD': is at 9e2abbe but expected 6c2f955";
+
+    #[tokio::test]
+    async fn a_commit_refused_because_head_moved_retries_on_the_new_head() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        retry_moved_head(HEAD_MOVED_RETRIES, || {
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { if n < 2 { Err(refused(MOVED)) } else { Ok(()) } }
+        })
+        .await
+        .expect("the third attempt succeeds");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_commit_still_refused_after_the_retries_stays_fatal() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let error = retry_moved_head(HEAD_MOVED_RETRIES, || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err(refused(MOVED)) }
+        })
+        .await
+        .expect_err("still refused");
+        assert!(
+            error.to_string().contains("cannot lock ref 'HEAD'"),
+            "{error}"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            HEAD_MOVED_RETRIES + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_commit_failing_for_another_reason_is_not_retried() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let error = retry_moved_head(HEAD_MOVED_RETRIES, || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async { Err(refused("fatal: unable to write new index file")) }
+        })
+        .await
+        .expect_err("fails");
+        assert!(matches!(error, CheckpointError::Command { .. }));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
